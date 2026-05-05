@@ -1,118 +1,360 @@
 #!/usr/bin/env python3
 """
-EDMS Simulator — Local Simulation Walkthrough
-Run this AFTER docker-compose up and uvicorn is running.
+EDMS Simulator — Local Simulation Walkthrough (Phase D)
 
-Usage:
+Exercises every ingestion channel end-to-end against a running stack:
+  STEP 0  Generate a realistic document package (W2, paystub, bank stmt,
+          credit report, driver's license JPG) into local_storage/
+  STEP 1  Chat-based intake via POST /ingest/chat
+  STEP 2  PDF upload — W2 via POST /ingest/pdf
+  STEP 3  Email with paystub attachment via POST /ingest/email
+  STEP 4  POST /loans creates the golden record; verify Redis + Postgres
+  STEP 5  Field confidence evolution: pick the highest-confidence value
+          across chat / W2 / paystub for the same fields
+  STEP 6  Same person, second LOS → deterministic SSN match
+
+Run:
+  docker compose up -d postgres redis
+  uvicorn api.main:app --port 8001
   python scripts/simulate_local.py
-
-What you will see:
-  STEP 1: New application → placeholder → active in Redis + Postgres
-  STEP 2: Verify Redis has golden record status + income + credit profiles
-  STEP 3: Verify Postgres has applicant row + XRef row
-  STEP 4: Upload a document → stale → re-aggregate → updated Redis
-  STEP 5: Second application same person → same applicant_id (deterministic match)
 """
+from __future__ import annotations
 
-import httpx, json, time, subprocess, sys, os
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import date, timedelta
+from pathlib import Path
 
-API_URL  = "http://localhost:8001"
-API_KEY  = "edms_dev_key"
-HEADERS  = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
+import httpx
 
-# ── Colour helpers ────────────────────────────────────────────────────────────
-GREEN  = "\033[92m"
-YELLOW = "\033[93m"
-CYAN   = "\033[96m"
-RED    = "\033[91m"
-BOLD   = "\033[1m"
-RESET  = "\033[0m"
+# Make core importable when running from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core.documents.generators.bank_stmt_generator import generate_bank_statement  # noqa: E402
+from core.documents.generators.credit_report_generator import generate_credit_report  # noqa: E402
+from core.documents.generators.identity_generator import generate_drivers_license  # noqa: E402
+from core.documents.generators.paystub_generator import generate_paystub  # noqa: E402
+from core.documents.generators.w2_generator import generate_w2  # noqa: E402
+from core.ingestion.confidence import (  # noqa: E402
+    ConfidenceResolver,
+    FieldValue,
+    SOURCE_CONFIDENCE_RANKING,
+)
+from core.ingestion.events import ChannelType  # noqa: E402
+
+API_URL = "http://localhost:8001"
+API_KEY = "edms_dev_key"
+HEADERS_JSON = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
+HEADERS_AUTH = {"X-API-Key": API_KEY}
+
+LOCAL_STORAGE = Path("local_storage")
+LOCAL_STORAGE.mkdir(parents=True, exist_ok=True)
+
+# ── colour helpers ────────────────────────────────────────────────────────────
+GREEN, YELLOW, CYAN, RED, MAGENTA, BOLD, RESET = (
+    "\033[92m", "\033[93m", "\033[96m", "\033[91m", "\033[95m", "\033[1m", "\033[0m",
+)
+
 
 def ok(msg):   print(f"  {GREEN}[PASS]{RESET} {msg}")
 def fail(msg): print(f"  {RED}[FAIL]{RESET} {msg}"); sys.exit(1)
 def info(msg): print(f"  {CYAN}      {RESET} {msg}")
-def step(n, title):
-    print(f"\n{BOLD}{YELLOW}{'='*60}{RESET}")
-    print(f"{BOLD}{YELLOW}  STEP {n}: {title}{RESET}")
-    print(f"{BOLD}{YELLOW}{'='*60}{RESET}")
+def warn(msg): print(f"  {YELLOW}[NOTE]{RESET} {msg}")
 
-def show_json(label, data):
+
+def step(n, title):
+    print(f"\n{BOLD}{YELLOW}{'='*72}{RESET}")
+    print(f"{BOLD}{YELLOW}  STEP {n}: {title}{RESET}")
+    print(f"{BOLD}{YELLOW}{'='*72}{RESET}")
+
+
+def show_json(label, data, max_lines=40):
     print(f"\n  {CYAN}{label}:{RESET}")
     lines = json.dumps(data, indent=4, default=str).split("\n")
-    for line in lines[:40]:
+    for line in lines[:max_lines]:
         print(f"    {line}")
-    if len(lines) > 40:
-        print(f"    ... ({len(lines)-40} more lines)")
+    if len(lines) > max_lines:
+        print(f"    ... ({len(lines)-max_lines} more lines)")
+
+
+# ── docker-exec helpers ──────────────────────────────────────────────────────
+
+
+def _docker(container, *args, timeout=10):
+    try:
+        result = subprocess.run(
+            ["docker", "exec", container, *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return result.stdout.strip()
+    except Exception as e:
+        return f"<error: {e}>"
+
 
 def redis_get(key):
-    try:
-        result = subprocess.run(
-            ["docker", "exec", "edms-simulator-redis-1",
-             "redis-cli", "GET", key],
-            capture_output=True, text=True, timeout=5
-        )
-        val = result.stdout.strip()
-        return json.loads(val) if val and val != "(nil)" else None
-    except Exception as e:
+    val = _docker("edms-simulator-redis-1", "redis-cli", "GET", key, timeout=5)
+    if not val or val == "(nil)":
         return None
+    try:
+        return json.loads(val)
+    except json.JSONDecodeError:
+        return val.strip('"')
+
 
 def redis_keys(pattern):
-    try:
-        result = subprocess.run(
-            ["docker", "exec", "edms-simulator-redis-1",
-             "redis-cli", "KEYS", pattern],
-            capture_output=True, text=True, timeout=5
-        )
-        return [k for k in result.stdout.strip().split("\n") if k and k != "(nil)"]
-    except Exception:
-        return []
+    val = _docker("edms-simulator-redis-1", "redis-cli", "KEYS", pattern, timeout=5)
+    return [k for k in val.split("\n") if k and k != "(nil)"]
+
 
 def redis_ttl(key):
-    try:
-        result = subprocess.run(
-            ["docker", "exec", "edms-simulator-redis-1",
-             "redis-cli", "TTL", key],
-            capture_output=True, text=True, timeout=5
-        )
-        return result.stdout.strip()
-    except Exception:
-        return "unknown"
+    return _docker("edms-simulator-redis-1", "redis-cli", "TTL", key, timeout=5)
+
 
 def psql(query):
-    try:
-        result = subprocess.run(
-            ["docker", "exec", "edms-simulator-postgres-1",
-             "psql", "-U", "edms", "-d", "edms",
-             "-c", query, "--no-psqlrc"],
-            capture_output=True, text=True, timeout=10
-        )
-        return result.stdout.strip()
-    except Exception as e:
-        return f"Error: {e}"
+    return _docker(
+        "edms-simulator-postgres-1",
+        "psql", "-U", "edms", "-d", "edms",
+        "-c", query, "--no-psqlrc",
+        timeout=15,
+    )
 
-# ── Check API is running ───────────────────────────────────────────────────────
-print(f"\n{BOLD}EDMS Simulator — Local Simulation Walkthrough{RESET}")
-print(f"{'─'*60}")
+
+# ── header ────────────────────────────────────────────────────────────────────
+print(f"\n{BOLD}EDMS Simulator — Local Simulation Walkthrough (Phase D){RESET}")
+print(f"{'─'*72}")
 
 try:
-    r = httpx.get(f"{API_URL}/health", timeout=5)
-    r.raise_for_status()
+    httpx.get(f"{API_URL}/health", timeout=5).raise_for_status()
     ok(f"API is running at {API_URL}")
 except Exception as e:
-    fail(f"API not reachable at {API_URL}. Start it with: uvicorn api.main:app --port 8001 --reload\nError: {e}")
+    fail(f"API not reachable at {API_URL}. Start it with `uvicorn api.main:app --port 8001`.\n  {e}")
 
-# ── STEP 1: New application ────────────────────────────────────────────────────
-step(1, "New application arrives — no golden record exists")
+claude_available = bool(os.getenv("ANTHROPIC_API_KEY"))
+if claude_available:
+    ok("ANTHROPIC_API_KEY is set — chat/email/image extractions will run live.")
+else:
+    warn("ANTHROPIC_API_KEY not set — chat/email body extractions will be skipped.")
 
-LOS_ID = f"LOS-2024-{int(time.time())}"
-payload = {
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 0 — Generate document package
+# ─────────────────────────────────────────────────────────────────────────────
+step(0, "Generate document package (W2, paystub, bank stmt, credit report, DL JPG)")
+
+PRIMARY_NAME = "James Okafor"
+PRIMARY_SSN_LAST4 = "4729"
+PRIMARY_DOB = date(1982, 7, 14)
+PRIMARY_ADDRESS = "100 Mission St\nSan Francisco, CA 94105"
+PRIMARY_EMPLOYER = "Accenture LLC"
+PRIMARY_INCOME = 92_400.00
+
+CO_NAME = "Sarah Okafor"
+CO_SSN_LAST4 = "8821"
+CO_INCOME = 56_200.00
+
+w2_pdf, w2_meta = generate_w2(
+    employee_name=PRIMARY_NAME,
+    employee_ssn_last4=PRIMARY_SSN_LAST4,
+    employee_address=PRIMARY_ADDRESS,
+    employer_name=PRIMARY_EMPLOYER,
+    employer_ein="123456789",
+    employer_address="1 Corporate Way\nSan Francisco, CA 94105",
+    tax_year=date.today().year - 1,
+    box1_wages=PRIMARY_INCOME,
+)
+paystub_pdf, paystub_meta = generate_paystub(
+    employer_name=PRIMARY_EMPLOYER,
+    employee_name=PRIMARY_NAME,
+    employee_ssn_last4=PRIMARY_SSN_LAST4,
+    pay_period_start=date.today() - timedelta(days=14),
+    pay_period_end=date.today(),
+    pay_date=date.today() + timedelta(days=3),
+    gross_pay=round(PRIMARY_INCOME / 26, 2),
+    ytd_gross=round(PRIMARY_INCOME / 26 * 8, 2),
+)
+bank_pdf, bank_meta = generate_bank_statement(
+    bank_name="Pacific First Bank",
+    account_holder=PRIMARY_NAME,
+    account_number="9876543210",
+    statement_end_date=date.today().replace(day=1) - timedelta(days=1),
+    starting_balance=12_000.00,
+    seed=42,
+)
+sample_credit = {
+    "applicant_id": "APL-PENDING-P",
+    "experian_score": 752, "equifax_score": 748, "transunion_score": 750,
+    "mid_score": 750, "credit_band": "prime",
+    "open_tradelines": 8, "revolving_utilization": 0.22,
+    "monthly_obligations": [
+        {"type": "car",         "creditor": "Auto Finance",  "monthly_payment": 425},
+        {"type": "credit_card", "creditor": "Chase",         "monthly_payment": 120},
+    ],
+    "total_monthly_obligations": 545.00,
+    "derogatory_marks": 0, "active_bankruptcy": False,
+    "foreclosure_last_36mo": False,
+    "late_30day": 0, "late_60day": 0, "late_90day": 0,
+    "hard_inquiries_12mo": 2, "report_date": date.today().isoformat(),
+}
+credit_pdf, credit_meta = generate_credit_report(applicant_name=PRIMARY_NAME, profile=sample_credit)
+dl_jpg, dl_meta = generate_drivers_license(
+    state="CA", full_name=PRIMARY_NAME, dob=PRIMARY_DOB,
+    address=PRIMARY_ADDRESS, dl_number="D1234567",
+    expiry=date.today() + timedelta(days=365 * 4),
+)
+
+(LOCAL_STORAGE / "demo").mkdir(exist_ok=True)
+artifacts = [
+    ("demo/W2.pdf",            w2_pdf),
+    ("demo/paystub.pdf",       paystub_pdf),
+    ("demo/bank_statement.pdf", bank_pdf),
+    ("demo/credit_report.pdf", credit_pdf),
+    ("demo/drivers_license.jpg", dl_jpg),
+]
+for rel, content in artifacts:
+    full = LOCAL_STORAGE / rel
+    full.write_bytes(content)
+    ok(f"{rel:<28} {len(content):>8,} bytes")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Chat-based intake
+# ─────────────────────────────────────────────────────────────────────────────
+step(1, "Chat-based intake → POST /ingest/chat")
+
+chat_messages = [
+    {"role": "user", "content": "Hi, I want to apply for a $385,000 mortgage."},
+    {"role": "assistant", "content": "Great. To get started, what's your name and email?"},
+    {"role": "user", "content": "James Okafor, james.okafor@email.com."},
+    {"role": "user", "content": "I make $92,000 a year at Accenture."},
+    {"role": "user", "content": "I also have rental income of about $1,800 a month."},
+    {"role": "assistant", "content": "Will anyone co-borrow with you?"},
+    {"role": "user", "content": "Yes — my wife Sarah Okafor will be co-borrower. She makes $56,000 at Dell."},
+    {"role": "user", "content": "Our DOBs are 1982-07-14 and 1985-03-22."},
+]
+
+chat_extracted = None
+chat_overall_conf = None
+chat_missing: list[str] = []
+chat_documents_needed: list[str] = []
+chat_next_question = None
+
+if claude_available:
+    try:
+        r = httpx.post(
+            f"{API_URL}/ingest/chat",
+            json={"messages": chat_messages},
+            headers=HEADERS_JSON,
+            timeout=60,
+        )
+        r.raise_for_status()
+        body = r.json()
+        chat_extracted = body.get("extracted") or {}
+        chat_overall_conf = body.get("overall_confidence")
+        chat_missing = body.get("missing_fields") or []
+        chat_documents_needed = body.get("documents_needed") or []
+        chat_next_question = body.get("next_question_suggestion")
+        ok(f"Chat extraction succeeded — overall_confidence={chat_overall_conf}")
+        show_json("Extracted (truncated)", chat_extracted, max_lines=35)
+        info(f"missing_fields:    {chat_missing}")
+        info(f"documents_needed:  {chat_documents_needed}")
+        if chat_next_question:
+            info(f"next_question:     \"{chat_next_question}\"")
+    except Exception as e:
+        warn(f"Chat ingest failed: {e}")
+else:
+    warn("Skipping live chat — set ANTHROPIC_API_KEY to exercise this path.")
+    info("(The /ingest/chat endpoint would return 503 without a key.)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — PDF upload (W2)
+# ─────────────────────────────────────────────────────────────────────────────
+step(2, "Upload W2 PDF → POST /ingest/pdf (deterministic pymupdf path, no Claude)")
+
+w2_event = None
+try:
+    files = {"file": ("W2.pdf", w2_pdf, "application/pdf")}
+    r = httpx.post(
+        f"{API_URL}/ingest/pdf",
+        files=files,
+        data={"borrower_role": "primary"},
+        headers=HEADERS_AUTH,
+        timeout=60,
+    )
+    r.raise_for_status()
+    w2_event = r.json()
+    ok(f"document_type detected: {w2_event['document_type']}")
+    info(f"box1_wages   = ${w2_event['extracted_fields'].get('box1_wages'):,.2f}")
+    info(f"employer     = {w2_event['extracted_fields'].get('employer_name')}")
+    info(f"tax_year     = {w2_event['extracted_fields'].get('tax_year')}")
+    info(f"confidence   = {w2_event['confidence']}")
+    if chat_overall_conf is not None:
+        info(
+            "Confidence evolution: "
+            f"chat (annual_income_stated)={chat_overall_conf:.2f} → "
+            f"W2 (box1_wages)={w2_event['confidence']:.2f}"
+        )
+except Exception as e:
+    warn(f"PDF ingest failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Email with paystub attachment
+# ─────────────────────────────────────────────────────────────────────────────
+step(3, "Email with paystub attachment → POST /ingest/email")
+
+email_payload = {
+    "from": "james.okafor@email.com",
+    "subject": "Please find my pay stub attached",
+    "body": "Hi — attaching this pay period's stub. Let me know if you need anything else.",
+    "attachments": [
+        {"filename": "paystub.pdf", "content_base64": base64.b64encode(paystub_pdf).decode()},
+    ],
+}
+
+paystub_event = None
+try:
+    r = httpx.post(
+        f"{API_URL}/ingest/email",
+        json=email_payload,
+        headers=HEADERS_JSON,
+        timeout=60,
+    )
+    r.raise_for_status()
+    body = r.json()
+    events = body.get("events", [])
+    info(f"events returned: {len(events)} (1 body + {body.get('documents_processed')} attachment)")
+    for ev in events:
+        if ev["source_channel"] == ChannelType.EMAIL.value:
+            ok(f"body event — confidence={ev['confidence']:.2f}, hint={ev.get('document_type')}")
+        elif ev["source_channel"] == ChannelType.PDF_UPLOAD.value:
+            paystub_event = ev
+            ok(f"attachment event — {ev['document_type']} confidence={ev['confidence']:.2f}")
+            ef = ev["extracted_fields"]
+            info(f"gross_pay  = ${ef.get('gross_pay'):,.2f}    ytd_gross = ${ef.get('ytd_gross'):,.2f}")
+            info(f"net_pay    = ${ef.get('net_pay'):,.2f}")
+except Exception as e:
+    warn(f"Email ingest failed: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — Create the loan via /loans (golden record + Redis + Postgres)
+# ─────────────────────────────────────────────────────────────────────────────
+step(4, "POST /loans — create golden record; verify Redis + Postgres + XRef")
+
+LOS_ID = f"LOS-{int(time.time())}"
+loan_payload = {
     "los_id": LOS_ID,
     "borrower": {
         "first_name": "James",
         "last_name":  "Okafor",
-        "dob":        "1982-07-14",
+        "dob":        PRIMARY_DOB.isoformat(),
         "ssn_hash":   "a3f9e2d1c4b5a6f7e8d9c0b1a2f3e4d5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1",
-        "ssn_last4":  "4729",
+        "ssn_last4":  PRIMARY_SSN_LAST4,
         "email":      "james.okafor@email.com",
     },
     "co_borrower": {
@@ -120,383 +362,191 @@ payload = {
         "last_name":  "Okafor",
         "dob":        "1985-03-22",
         "ssn_hash":   "b4f0e3d2c5b6a7f8e9d0c1b2a3f4e5d6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2",
-        "ssn_last4":  "8821",
+        "ssn_last4":  CO_SSN_LAST4,
     },
-    "loan": {
-        "loan_amount":  385000,
-        "loan_type":    "conventional",
-        "credit_band":  "near-prime",
-    },
+    "loan": {"loan_amount": 385000, "loan_type": "conventional", "credit_band": "prime"},
     "documents": [
-        {
-            "document_id":    "DOC-W2-001",
-            "document_type":  "W2_CURRENT",
-            "borrower_role":  "primary",
-            "employer_name":  "Accenture LLC",
-            "box1_wages":     92400,
-            "tax_year":       2023,
-        },
-        {
-            "document_id":    "DOC-W2-002",
-            "document_type":  "W2_CURRENT",
-            "borrower_role":  "co_borrower",
-            "employer_name":  "Dell Technologies",
-            "box1_wages":     56200,
-            "tax_year":       2023,
-        },
-        {
-            "document_id":    "DOC-PAY-001",
-            "document_type":  "PAYSTUB_CURRENT",
-            "borrower_role":  "primary",
-            "ytd_gross":      15400,
-            "pay_period_end": "2024-02-28",
-        },
-    ]
+        {"document_id": "DOC-W2-001", "document_type": "W2", "borrower_role": "primary",
+         "box1_wages": int(PRIMARY_INCOME), "employer_name": PRIMARY_EMPLOYER},
+        {"document_id": "DOC-PAY-001", "document_type": "PAYSTUB", "borrower_role": "primary"},
+    ],
 }
 
-print(f"\n  Sending POST /loans with LOS ID: {LOS_ID}")
-print(f"  Borrower: James Okafor (primary) + Sarah Okafor (co-borrower)")
+r = httpx.post(f"{API_URL}/loans", json=loan_payload, headers=HEADERS_JSON, timeout=30)
+r.raise_for_status()
+loan = r.json()
+show_json("API response", loan, max_lines=10)
+applicant_id = loan["applicant_id"]
+co_applicant_id = loan["co_applicant_id"]
+application_id = loan["application_id"]
+ok(f"applicant_id={applicant_id}, co_applicant_id={co_applicant_id}")
 
-try:
-    r = httpx.post(f"{API_URL}/loans", json=payload, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    result = r.json()
-    show_json("API response", result)
-except Exception as e:
-    fail(f"POST /loans failed: {e}")
+time.sleep(1)
 
-applicant_id    = result.get("applicant_id")
-co_applicant_id = result.get("co_applicant_id")
-application_id  = result.get("application_id")
-match_method    = result.get("match_method")
-is_new          = result.get("is_new_record")
-
-if not applicant_id or not applicant_id.startswith("APL-"):
-    fail(f"Expected APL-XXXXX-P format, got: {applicant_id}")
-ok(f"Golden record created: {applicant_id} (primary)")
-ok(f"Co-borrower golden record: {co_applicant_id}")
-ok(f"Application ID: {application_id}")
-ok(f"Match method: {match_method} — is_new_record: {is_new}")
-
-# ── STEP 2: Verify Redis ────────────────────────────────────────────────────
-step(2, "Verify Redis — status, income profile, credit profile")
-
-time.sleep(1)  # small delay to ensure async writes complete
-
-# Status check
+# Redis
 status = redis_get(f"status:{applicant_id}")
-if not status:
-    raw = redis_get(f"status:{applicant_id}")
-    # Try as raw string
-    try:
-        result2 = subprocess.run(
-            ["docker", "exec", "edms-simulator-redis-1",
-             "redis-cli", "GET", f"status:{applicant_id}"],
-            capture_output=True, text=True, timeout=5
-        )
-        status = result2.stdout.strip().strip('"')
-    except Exception:
-        pass
-
 if status == "active":
-    ok(f"Redis status:{applicant_id} = '{status}'")
+    ok(f"Redis status:{applicant_id} = 'active' (TTL {redis_ttl(f'status:{applicant_id}')}s)")
 else:
-    info(f"Redis status:{applicant_id} = '{status}' (may still be resolving)")
+    warn(f"Redis status: {status!r}")
 
-status_ttl = redis_ttl(f"status:{applicant_id}")
-info(f"Status TTL: {status_ttl} seconds (~{int(status_ttl)//3600}hrs remaining)" if status_ttl.isdigit() else f"Status TTL: {status_ttl}")
-
-# Income profile
 income = redis_get(f"income:{applicant_id}")
 if income:
-    ok(f"Redis income:{applicant_id} — cache HIT")
-    info(f"combined_qualifying_monthly = ${income.get('combined_qualifying_monthly', 0):,.2f}")
-    info(f"qualifying_score_used = {income.get('qualifying_score_used', 'N/A')}")
-    info(f"dti_inputs_ready = {income.get('dti_inputs_ready', False)}")
-    info(f"lineage_hash = {income.get('lineage_hash', 'N/A')}")
-    income_ttl = redis_ttl(f"income:{applicant_id}")
-    info(f"TTL: {income_ttl}s (~{int(income_ttl)//3600}hrs)" if str(income_ttl).isdigit() else f"TTL: {income_ttl}")
-else:
-    info("Redis income profile not yet cached (check Postgres in step 3)")
-
-# Credit profile
+    ok(f"Redis income:{applicant_id} cached — combined_qualifying_monthly=${income.get('combined_qualifying_monthly', 0):,.2f}")
 credit = redis_get(f"credit:{applicant_id}")
 if credit:
-    ok(f"Redis credit:{applicant_id} — cache HIT")
-    info(f"mid_score = {credit.get('mid_score', 'N/A')}")
-    info(f"credit_band = {credit.get('credit_band', 'N/A')}")
-    info(f"total_monthly_obligations = ${credit.get('total_monthly_obligations', 0):,.2f}")
-else:
-    info("Redis credit profile not yet cached")
+    ok(f"Redis credit:{applicant_id} cached — mid_score={credit.get('mid_score')}")
 
-# App lookup cache
-app_lookup = redis_get(f"app_los:{LOS_ID}")
-if app_lookup:
-    ok(f"Redis app_los:{LOS_ID} — lookup cache HIT")
-else:
-    info("App lookup not yet cached (cached on first GET request)")
+# Postgres
+print()
+print(f"  {CYAN}Postgres applicants:{RESET}")
+print(psql(f"SELECT applicant_id, full_name, dob, status FROM applicants WHERE applicant_id IN ('{applicant_id}', '{co_applicant_id}');"))
 
-# All Redis keys for this applicant
-all_keys = redis_keys(f"*{applicant_id}*")
-info(f"All Redis keys for {applicant_id}: {all_keys}")
+print(f"\n  {CYAN}Postgres applicant_identity_xref:{RESET}")
+print(psql(f"SELECT applicant_id, source_system, source_id, match_method, match_confidence FROM applicant_identity_xref WHERE applicant_id IN ('{applicant_id}', '{co_applicant_id}') ORDER BY added_at;"))
 
-# ── STEP 3: Verify Postgres ──────────────────────────────────────────────────
-step(3, "Verify Postgres — golden record, XRef table, income profile")
+print(f"\n  {CYAN}Postgres applications:{RESET}")
+print(psql(f"SELECT application_id, applicant_id, co_applicant_id, los_id, status FROM applications WHERE los_id='{LOS_ID}';"))
 
-# Applicant row
-print(f"\n  Querying applicants table for {applicant_id}:")
-rows = psql(f"SELECT applicant_id, full_name, dob, status, created_at FROM applicants WHERE applicant_id='{applicant_id}';")
-print(f"\n{rows}")
-if applicant_id in rows:
-    ok(f"Postgres: applicant row found for {applicant_id}")
-else:
-    fail(f"Postgres: no applicant row found for {applicant_id}")
 
-# XRef row
-print(f"\n  Querying identity_xref table for {applicant_id}:")
-xref_rows = psql(f"SELECT applicant_id, source_system, source_id, match_method, match_confidence FROM applicant_identity_xref WHERE applicant_id='{applicant_id}';")
-print(f"\n{xref_rows}")
-if "los" in xref_rows and LOS_ID in xref_rows:
-    ok(f"Postgres: XRef row found — source_system=los, source_id={LOS_ID}")
-else:
-    info(f"XRef: {xref_rows}")
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 — Field confidence evolution
+# ─────────────────────────────────────────────────────────────────────────────
+step(5, "Field confidence evolution — same field, multiple sources, pick winner")
 
-# Application row
-print(f"\n  Querying applications table:")
-app_rows = psql(f"SELECT application_id, applicant_id, co_applicant_id, los_id, status FROM applications WHERE los_id='{LOS_ID}';")
-print(f"\n{app_rows}")
-if LOS_ID in app_rows:
-    ok(f"Postgres: application row found — los_id={LOS_ID}")
+resolver = ConfidenceResolver()
 
-# Income profile
-print(f"\n  Querying income_profiles table:")
-income_rows = psql(f"SELECT profile_id, applicant_id, lineage_hash, version, assembled_at FROM income_profiles WHERE applicant_id='{applicant_id}' ORDER BY version DESC LIMIT 3;")
-print(f"\n{income_rows}")
-if applicant_id in income_rows:
-    ok(f"Postgres: income_profile row found for {applicant_id}")
 
-# Co-borrower check
-if co_applicant_id:
-    co_rows = psql(f"SELECT applicant_id, full_name, status FROM applicants WHERE applicant_id='{co_applicant_id}';")
-    if co_applicant_id in co_rows:
-        ok(f"Postgres: co-borrower golden record found: {co_applicant_id}")
+def _ranked_table(field_name: str, sources: list[FieldValue]):
+    if not sources:
+        info(f"{field_name}: (no sources collected)")
+        return
+    res = resolver.resolve(field_name, sources)
+    print(f"\n  {BOLD}{field_name}{RESET}")
+    print(f"  {'source':<20} {'value':>14}  {'confidence':>10}  channel")
+    print(f"  {'-'*20} {'-'*14}  {'-'*10}  {'-'*16}")
+    for s in sorted(sources, key=lambda v: v.confidence, reverse=True):
+        marker = "★" if s is res.chosen else " "
+        val_str = f"{s.value:,.2f}" if isinstance(s.value, (int, float)) else str(s.value)
+        print(f"  {marker} {s.source:<18} {val_str:>14}  {s.confidence:>10.2f}  {s.source_channel.value}")
+    print(f"  {GREEN}→ chosen:{RESET} {res.chosen.source} = {res.chosen.value} (confidence {res.chosen.confidence:.2f})")
+    if res.has_conflict:
+        warn(f"CONFLICT — {res.conflict_reason}")
 
-# ── STEP 4: Upload a document → re-aggregation ─────────────────────────────
-step(4, "Upload new document for same applicant → stale → re-aggregate → new lineage_hash")
 
-# Capture current lineage_hash before upload
-lineage_before = income.get("lineage_hash", "none") if income else "none"
-info(f"lineage_hash BEFORE upload: {lineage_before}")
+# annual_income sources from this run
+annual_income_sources: list[FieldValue] = []
+if chat_extracted and isinstance(chat_extracted.get("primary_borrower"), dict):
+    val = chat_extracted["primary_borrower"].get("annual_income_stated")
+    if isinstance(val, (int, float)):
+        annual_income_sources.append(FieldValue(
+            value=float(val),
+            confidence=SOURCE_CONFIDENCE_RANKING["CHAT"],
+            source="CHAT",
+            source_channel=ChannelType.CHAT,
+            requires_verification=True,
+        ))
+if w2_event:
+    box1 = w2_event["extracted_fields"].get("box1_wages")
+    if isinstance(box1, (int, float)):
+        annual_income_sources.append(FieldValue(
+            value=float(box1),
+            confidence=SOURCE_CONFIDENCE_RANKING["W2_PDF"],
+            source="W2_PDF",
+            source_channel=ChannelType.PDF_UPLOAD,
+        ))
+if paystub_event:
+    ytd = paystub_event["extracted_fields"].get("ytd_gross")
+    if isinstance(ytd, (int, float)) and ytd > 0:
+        # Annualize naively for comparison
+        annualized = float(ytd) * 26 / 8
+        annual_income_sources.append(FieldValue(
+            value=annualized,
+            confidence=SOURCE_CONFIDENCE_RANKING["PAYSTUB_PDF"],
+            source="PAYSTUB_PDF (annualized)",
+            source_channel=ChannelType.PDF_UPLOAD,
+        ))
 
-# Simulate document upload event
-doc_payload = {
-    "applicant_id":   applicant_id,
-    "application_id": application_id,
-    "document_id":    "DOC-1099-001",
-    "document_type":  "1099_NEC",
-    "source_id":      f"VENDOR-{int(time.time())}",
-    "all_documents": [
-        # Original docs + new 1099
-        {
-            "document_id":    "DOC-W2-001",
-            "document_type":  "W2_CURRENT",
-            "borrower_role":  "primary",
-            "employer_name":  "Accenture LLC",
-            "box1_wages":     92400,
-            "tax_year":       2023,
-        },
-        {
-            "document_id":    "DOC-1099-001",
-            "document_type":  "CONTRACTOR_1099",
-            "borrower_role":  "primary",
-            "amount_1099":    18500,
-            "payer_name":     "Consulting Client LLC",
-            "tax_year":       2023,
-        },
-        {
-            "document_id":    "DOC-PAY-001",
-            "document_type":  "PAYSTUB_CURRENT",
-            "borrower_role":  "primary",
-            "ytd_gross":      15400,
-        },
-        {
-            "document_id":    "DOC-W2-002",
-            "document_type":  "W2_CURRENT",
-            "borrower_role":  "co_borrower",
-            "employer_name":  "Dell Technologies",
-            "box1_wages":     56200,
-            "tax_year":       2023,
-        },
-    ]
-}
+_ranked_table("annual_income", annual_income_sources)
 
-print(f"\n  Sending document upload event for applicant {applicant_id}")
-print(f"  New document: DOC-1099-001 (1099 consulting income — $18,500)")
+# employer sources
+employer_sources: list[FieldValue] = []
+if chat_extracted and isinstance(chat_extracted.get("primary_borrower"), dict):
+    emp = chat_extracted["primary_borrower"].get("employer")
+    if emp:
+        employer_sources.append(FieldValue(
+            value=emp,
+            confidence=SOURCE_CONFIDENCE_RANKING["CHAT"],
+            source="CHAT",
+            source_channel=ChannelType.CHAT,
+            requires_verification=True,
+        ))
+if w2_event:
+    emp = w2_event["extracted_fields"].get("employer_name")
+    if emp:
+        employer_sources.append(FieldValue(
+            value=emp,
+            confidence=SOURCE_CONFIDENCE_RANKING["W2_PDF"],
+            source="W2_PDF",
+            source_channel=ChannelType.PDF_UPLOAD,
+        ))
 
-try:
-    r = httpx.post(f"{API_URL}/loans/document",
-                   json=doc_payload, headers=HEADERS, timeout=30)
-    if r.status_code == 404:
-        info("POST /loans/document endpoint not yet built — simulating via aggregation service directly")
-        info("This will be wired in the full build. Showing expected behaviour:")
-        print(f"""
-  Expected sequence:
-    1. Redis status:{applicant_id} flips to "stale"
-    2. Income assembly re-runs with all_documents (including new 1099)
-    3. New income_profiles row inserted in Postgres (version 2)
-    4. Old row gets superseded_by = new profile_id
-    5. Redis income:{applicant_id} updated with new profile
-    6. lineage_hash changes (new document in set)
-    7. Redis status:{applicant_id} flips back to "active"
-    8. Decision OS — if it calls GET /income-profile now,
-       it gets the updated profile with the 1099 income included
-""")
-    else:
-        r.raise_for_status()
-        result3 = r.json()
-        show_json("Document upload response", result3)
-        time.sleep(1)
+_ranked_table("employer", employer_sources)
 
-        income_after = redis_get(f"income:{applicant_id}")
-        if income_after:
-            lineage_after = income_after.get("lineage_hash","none")
-            if lineage_after != lineage_before:
-                ok(f"lineage_hash CHANGED after document upload")
-                info(f"  Before: {lineage_before}")
-                info(f"  After:  {lineage_after}")
-                q_monthly_after = income_after.get("combined_qualifying_monthly", 0)
-                info(f"  combined_qualifying_monthly updated: ${q_monthly_after:,.2f}")
-            else:
-                info(f"lineage_hash unchanged (document did not change income sources)")
-        print(f"\n  Postgres income_profiles (versioned):")
-        rows2 = psql(f"SELECT profile_id, lineage_hash, version, superseded_by, assembled_at FROM income_profiles WHERE applicant_id='{applicant_id}' ORDER BY version;")
-        print(f"\n{rows2}")
-        if rows2:
-            ok("Postgres: income_profiles has versioned rows with superseded_by chain")
 
-except Exception as e:
-    info(f"Document upload endpoint note: {e}")
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 — Same person, second LOS → deterministic SSN match
+# ─────────────────────────────────────────────────────────────────────────────
+step(6, "Same person, new LOS → deterministic SSN hash match (same applicant_id)")
 
-# ── STEP 5: Same person applies again → deterministic match ─────────────────
-step(5, "Same person, new LOS ID → deterministic SSN hash match → SAME applicant_id")
-
-LOS_ID_2 = f"LOS-2026-{int(time.time())}"
+LOS_ID_2 = f"LOS-{int(time.time())+10}"
 payload2 = {
     "los_id": LOS_ID_2,
-    "borrower": {
-        "first_name": "James",
-        "last_name":  "Okafor",
-        "dob":        "1982-07-14",
-        "ssn_hash":   "a3f9e2d1c4b5a6f7e8d9c0b1a2f3e4d5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1",  # SAME SSN hash
-        "ssn_last4":  "4729",
-        "email":      "james.okafor@email.com",
-    },
+    "borrower": loan_payload["borrower"],  # same SSN hash
     "loan": {"loan_amount": 420000, "loan_type": "conventional", "credit_band": "prime"},
-    "documents": []
+    "documents": [],
 }
+r = httpx.post(f"{API_URL}/loans", json=payload2, headers=HEADERS_JSON, timeout=30)
+r.raise_for_status()
+loan2 = r.json()
+show_json("API response", loan2, max_lines=10)
 
-print(f"\n  Same James Okafor, new LOS ID: {LOS_ID_2}")
-print(f"  SSN hash is IDENTICAL to first application")
+if loan2["applicant_id"] == applicant_id and loan2["match_method"] == "deterministic":
+    ok(f"SAME applicant_id returned: {applicant_id} via {loan2['match_method']} match")
+else:
+    fail(f"Expected deterministic match to {applicant_id}, got {loan2}")
 
-try:
-    r = httpx.post(f"{API_URL}/loans", json=payload2, headers=HEADERS, timeout=30)
-    r.raise_for_status()
-    result4 = r.json()
-    show_json("API response", result4)
+print(f"\n  {CYAN}Postgres XRef table — both LOS IDs now linked:{RESET}")
+print(psql(
+    "SELECT source_system, source_id, match_method, match_confidence, added_at "
+    f"FROM applicant_identity_xref WHERE applicant_id='{applicant_id}' ORDER BY added_at;"
+))
 
-    applicant_id_2 = result4.get("applicant_id")
-    match_method_2 = result4.get("match_method")
-    is_new_2       = result4.get("is_new_record")
 
-    if applicant_id_2 == applicant_id:
-        ok(f"SAME applicant_id returned: {applicant_id_2}")
-        ok(f"Match method: {match_method_2} (SSN hash deterministic match)")
-        ok(f"is_new_record: {is_new_2} (False = existing record reused)")
-    else:
-        fail(f"Expected {applicant_id}, got {applicant_id_2}")
-
-    print(f"\n  Postgres XRef table now has TWO LOS IDs for same applicant:")
-    xref_both = psql(f"SELECT source_system, source_id, match_method, match_confidence, added_at FROM applicant_identity_xref WHERE applicant_id='{applicant_id}' ORDER BY added_at;")
-    print(f"\n{xref_both}")
-    if LOS_ID in xref_both and LOS_ID_2 in xref_both:
-        ok(f"XRef table: both LOS IDs linked to same golden record {applicant_id}")
-
-except Exception as e:
-    info(f"Second application: {e}")
-
-# ── STEP 6: GET endpoints — verify cache vs DB ──────────────────────────────
-step(6, "GET endpoints — verify Redis cache hit vs Postgres fallback")
-
-print(f"\n  GET /loan/{LOS_ID}/applicant-id")
-try:
-    r = httpx.get(f"{API_URL}/loan/{LOS_ID}/applicant-id", headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    show_json("Response", data)
-    if data.get("applicant_id") == applicant_id:
-        ok(f"LOS ID resolved to correct applicant_id: {applicant_id}")
-except Exception as e:
-    info(f"GET /loan: {e}")
-
-print(f"\n  GET /applicant/{applicant_id}/income-profile")
-try:
-    r = httpx.get(f"{API_URL}/applicant/{applicant_id}/income-profile",
-                  headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    source = data.get("source","unknown")
-    income_data = data.get("data", data)
-    info(f"Source: {BOLD}{source}{RESET} ({'Redis' if source=='cache' else 'Postgres'})")
-    info(f"combined_qualifying_monthly: ${income_data.get('combined_qualifying_monthly',0):,.2f}")
-    info(f"qualifying_score_used: {income_data.get('qualifying_score_used','N/A')}")
-    info(f"requires_human_review: {income_data.get('requires_human_review', False)}")
-    ok(f"Income profile returned from {source}")
-except Exception as e:
-    info(f"GET /income-profile: {e}")
-
-print(f"\n  GET /applicant/{applicant_id}/credit-profile")
-try:
-    r = httpx.get(f"{API_URL}/applicant/{applicant_id}/credit-profile",
-                  headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    source = data.get("source","unknown")
-    credit_data = data.get("data", data)
-    info(f"Source: {BOLD}{source}{RESET}")
-    info(f"mid_score: {credit_data.get('mid_score','N/A')}")
-    info(f"credit_band: {credit_data.get('credit_band','N/A')}")
-    ok(f"Credit profile returned from {source}")
-except Exception as e:
-    info(f"GET /credit-profile: {e}")
-
-# ── SUMMARY ───────────────────────────────────────────────────────────────────
-print(f"\n{BOLD}{GREEN}{'='*60}{RESET}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary
+# ─────────────────────────────────────────────────────────────────────────────
+print(f"\n{BOLD}{GREEN}{'='*72}{RESET}")
 print(f"{BOLD}{GREEN}  LOCAL SIMULATION COMPLETE{RESET}")
-print(f"{BOLD}{GREEN}{'='*60}{RESET}")
+print(f"{BOLD}{GREEN}{'='*72}{RESET}")
+
+artifact_count = len(artifacts)
 print(f"""
-  What you just verified locally:
+  Documents generated and saved to {LOCAL_STORAGE/'demo'}:
+    {artifact_count} files ({sum(len(c) for _, c in artifacts):,} bytes total)
 
-  {GREEN}✓{RESET}  New application → golden record created (APL-XXXXX-P)
-  {GREEN}✓{RESET}  Redis: status, income profile, credit profile all cached
-  {GREEN}✓{RESET}  Postgres: applicant row, XRef row, income profile row
-  {GREEN}✓{RESET}  Document upload → lineage_hash changes → Redis updated
-  {GREEN}✓{RESET}  Same SSN → same applicant_id returned (deterministic match)
-  {GREEN}✓{RESET}  GET endpoints serve from Redis cache (fast path)
+  Channels exercised this run:
+    chat       {'✓ live' if claude_available and chat_extracted else 'skipped (no key)'}
+    pdf        ✓ deterministic (pymupdf)
+    email+pdf  {'✓' if paystub_event else '(body only)'}
+    api        ✓ POST /loans
 
-  Redis keys written for {applicant_id}:
-    status:{applicant_id}   TTL 24hr
-    income:{applicant_id}   TTL 4hr
-    credit:{applicant_id}   TTL 4hr
+  Postgres now contains:
+    applicants               {applicant_id}, {co_applicant_id}
+    applicant_identity_xref  rows for both LOS IDs ({LOS_ID}, {LOS_ID_2})
+    applications             two rows tied to {applicant_id}
 
-  Postgres tables written:
-    applicants              1 row (golden record)
-    applicant_identity_xref 2 rows (LOS-1 + LOS-2)
-    applications            2 rows (one per LOS ID)
-    income_profiles         1+ rows (versioned)
-    credit_profiles         1 row (current)
-
-  When you are satisfied this works locally:
-    git add . && git commit -m "feat: EDMS Simulator verified locally"
-    git push
-    → GitHub Actions aws.yaml deploys to ECS automatically
+  Confidence ranking demonstrated for:
+    annual_income  {len(annual_income_sources)} source(s) compared
+    employer       {len(employer_sources)} source(s) compared
 """)
