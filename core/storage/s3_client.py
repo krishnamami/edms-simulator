@@ -27,8 +27,8 @@ class S3Client:
             self._client = boto3.client("s3", region_name=self.region)
         return self._client
 
-    def _key(self, application_id: str, category: str, document_id: str) -> str:
-        return f"loans/{application_id}/{category}/{document_id}.pdf"
+    def _key(self, application_id: str, category: str, document_id: str, extension: str = "pdf") -> str:
+        return f"loans/{application_id}/{category}/{document_id}.{extension.lstrip('.')}"
 
     def upload_document(
         self,
@@ -36,8 +36,10 @@ class S3Client:
         category: str,
         document_id: str,
         content: Union[bytes, str],
+        extension: str = "pdf",
+        content_type: str = "application/pdf",
     ) -> str:
-        key = self._key(application_id, category, document_id)
+        key = self._key(application_id, category, document_id, extension=extension)
         body = content.encode() if isinstance(content, str) else content
 
         if self.use_local:
@@ -53,7 +55,7 @@ class S3Client:
                 Key=key,
                 Body=body,
                 ServerSideEncryption="aws:kms",
-                ContentType="application/pdf",
+                ContentType=content_type,
             )
             logger.info("doc_s3_uploaded", extra={"bucket": self.bucket, "key": key})
             return key

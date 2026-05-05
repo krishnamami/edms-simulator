@@ -1,0 +1,132 @@
+"""Tri-merge credit report PDF generator.
+
+Renders a CreditProfile dict (the same shape produced by
+core.credit.assembler.CreditAssembler) so that text extraction from the
+PDF round-trips to the structured profile.
+"""
+from __future__ import annotations
+
+import io
+from typing import Optional
+
+from reportlab.lib.colors import HexColor
+from reportlab.lib.pagesizes import LETTER
+from reportlab.pdfgen import canvas
+
+
+def _money(v: float) -> str:
+    return f"${v:,.2f}"
+
+
+def generate_credit_report(
+    *,
+    applicant_name: str,
+    profile: dict,
+    pulled_for: str = "Mortgage Origination",
+) -> tuple[bytes, dict]:
+    metadata = {
+        "document_type": "CREDIT_REPORT",
+        "applicant_name": applicant_name,
+        "applicant_id": profile.get("applicant_id"),
+        "experian_score": profile["experian_score"],
+        "equifax_score": profile["equifax_score"],
+        "transunion_score": profile["transunion_score"],
+        "mid_score": profile["mid_score"],
+        "credit_band": profile["credit_band"],
+        "open_tradelines": profile["open_tradelines"],
+        "revolving_utilization": profile["revolving_utilization"],
+        "total_monthly_obligations": profile["total_monthly_obligations"],
+        "monthly_obligations": profile["monthly_obligations"],
+        "derogatory_marks": profile["derogatory_marks"],
+        "hard_inquiries_12mo": profile["hard_inquiries_12mo"],
+        "report_date": profile["report_date"],
+    }
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=LETTER)
+    w, h = LETTER
+
+    # Header
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(40, h - 50, "TRI-MERGE CREDIT REPORT")
+    c.setFont("Helvetica", 10)
+    c.drawString(40, h - 68, f"Pulled for: {pulled_for}")
+    c.drawRightString(w - 40, h - 50, f"Report Date: {profile['report_date']}")
+
+    # Applicant
+    c.line(40, h - 80, w - 40, h - 80)
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(40, h - 100, f"Consumer: {applicant_name}")
+    if profile.get("applicant_id"):
+        c.setFont("Helvetica", 9)
+        c.drawString(40, h - 114, f"Applicant ID: {profile['applicant_id']}")
+
+    # 3-bureau scores box
+    y = h - 150
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, y, "BUREAU SCORES")
+    c.line(40, y - 4, w - 40, y - 4)
+    bureaus = [
+        ("EXPERIAN",   profile["experian_score"]),
+        ("EQUIFAX",    profile["equifax_score"]),
+        ("TRANSUNION", profile["transunion_score"]),
+    ]
+    for i, (name, score) in enumerate(bureaus):
+        col_x = 60 + i * 180
+        c.setStrokeColor(HexColor("#444444"))
+        c.rect(col_x - 10, y - 70, 150, 56, stroke=1, fill=0)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(col_x, y - 28, name)
+        c.setFont("Helvetica-Bold", 22)
+        c.drawString(col_x, y - 56, str(score))
+
+    # Mid-score callout
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(40, y - 90, f"Mid Score (used for decisioning): {profile['mid_score']}    Band: {profile['credit_band']}")
+
+    # Tradelines section
+    ty = y - 120
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, ty, "TRADELINES & OBLIGATIONS")
+    c.line(40, ty - 4, w - 40, ty - 4)
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(40, ty - 22, "Type")
+    c.drawString(180, ty - 22, "Creditor")
+    c.drawRightString(w - 60, ty - 22, "Monthly Payment")
+    c.setFont("Helvetica", 10)
+    for i, ob in enumerate(profile["monthly_obligations"]):
+        row_y = ty - 40 - i * 14
+        c.drawString(40, row_y, ob["type"])
+        c.drawString(180, row_y, ob["creditor"])
+        c.drawRightString(w - 60, row_y, _money(ob["monthly_payment"]))
+
+    n_obs = len(profile["monthly_obligations"])
+    total_y = ty - 40 - n_obs * 14 - 10
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(40, total_y, "Total Monthly Obligations")
+    c.drawRightString(w - 60, total_y, _money(profile["total_monthly_obligations"]))
+
+    # Derogatory + Inquiries
+    dy = total_y - 50
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(40, dy, "DEROGATORY & RISK FACTORS")
+    c.line(40, dy - 4, w - 40, dy - 4)
+    c.setFont("Helvetica", 10)
+    c.drawString(40, dy - 22, f"Derogatory marks: {profile['derogatory_marks']}")
+    c.drawString(40, dy - 36, f"30-day late: {profile.get('late_30day', 0)}    60-day: {profile.get('late_60day', 0)}    90-day: {profile.get('late_90day', 0)}")
+    c.drawString(40, dy - 50, f"Active bankruptcy: {profile.get('active_bankruptcy', False)}")
+    c.drawString(40, dy - 64, f"Foreclosure (last 36 months): {profile.get('foreclosure_last_36mo', False)}")
+    c.drawString(40, dy - 78, f"Hard inquiries (last 12 months): {profile['hard_inquiries_12mo']}")
+    c.drawString(40, dy - 92, f"Open tradelines: {profile['open_tradelines']}")
+    c.drawString(40, dy - 106, f"Revolving utilization: {profile['revolving_utilization']:.0%}")
+
+    # Footer
+    c.setFont("Helvetica-Oblique", 8)
+    c.drawCentredString(
+        w / 2, 40,
+        "Simulated tri-merge credit report generated by EDMS Simulator for testing.",
+    )
+
+    c.showPage()
+    c.save()
+    return buf.getvalue(), metadata
