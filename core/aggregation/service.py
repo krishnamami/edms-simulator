@@ -10,9 +10,14 @@ from typing import Optional
 
 import structlog
 
-from core.aggregation.events import BaseEvent, EventType
+from core.aggregation.events import (
+    ApplicationSubmittedEvent,
+    BaseEvent,
+    EventType,
+)
 from core.aggregation.status import GoldenRecordStatus, StatusMachine
 from core.identity.resolver import IdentityResolver, IdentitySignals
+from core.ingestion.events import ChannelType, NormalizedIngestEvent
 
 logger = structlog.get_logger()
 
@@ -38,7 +43,10 @@ class AggregationService:
         self.event_bus = event_bus
         self._published_events: list = []
 
-    async def handle(self, event: BaseEvent) -> dict:
+    async def handle(self, event) -> dict:
+        if isinstance(event, NormalizedIngestEvent):
+            return await self._handle_normalized_ingest_event(event)
+
         handlers = {
             EventType.APPLICATION_SUBMITTED: self._handle_application_submitted,
             EventType.DOCUMENT_UPLOADED: self._handle_document_uploaded,
@@ -48,6 +56,35 @@ class AggregationService:
         if not handler:
             raise ValueError(f"No handler for: {event.event_type}")
         return await handler(event)
+
+    async def _handle_normalized_ingest_event(
+        self, event: NormalizedIngestEvent
+    ) -> dict:
+        if event.source_channel == ChannelType.API:
+            signals = event.applicant_signals or {}
+            extracted = event.extracted_fields or {}
+            payload = {
+                "los_id": signals.get("los_id") or extracted.get("los_id"),
+                "borrower": {
+                    "first_name": signals.get("first_name"),
+                    "last_name": signals.get("last_name"),
+                    "dob": signals.get("dob"),
+                    "ssn_hash": signals.get("ssn_hash"),
+                    "ssn_last4": signals.get("ssn_last4"),
+                    "email": signals.get("email"),
+                    "phone": signals.get("phone"),
+                },
+                "co_borrower": extracted.get("co_borrower"),
+                "loan": extracted.get("loan", {}),
+                "documents": extracted.get("documents", []),
+            }
+            inner = ApplicationSubmittedEvent(payload=payload)
+            return await self._handle_application_submitted(inner)
+
+        raise NotImplementedError(
+            f"NormalizedIngestEvent handler for "
+            f"{event.source_channel.value} not implemented yet"
+        )
 
     async def _handle_application_submitted(self, event) -> dict:
         p = event.payload
@@ -91,6 +128,13 @@ class AggregationService:
             )
             co_result = self.resolver.resolve(co_signals)
             co_applicant_id = co_result.golden_record.applicant_id
+            await self.postgres_store.save_golden_record(co_result.golden_record.model_dump())
+            for xref in co_result.golden_record.identity_xrefs:
+                await self.postgres_store.save_xref(xref.model_dump())
+
+        await self.postgres_store.save_golden_record(primary_gr.model_dump())
+        for xref in primary_gr.identity_xrefs:
+            await self.postgres_store.save_xref(xref.model_dump())
 
         application_id = f"APP-{los_id}"
         application = {

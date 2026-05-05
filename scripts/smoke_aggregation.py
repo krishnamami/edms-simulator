@@ -52,6 +52,13 @@ class FakePG:
         self.applications: dict = {}
         self.income: dict = {}
         self.credit: dict = {}
+        self.applicants: dict = {}
+
+    async def save_golden_record(self, gr):
+        self.applicants[gr["applicant_id"]] = gr
+
+    async def save_xref(self, xref):
+        pass
 
     async def save_application(self, app):
         self.applications[app["application_id"]] = app

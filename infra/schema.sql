@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS applicant_identity_xref (
     match_confidence FLOAT NOT NULL,
     match_method     VARCHAR NOT NULL,
     added_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (source_system, source_id)
+    UNIQUE (applicant_id, source_system, source_id)
 );
 
 CREATE TABLE IF NOT EXISTS applications (

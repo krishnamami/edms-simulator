@@ -4,9 +4,22 @@ Uses the asyncpg pool from core.storage.db. All methods are async.
 """
 import json
 import logging
+from datetime import date, datetime
 from typing import Optional
 
 from core.storage import db
+
+
+def _to_date(value):
+    if value is None or isinstance(value, date):
+        return value
+    return datetime.fromisoformat(str(value)).date()
+
+
+def _to_ts(value):
+    if value is None or isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +84,7 @@ class PostgresStore:
             gr["full_name"],
             gr["first_name"],
             gr["last_name"],
-            gr["dob"],
+            _to_date(gr["dob"]),
             gr["ssn_hash"],
             gr.get("ssn_last4"),
             gr.get("email"),
@@ -120,7 +133,7 @@ class PostgresStore:
             INSERT INTO applicant_identity_xref (
                 applicant_id, source_system, source_id, match_confidence, match_method
             ) VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (source_system, source_id) DO NOTHING
+            ON CONFLICT (applicant_id, source_system, source_id) DO NOTHING
             """,
             xref["applicant_id"],
             xref["source_system"],
@@ -180,7 +193,7 @@ class PostgresStore:
             """,
             applicant_id,
             profile.get("application_id"),
-            profile["assembled_at"],
+            _to_ts(profile["assembled_at"]),
             _to_jsonb(profile),
             profile.get("lineage_hash", ""),
             version,
@@ -230,8 +243,8 @@ class PostgresStore:
             int(profile["mid_score"]),
             profile["credit_band"],
             _to_jsonb(profile),
-            profile.get("report_date"),
-            profile.get("expiry_date"),
+            _to_date(profile.get("report_date")),
+            _to_date(profile.get("expiry_date")),
         )
 
     async def get_credit_profile(self, applicant_id: str) -> Optional[dict]:
@@ -282,7 +295,7 @@ class PostgresStore:
             doc.get("borrower_role", "primary"),
             doc.get("s3_key"),
             doc.get("status", "received"),
-            doc.get("expiry_date"),
+            _to_date(doc.get("expiry_date")),
             doc.get("is_current", True),
             _to_jsonb(doc.get("extracted_fields")),
             doc.get("confidence_score"),

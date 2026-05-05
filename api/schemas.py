@@ -69,12 +69,16 @@ class IncomeProfileResponse(BaseModel):
     applicant_id: str
     profile: dict
     cached: bool
+    source: str = "cache"
+    data: dict = {}
 
 
 class CreditProfileResponse(BaseModel):
     applicant_id: str
     profile: dict
     cached: bool
+    source: str = "cache"
+    data: dict = {}
 
 
 class DocumentUploadRequest(BaseModel):

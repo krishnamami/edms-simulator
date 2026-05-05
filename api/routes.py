@@ -3,11 +3,12 @@
 Auth: X-API-Key validated against the edms/api/keys secret.
 Cache pattern: Redis -> Postgres.
 """
+import base64
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 
 from api.schemas import (
     ApplicantIdResponse,
@@ -22,6 +23,8 @@ from core.aggregation.events import (
     DocumentUploadedEvent,
     EventType,
 )
+from core.ingestion.events import ChannelType
+from core.ingestion.router import IngestRouter
 
 logger = structlog.get_logger()
 router = APIRouter()
@@ -103,7 +106,8 @@ async def get_income_profile(request: Request, applicant_id: str):
     cached = redis_store.get_income_profile(applicant_id)
     if cached:
         return IncomeProfileResponse(
-            applicant_id=applicant_id, profile=cached, cached=True
+            applicant_id=applicant_id, profile=cached, cached=True,
+            source="cache", data=cached,
         )
 
     profile = await postgres_store.get_income_profile(applicant_id)
@@ -111,7 +115,8 @@ async def get_income_profile(request: Request, applicant_id: str):
         raise HTTPException(status_code=404, detail="Income profile not found")
     redis_store.set_income_profile(applicant_id, profile)
     return IncomeProfileResponse(
-        applicant_id=applicant_id, profile=profile, cached=False
+        applicant_id=applicant_id, profile=profile, cached=False,
+        source="postgres", data=profile,
     )
 
 
@@ -127,7 +132,8 @@ async def get_credit_profile(request: Request, applicant_id: str):
     cached = redis_store.get_credit_profile(applicant_id)
     if cached:
         return CreditProfileResponse(
-            applicant_id=applicant_id, profile=cached, cached=True
+            applicant_id=applicant_id, profile=cached, cached=True,
+            source="cache", data=cached,
         )
 
     profile = await postgres_store.get_credit_profile(applicant_id)
@@ -135,21 +141,124 @@ async def get_credit_profile(request: Request, applicant_id: str):
         raise HTTPException(status_code=404, detail="Credit profile not found")
     redis_store.set_credit_profile(applicant_id, profile)
     return CreditProfileResponse(
-        applicant_id=applicant_id, profile=profile, cached=False
+        applicant_id=applicant_id, profile=profile, cached=False,
+        source="postgres", data=profile,
     )
+
+
+async def _upload_documents_impl(request: Request, body: DocumentUploadRequest):
+    service = request.app.state.aggregation_service
+    event = DocumentUploadedEvent(
+        event_type=EventType.DOCUMENT_UPLOADED,
+        payload=body.model_dump(),
+    )
+    return await service.handle(event)
 
 
 @router.post(
     "/documents/upload",
     dependencies=[Depends(verify_api_key)],
 )
-async def upload_documents(
-    request: Request, body: DocumentUploadRequest
+async def upload_documents(request: Request, body: DocumentUploadRequest):
+    return await _upload_documents_impl(request, body)
+
+
+@router.post(
+    "/loans/document",
+    dependencies=[Depends(verify_api_key)],
+)
+async def upload_documents_loans_alias(request: Request, body: DocumentUploadRequest):
+    return await _upload_documents_impl(request, body)
+
+
+# ---------------------------------------------------------------------------
+# Universal ingestion (Phase A: API channel wired, others stubbed)
+# ---------------------------------------------------------------------------
+
+_NOT_IMPLEMENTED = {
+    "status": "not_implemented",
+    "phase": "Phase A — endpoint stubbed; adapter lands in a later phase",
+}
+
+
+def _stub(channel: ChannelType, **detail) -> dict:
+    return {**_NOT_IMPLEMENTED, "channel": channel.value, **detail}
+
+
+@router.post("/ingest/pdf", dependencies=[Depends(verify_api_key)])
+async def ingest_pdf(
+    file: UploadFile = File(...),
+    applicant_id: Optional[str] = Form(None),
+    borrower_role: str = Form("primary"),
 ):
-    service = request.app.state.aggregation_service
-    event = DocumentUploadedEvent(
-        event_type=EventType.DOCUMENT_UPLOADED,
-        payload=body.model_dump(),
+    return _stub(
+        ChannelType.PDF_UPLOAD,
+        filename=file.filename,
+        size=len(await file.read()),
+        applicant_id=applicant_id,
+        borrower_role=borrower_role,
     )
-    result = await service.handle(event)
-    return result
+
+
+@router.post("/ingest/image", dependencies=[Depends(verify_api_key)])
+async def ingest_image(
+    file: UploadFile = File(...),
+    applicant_id: Optional[str] = Form(None),
+    borrower_role: str = Form("primary"),
+):
+    return _stub(
+        ChannelType.IMAGE_UPLOAD,
+        filename=file.filename,
+        size=len(await file.read()),
+        applicant_id=applicant_id,
+        borrower_role=borrower_role,
+    )
+
+
+@router.post("/ingest/email", dependencies=[Depends(verify_api_key)])
+async def ingest_email(payload: dict):
+    return _stub(
+        ChannelType.EMAIL,
+        from_=payload.get("from"),
+        subject=payload.get("subject"),
+        attachments_count=len(payload.get("attachments", []) or []),
+    )
+
+
+@router.post("/ingest/chat", dependencies=[Depends(verify_api_key)])
+async def ingest_chat(payload: dict):
+    messages = payload.get("messages", []) or []
+    return _stub(
+        ChannelType.CHAT,
+        messages_count=len(messages),
+        applicant_id=payload.get("applicant_id"),
+    )
+
+
+@router.post("/ingest/form", dependencies=[Depends(verify_api_key)])
+async def ingest_form(payload: dict):
+    return _stub(
+        ChannelType.FORM,
+        form_type=payload.get("form_type"),
+        fields_count=len((payload.get("fields") or {})),
+    )
+
+
+@router.post("/ingest/csv", dependencies=[Depends(verify_api_key)])
+async def ingest_csv(file: UploadFile = File(...)):
+    body = await file.read()
+    return _stub(
+        ChannelType.CSV_BATCH,
+        filename=file.filename,
+        size=len(body),
+    )
+
+
+@router.post("/ingest/xml", dependencies=[Depends(verify_api_key)])
+async def ingest_xml(file: UploadFile = File(...)):
+    body = await file.read()
+    return _stub(
+        ChannelType.XML,
+        filename=file.filename,
+        size=len(body),
+    )
