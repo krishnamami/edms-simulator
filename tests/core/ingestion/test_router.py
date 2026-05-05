@@ -90,6 +90,8 @@ def test_route_api_returns_normalized_event(router):
     assert event.applicant_signals["los_id"] == "LOS-X1"
 
 
-def test_route_unimplemented_channel_raises(router):
-    with pytest.raises(NotImplementedError):
-        router.route({}, ChannelType.CHAT)
+def test_route_chat_without_key_raises_claude_unavailable(router, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    from core.ingestion._claude_client import ClaudeUnavailable
+    with pytest.raises(ClaudeUnavailable):
+        router.route([{"role": "user", "content": "hi"}], ChannelType.CHAT)

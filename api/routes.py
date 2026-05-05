@@ -23,6 +23,16 @@ from core.aggregation.events import (
     DocumentUploadedEvent,
     EventType,
 )
+from core.ingestion._claude_client import ClaudeUnavailable
+from core.ingestion.adapters import (
+    chat_adapter,
+    csv_adapter,
+    email_adapter,
+    form_adapter,
+    image_adapter,
+    pdf_adapter,
+    xml_adapter,
+)
 from core.ingestion.events import ChannelType
 from core.ingestion.router import IngestRouter
 
@@ -172,17 +182,16 @@ async def upload_documents_loans_alias(request: Request, body: DocumentUploadReq
 
 
 # ---------------------------------------------------------------------------
-# Universal ingestion (Phase A: API channel wired, others stubbed)
+# Universal ingestion (Phase C: all adapters wired)
 # ---------------------------------------------------------------------------
 
-_NOT_IMPLEMENTED = {
-    "status": "not_implemented",
-    "phase": "Phase A — endpoint stubbed; adapter lands in a later phase",
-}
 
-
-def _stub(channel: ChannelType, **detail) -> dict:
-    return {**_NOT_IMPLEMENTED, "channel": channel.value, **detail}
+def _next_question_for(missing: list[str]) -> Optional[str]:
+    if not missing:
+        return None
+    field = missing[0]
+    pretty = field.replace("_", " ")
+    return f"Could you share your {pretty}?"
 
 
 @router.post("/ingest/pdf", dependencies=[Depends(verify_api_key)])
@@ -191,13 +200,11 @@ async def ingest_pdf(
     applicant_id: Optional[str] = Form(None),
     borrower_role: str = Form("primary"),
 ):
-    return _stub(
-        ChannelType.PDF_UPLOAD,
-        filename=file.filename,
-        size=len(await file.read()),
-        applicant_id=applicant_id,
-        borrower_role=borrower_role,
+    body = await file.read()
+    event = pdf_adapter.adapt(
+        body, applicant_id=applicant_id, borrower_role=borrower_role,
     )
+    return event.model_dump()
 
 
 @router.post("/ingest/image", dependencies=[Depends(verify_api_key)])
@@ -206,59 +213,66 @@ async def ingest_image(
     applicant_id: Optional[str] = Form(None),
     borrower_role: str = Form("primary"),
 ):
-    return _stub(
-        ChannelType.IMAGE_UPLOAD,
-        filename=file.filename,
-        size=len(await file.read()),
-        applicant_id=applicant_id,
-        borrower_role=borrower_role,
-    )
+    body = await file.read()
+    try:
+        event = image_adapter.adapt(
+            body, applicant_id=applicant_id, borrower_role=borrower_role,
+        )
+    except ClaudeUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return event.model_dump()
 
 
 @router.post("/ingest/email", dependencies=[Depends(verify_api_key)])
 async def ingest_email(payload: dict):
-    return _stub(
-        ChannelType.EMAIL,
-        from_=payload.get("from"),
-        subject=payload.get("subject"),
-        attachments_count=len(payload.get("attachments", []) or []),
-    )
+    try:
+        events = email_adapter.adapt(payload)
+    except ClaudeUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    attachments_count = max(0, len(events) - 1)  # one body event + N attachments
+    return {
+        "events": [e.model_dump() for e in events],
+        "documents_processed": attachments_count,
+    }
 
 
 @router.post("/ingest/chat", dependencies=[Depends(verify_api_key)])
 async def ingest_chat(payload: dict):
-    messages = payload.get("messages", []) or []
-    return _stub(
-        ChannelType.CHAT,
-        messages_count=len(messages),
-        applicant_id=payload.get("applicant_id"),
-    )
+    messages = payload.get("messages") or []
+    applicant_id = payload.get("applicant_id")
+    try:
+        event = chat_adapter.adapt(messages, applicant_id=applicant_id)
+    except ClaudeUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {
+        "extracted": event.extracted_fields,
+        "missing_fields": event.missing_fields,
+        "documents_needed": event.documents_needed,
+        "overall_confidence": event.confidence,
+        "applicant_id": applicant_id,
+        "next_question_suggestion": _next_question_for(event.missing_fields),
+        "event": event.model_dump(),
+    }
 
 
 @router.post("/ingest/form", dependencies=[Depends(verify_api_key)])
 async def ingest_form(payload: dict):
-    return _stub(
-        ChannelType.FORM,
-        form_type=payload.get("form_type"),
-        fields_count=len((payload.get("fields") or {})),
-    )
+    event = form_adapter.adapt(payload)
+    return event.model_dump()
 
 
 @router.post("/ingest/csv", dependencies=[Depends(verify_api_key)])
 async def ingest_csv(file: UploadFile = File(...)):
     body = await file.read()
-    return _stub(
-        ChannelType.CSV_BATCH,
-        filename=file.filename,
-        size=len(body),
-    )
+    events, report = csv_adapter.adapt(body)
+    return {
+        **report,
+        "applicants": [e.applicant_signals for e in events],
+    }
 
 
 @router.post("/ingest/xml", dependencies=[Depends(verify_api_key)])
 async def ingest_xml(file: UploadFile = File(...)):
     body = await file.read()
-    return _stub(
-        ChannelType.XML,
-        filename=file.filename,
-        size=len(body),
-    )
+    event = xml_adapter.adapt(body)
+    return event.model_dump()

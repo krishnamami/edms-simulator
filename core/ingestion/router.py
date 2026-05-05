@@ -3,11 +3,30 @@
 Detection is deliberately content-based, not metadata-based: we may receive
 bytes from a multipart upload, a JSON dict from a webhook, or a list of
 chat messages from a websocket. We don't trust caller-supplied content-type.
-"""
-from typing import Any
 
-from core.ingestion.adapters import api_adapter
+route() returns a NormalizedIngestEvent for single-event channels.
+EMAIL returns list[NormalizedIngestEvent] (one per body + attachment).
+CSV_BATCH returns tuple[list[NormalizedIngestEvent], report_dict].
+"""
+from typing import Any, Union
+
+from core.ingestion.adapters import (
+    api_adapter,
+    chat_adapter,
+    csv_adapter,
+    email_adapter,
+    form_adapter,
+    image_adapter,
+    pdf_adapter,
+    xml_adapter,
+)
 from core.ingestion.events import ChannelType, NormalizedIngestEvent
+
+RouteResult = Union[
+    NormalizedIngestEvent,
+    list[NormalizedIngestEvent],
+    tuple[list[NormalizedIngestEvent], dict],
+]
 
 
 class IngestRouter:
@@ -45,11 +64,21 @@ class IngestRouter:
 
         raise TypeError(f"Unsupported payload type: {type(payload).__name__}")
 
-    def route(
-        self, payload: Any, channel_type: ChannelType
-    ) -> NormalizedIngestEvent:
+    def route(self, payload: Any, channel_type: ChannelType) -> RouteResult:
         if channel_type == ChannelType.API:
             return api_adapter.adapt(payload)
-        raise NotImplementedError(
-            f"Adapter for {channel_type.value} not implemented yet"
-        )
+        if channel_type == ChannelType.PDF_UPLOAD:
+            return pdf_adapter.adapt(payload)
+        if channel_type == ChannelType.IMAGE_UPLOAD:
+            return image_adapter.adapt(payload)
+        if channel_type == ChannelType.CHAT:
+            return chat_adapter.adapt(payload)
+        if channel_type == ChannelType.FORM:
+            return form_adapter.adapt(payload)
+        if channel_type == ChannelType.XML:
+            return xml_adapter.adapt(payload)
+        if channel_type == ChannelType.EMAIL:
+            return email_adapter.adapt(payload)
+        if channel_type == ChannelType.CSV_BATCH:
+            return csv_adapter.adapt(payload)
+        raise ValueError(f"Unsupported channel: {channel_type}")
