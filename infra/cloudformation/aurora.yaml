@@ -46,7 +46,7 @@ Resources:
     UpdateReplacePolicy: Snapshot
     Properties:
       Engine: aurora-postgresql
-      EngineVersion: "15.4"
+      EngineVersion: "15.8"
       EngineMode: provisioned
       DatabaseName: edms
       MasterUsername: !Ref DBMasterUsername
