@@ -1,0 +1,59 @@
+{
+  "family": "edms-simulator",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/edms-simulator-task-role",
+  "containerDefinitions": [
+    {
+      "name": "edms-simulator",
+      "image": "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/edms-simulator:latest",
+      "portMappings": [
+        {
+          "containerPort": 8001,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "environment": [
+        {"name": "ENVIRONMENT", "value": "production"},
+        {"name": "USE_AWS_SECRETS", "value": "true"},
+        {"name": "USE_AWS_SQS", "value": "true"},
+        {"name": "AWS_REGION", "value": "us-east-1"},
+        {"name": "USE_LOCAL_STORAGE", "value": "false"},
+        {"name": "USE_FAKE_REDIS", "value": "false"}
+      ],
+      "secrets": [
+        {
+          "name": "DB_CONNECTION",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:edms/aurora/credentials"
+        },
+        {
+          "name": "REDIS_CONNECTION",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:edms/redis/endpoint"
+        },
+        {
+          "name": "API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:edms/api/keys"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/edms-simulator",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"],
+        "interval": 30,
+        "timeout": 10,
+        "retries": 3,
+        "startPeriod": 30
+      }
+    }
+  ]
+}

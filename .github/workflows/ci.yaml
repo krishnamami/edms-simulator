@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: edms_test
+          POSTGRES_USER: edms
+          POSTGRES_PASSWORD: edms_test
+        ports: ["5433:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      ENVIRONMENT: test
+      DB_HOST: localhost
+      DB_PORT: "5433"
+      DB_NAME: edms_test
+      DB_USER: edms
+      DB_PASSWORD: edms_test
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      USE_LOCAL_STORAGE: "true"
+      USE_AWS_SECRETS: "false"
+      USE_AWS_SQS: "false"
+      USE_FAKE_REDIS: "true"
+      API_KEY: test_key
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements*.txt') }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Apply schema
+        run: psql postgresql://edms:edms_test@localhost:5433/edms_test -f infra/schema.sql
+        env:
+          PGPASSWORD: edms_test
+
+      - name: Run unit tests
+        run: pytest tests/ --ignore=tests/integration -v --tb=short
+
+      - name: Run smoke tests
+        run: python scripts/smoke_aggregation.py

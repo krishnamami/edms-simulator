@@ -1,0 +1,136 @@
+"""ElastiCache Redis store with three-mode support.
+
+- USE_FAKE_REDIS=true   -> fakeredis (CI/unit tests)
+- ENVIRONMENT=local     -> local Redis (docker-compose)
+- ENVIRONMENT=production-> ElastiCache via secrets manager
+"""
+import json
+import logging
+import os
+from typing import Optional
+
+from core.storage.secrets import get_secrets
+
+logger = logging.getLogger(__name__)
+_client = None
+
+
+def get_redis():
+    global _client
+    if _client is None:
+        _client = _create_client()
+    return _client
+
+
+def _create_client():
+    if os.getenv("USE_FAKE_REDIS", "false").lower() == "true":
+        import fakeredis
+        logger.info("redis_using_fakeredis")
+        return fakeredis.FakeRedis(decode_responses=True)
+
+    secrets = get_secrets()
+    creds = secrets.get_secret("edms/redis/endpoint")
+    import redis
+    client = redis.Redis(
+        host=creds["host"],
+        port=creds["port"],
+        password=creds.get("password") or None,
+        decode_responses=True,
+        ssl=os.getenv("REDIS_SSL", "false").lower() == "true",
+        socket_connect_timeout=5,
+        socket_timeout=5,
+        retry_on_timeout=True,
+    )
+    logger.info("redis_connected", extra={"host": creds["host"]})
+    return client
+
+
+class RedisStore:
+    TTL_INCOME_PROFILE = 14400   # 4 hours
+    TTL_CREDIT_PROFILE = 14400   # 4 hours
+    TTL_GOLDEN_STATUS = 86400    # 24 hours
+    TTL_APP_LOOKUP = 43200       # 12 hours
+
+    def __init__(self, client=None):
+        self._r = client or get_redis()
+
+    def set_income_profile(
+        self, applicant_id: str, profile: dict, ttl: Optional[int] = None
+    ) -> bool:
+        try:
+            self._r.setex(
+                f"income:{applicant_id}",
+                ttl or self.TTL_INCOME_PROFILE,
+                json.dumps(profile, default=str),
+            )
+            return True
+        except Exception as e:
+            logger.warning("redis_set_income_failed", extra={"error": str(e)})
+            return False
+
+    def get_income_profile(self, applicant_id: str) -> Optional[dict]:
+        try:
+            raw = self._r.get(f"income:{applicant_id}")
+            return json.loads(raw) if raw else None
+        except Exception as e:
+            logger.warning("redis_get_income_failed", extra={"error": str(e)})
+            return None
+
+    def set_credit_profile(
+        self, applicant_id: str, profile: dict, ttl: Optional[int] = None
+    ) -> bool:
+        try:
+            self._r.setex(
+                f"credit:{applicant_id}",
+                ttl or self.TTL_CREDIT_PROFILE,
+                json.dumps(profile, default=str),
+            )
+            return True
+        except Exception as e:
+            logger.warning("redis_set_credit_failed", extra={"error": str(e)})
+            return False
+
+    def get_credit_profile(self, applicant_id: str) -> Optional[dict]:
+        try:
+            raw = self._r.get(f"credit:{applicant_id}")
+            return json.loads(raw) if raw else None
+        except Exception as e:
+            logger.warning("redis_get_credit_failed", extra={"error": str(e)})
+            return None
+
+    def set_status(self, applicant_id: str, status: str):
+        try:
+            self._r.setex(
+                f"status:{applicant_id}", self.TTL_GOLDEN_STATUS, status
+            )
+        except Exception as e:
+            logger.warning("redis_set_status_failed", extra={"error": str(e)})
+
+    def get_status(self, applicant_id: str) -> Optional[str]:
+        try:
+            return self._r.get(f"status:{applicant_id}")
+        except Exception:
+            return None
+
+    def set_app_lookup(self, los_id: str, data: dict):
+        try:
+            self._r.setex(
+                f"app_los:{los_id}",
+                self.TTL_APP_LOOKUP,
+                json.dumps(data, default=str),
+            )
+        except Exception as e:
+            logger.warning("redis_set_app_failed", extra={"error": str(e)})
+
+    def get_app_lookup(self, los_id: str) -> Optional[dict]:
+        try:
+            raw = self._r.get(f"app_los:{los_id}")
+            return json.loads(raw) if raw else None
+        except Exception:
+            return None
+
+    def ping(self) -> bool:
+        try:
+            return bool(self._r.ping())
+        except Exception:
+            return False

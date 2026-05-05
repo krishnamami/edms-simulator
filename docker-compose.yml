@@ -1,0 +1,57 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: edms
+      POSTGRES_USER: edms
+      POSTGRES_PASSWORD: edms_dev
+    ports: ["5433:5432"]
+    volumes:
+      - edms_pgdata:/var/lib/postgresql/data
+      - ./infra/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edms"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports: ["6380:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8001 --reload
+    ports: ["8001:8001"]
+    environment:
+      ENVIRONMENT:        local
+      DB_HOST:            postgres
+      DB_PORT:            "5432"
+      DB_NAME:            edms
+      DB_USER:            edms
+      DB_PASSWORD:        edms_dev
+      REDIS_HOST:         redis
+      REDIS_PORT:         "6379"
+      USE_LOCAL_STORAGE:  "true"
+      USE_AWS_SECRETS:    "false"
+      USE_AWS_SQS:        "false"
+      USE_FAKE_REDIS:     "false"
+      API_KEY:            edms_dev_key
+      LOCAL_STORAGE_PATH: /app/local_storage
+    volumes:
+      - .:/app
+      - local_storage:/app/local_storage
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+
+volumes:
+  edms_pgdata:
+  local_storage:

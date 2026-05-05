@@ -1,0 +1,65 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: EDMS Simulator - ElastiCache Redis (cluster mode disabled, replication group).
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: edms-simulator
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  CacheNodeType:
+    Type: String
+    Default: cache.t4g.small
+  IngressCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+Resources:
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ElastiCache Redis ingress
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          CidrIp: !Ref IngressCidr
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-redis-sg
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Redis subnet group
+      SubnetIds: !Ref PrivateSubnetIds
+
+  RedisReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub ${EnvironmentName}-redis
+      ReplicationGroupDescription: EDMS hot cache
+      Engine: redis
+      EngineVersion: "7.1"
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheClusters: 2
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds: [!Ref RedisSecurityGroup]
+      SnapshotRetentionLimit: 1
+
+Outputs:
+  RedisPrimaryEndpoint:
+    Value: !GetAtt RedisReplicationGroup.PrimaryEndPoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-redis-endpoint
+  RedisSecurityGroupId:
+    Value: !Ref RedisSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-redis-sg

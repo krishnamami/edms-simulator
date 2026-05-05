@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: EDMS Simulator - SQS FIFO queues + Lambda async processors.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: edms-simulator
+  LambdaCodeBucket:
+    Type: String
+  LambdaCodeKey:
+    Type: String
+    Default: edms-simulator-lambdas.zip
+  LambdaRuntime:
+    Type: String
+    Default: python3.10
+
+Resources:
+  IdentityResolutionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: identity-resolution-queue-dlq.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  IdentityResolutionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: identity-resolution-queue.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IdentityResolutionDLQ.Arn
+        maxReceiveCount: 5
+
+  IncomeAssemblyDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: income-assembly-queue-dlq.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  IncomeAssemblyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: income-assembly-queue.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 180
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IncomeAssemblyDLQ.Arn
+        maxReceiveCount: 5
+
+  DocumentIngestionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: document-ingestion-queue-dlq.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  DocumentIngestionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: document-ingestion-queue.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+      VisibilityTimeout: 300
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DocumentIngestionDLQ.Arn
+        maxReceiveCount: 5
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: SqsAndStorage
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:HeadObject
+                Resource: "*"
+
+  IdentityResolverFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-identity-resolver
+      Runtime: !Ref LambdaRuntime
+      Handler: core.lambda_handlers.identity_resolver_fn.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+
+  IncomeAssemblerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-income-assembler
+      Runtime: !Ref LambdaRuntime
+      Handler: core.lambda_handlers.income_assembler_fn.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+
+  DocumentIngestFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-document-ingest
+      Runtime: !Ref LambdaRuntime
+      Handler: core.lambda_handlers.document_ingest_fn.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+
+  IdentityResolverMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IdentityResolutionQueue.Arn
+      FunctionName: !Ref IdentityResolverFn
+      BatchSize: 5
+
+  IncomeAssemblerMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IncomeAssemblyQueue.Arn
+      FunctionName: !Ref IncomeAssemblerFn
+      BatchSize: 5
+
+  DocumentIngestMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt DocumentIngestionQueue.Arn
+      FunctionName: !Ref DocumentIngestFn
+      BatchSize: 5
+
+Outputs:
+  IdentityResolutionQueueUrl:
+    Value: !Ref IdentityResolutionQueue
+    Export:
+      Name: !Sub ${EnvironmentName}-identity-queue
+  IncomeAssemblyQueueUrl:
+    Value: !Ref IncomeAssemblyQueue
+    Export:
+      Name: !Sub ${EnvironmentName}-income-queue
+  DocumentIngestionQueueUrl:
+    Value: !Ref DocumentIngestionQueue
+    Export:
+      Name: !Sub ${EnvironmentName}-document-queue

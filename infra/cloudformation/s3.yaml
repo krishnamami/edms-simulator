@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: EDMS Simulator - S3 raw document bucket (versioned + KMS + lifecycle).
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: edms-simulator
+  BucketName:
+    Type: String
+    Default: edms-simulator-loans
+
+Resources:
+  DocumentsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for EDMS document bucket SSE-KMS
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAccountRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+
+  DocumentsKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${EnvironmentName}-docs
+      TargetKeyId: !Ref DocumentsKmsKey
+
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref DocumentsKmsKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TierToIntelligentTieringAfter30Days
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+Outputs:
+  BucketName:
+    Value: !Ref DocumentsBucket
+    Export:
+      Name: !Sub ${EnvironmentName}-docs-bucket
+  KmsKeyArn:
+    Value: !GetAtt DocumentsKmsKey.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-docs-kms

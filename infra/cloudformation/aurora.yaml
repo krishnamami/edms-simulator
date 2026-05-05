@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: EDMS Simulator - Aurora Serverless v2 (Postgres 15) + RDS Proxy.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: edms-simulator
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  DBMasterUsername:
+    Type: String
+    Default: edms_admin
+  DBSecretArn:
+    Type: String
+    Description: ARN of edms/aurora/credentials secret in Secrets Manager
+  DBSecurityGroupIngressCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+Resources:
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora Postgres ingress
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref DBSecurityGroupIngressCidr
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-aurora-sg
+
+  AuroraSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Aurora subnet group
+      SubnetIds: !Ref PrivateSubnetIds
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: "15.4"
+      EngineMode: provisioned
+      DatabaseName: edms
+      MasterUsername: !Ref DBMasterUsername
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref AuroraSubnetGroup
+      VpcSecurityGroupIds: [!Ref AuroraSecurityGroup]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 8
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      DeletionProtection: true
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      PubliclyAccessible: false
+
+  RDSProxy:
+    Type: AWS::RDS::DBProxy
+    Properties:
+      DBProxyName: !Sub ${EnvironmentName}-rds-proxy
+      EngineFamily: POSTGRESQL
+      Auth:
+        - AuthScheme: SECRETS
+          SecretArn: !Ref DBSecretArn
+          IAMAuth: DISABLED
+      RoleArn: !GetAtt RDSProxyRole.Arn
+      VpcSubnetIds: !Ref PrivateSubnetIds
+      VpcSecurityGroupIds: [!Ref AuroraSecurityGroup]
+      RequireTLS: true
+      IdleClientTimeout: 1800
+
+  RDSProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref RDSProxy
+      TargetGroupName: default
+      DBClusterIdentifiers: [!Ref AuroraCluster]
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 100
+        MaxIdleConnectionsPercent: 50
+        ConnectionBorrowTimeout: 120
+
+  RDSProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: rds.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReadDBSecret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DBSecretArn
+
+Outputs:
+  AuroraEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-aurora-endpoint
+  RDSProxyEndpoint:
+    Value: !GetAtt RDSProxy.Endpoint
+    Export:
+      Name: !Sub ${EnvironmentName}-rds-proxy-endpoint
+  AuroraSecurityGroupId:
+    Value: !Ref AuroraSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-aurora-sg

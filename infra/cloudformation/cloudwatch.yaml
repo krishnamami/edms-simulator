@@ -1,0 +1,98 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: EDMS Simulator - CloudWatch alarms + dashboard.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: edms-simulator
+  EcsClusterName:
+    Type: String
+  EcsServiceName:
+    Type: String
+  AlertTopicArn:
+    Type: String
+    Description: SNS topic ARN for alarm notifications
+
+Resources:
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-ecs-high-cpu
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Statistic: Average
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 3
+      Period: 60
+      Dimensions:
+        - { Name: ClusterName, Value: !Ref EcsClusterName }
+        - { Name: ServiceName, Value: !Ref EcsServiceName }
+      AlarmActions: [!Ref AlertTopicArn]
+
+  HighMemAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-ecs-high-mem
+      Namespace: AWS/ECS
+      MetricName: MemoryUtilization
+      Statistic: Average
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 3
+      Period: 60
+      Dimensions:
+        - { Name: ClusterName, Value: !Ref EcsClusterName }
+        - { Name: ServiceName, Value: !Ref EcsServiceName }
+      AlarmActions: [!Ref AlertTopicArn]
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-alb-5xx
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Statistic: Sum
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      Period: 60
+      AlarmActions: [!Ref AlertTopicArn]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${EnvironmentName}-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ECS", "CPUUtilization", "ServiceName", "${EcsServiceName}", "ClusterName", "${EcsClusterName}"],
+                  [".", "MemoryUtilization", ".", ".", ".", "."]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "ECS CPU & Memory"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/ApplicationELB", "TargetResponseTime"],
+                  [".", "HTTPCode_Target_2XX_Count"],
+                  [".", "HTTPCode_Target_5XX_Count"]
+                ],
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "title": "ALB Latency / Status Codes"
+              }
+            }
+          ]
+        }
