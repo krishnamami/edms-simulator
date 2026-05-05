@@ -3,11 +3,16 @@
 Returns a list of NormalizedIngestEvents: one for the email body (Claude
 extraction) plus one per attachment (routed through pdf_adapter or
 image_adapter). Subject keywords add a document-type hint to the body event.
+
+If the Claude call for body extraction fails (e.g. account-level errors
+like quota exhaustion), the body event falls back to the no-Claude shape
+with a `_claude_error` note so attachments still process.
 """
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 from typing import Any, Optional
 
@@ -17,6 +22,8 @@ from core.ingestion._claude_client import (
 )
 from core.ingestion.adapters import image_adapter, pdf_adapter
 from core.ingestion.events import ChannelType, NormalizedIngestEvent
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = (
@@ -72,6 +79,26 @@ def _detect_attachment_kind(raw: bytes) -> Optional[str]:
     return None
 
 
+def _fallback_body_event(
+    subject: str,
+    body: str,
+    hint: Optional[str],
+    applicant_id: Optional[str],
+    error_note: Optional[str] = None,
+) -> NormalizedIngestEvent:
+    extracted = {"subject": subject, "body": body, "subject_hint": hint}
+    if error_note:
+        extracted["_claude_error"] = error_note
+    return NormalizedIngestEvent(
+        source_channel=ChannelType.EMAIL,
+        document_type=hint,
+        applicant_signals={"applicant_id": applicant_id} if applicant_id else {},
+        extracted_fields=extracted,
+        confidence=0.40,
+        requires_verification=True,
+    )
+
+
 def _body_event(
     subject: str,
     body: str,
@@ -85,25 +112,25 @@ def _body_event(
     if api is None or not body.strip():
         # No Claude available or empty body — emit a low-confidence event
         # carrying just the raw text + subject hint.
-        return NormalizedIngestEvent(
-            source_channel=ChannelType.EMAIL,
-            document_type=hint,
-            applicant_signals={"applicant_id": applicant_id} if applicant_id else {},
-            extracted_fields={
-                "subject": subject,
-                "body": body,
-                "subject_hint": hint,
-            },
-            confidence=0.40,
-            requires_verification=True,
+        return _fallback_body_event(subject, body, hint, applicant_id)
+
+    try:
+        response = api.messages.create(
+            model=CLAUDE_MODEL_ID,
+            max_tokens=1000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": f"Subject: {subject}\n\n{body}"}],
+        )
+    except Exception as exc:
+        # Account-level errors (quota, auth) and any other API failure must
+        # not break the whole email pipeline — attachments still need to
+        # process. Fall back with a note so callers can surface it.
+        logger.warning("email_body_claude_failed: %s", exc)
+        return _fallback_body_event(
+            subject, body, hint, applicant_id,
+            error_note=f"{type(exc).__name__}: {exc}",
         )
 
-    response = api.messages.create(
-        model=CLAUDE_MODEL_ID,
-        max_tokens=1000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": f"Subject: {subject}\n\n{body}"}],
-    )
     text_blocks = [b.text for b in response.content if getattr(b, "type", None) == "text"]
     extracted = _parse_json(text_blocks[0]) if text_blocks else {}
 

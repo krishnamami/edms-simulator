@@ -103,3 +103,49 @@ def test_body_extraction_with_mocked_claude():
     assert body.confidence >= 0.70
     assert body.extracted_fields["annual_income"] == 92000
     assert body.extracted_fields["employer"] == "Accenture"
+
+
+class _FailingClaudeClient:
+    """Simulates an Anthropic API error (e.g. quota exhausted)."""
+
+    def __init__(self):
+        self.messages = self
+
+    def create(self, **kwargs):
+        raise RuntimeError(
+            "Error code: 400 - Your credit balance is too low"
+        )
+
+
+def test_body_extraction_falls_back_when_claude_errors():
+    """Account-level Claude errors must not break the email pipeline."""
+    client = _FailingClaudeClient()
+    pdf_bytes, _ = generate_w2(
+        employee_name="James Okafor", employee_ssn_last4="1234",
+        employee_address="X", employer_name="Accenture LLC",
+        employer_ein="999999999", employer_address="X",
+        tax_year=2024, box1_wages=92400,
+    )
+
+    events = email_adapter.adapt(
+        {
+            "from": "x@y.com",
+            "subject": "W2 attached",
+            "body": "see attached",
+            "attachments": [
+                {"filename": "w2.pdf", "content_base64": base64.b64encode(pdf_bytes).decode()},
+            ],
+        },
+        client=client,
+    )
+
+    # Body event survives with a recorded error and low confidence.
+    body = events[0]
+    assert body.confidence < 0.50
+    assert "_claude_error" in body.extracted_fields
+    assert "credit balance" in body.extracted_fields["_claude_error"]
+
+    # Attachment event still produced (this is the critical guarantee).
+    pdf_events = [e for e in events if e.source_channel.value == "pdf_upload"]
+    assert len(pdf_events) == 1
+    assert pdf_events[0].document_type == "W2"

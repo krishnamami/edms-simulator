@@ -36,6 +36,17 @@ from core.ingestion.adapters import (
 from core.ingestion.events import ChannelType
 from core.ingestion.router import IngestRouter
 
+try:
+    from anthropic import APIStatusError as _AnthropicAPIStatusError  # type: ignore
+except Exception:  # SDK absent in some environments
+    _AnthropicAPIStatusError = None  # type: ignore[assignment]
+
+
+def _claude_error_to_http(exc: Exception) -> HTTPException:
+    """Map an upstream Anthropic error to a 502 with a useful detail."""
+    detail = getattr(exc, "message", None) or str(exc)
+    return HTTPException(status_code=502, detail=f"Anthropic upstream error: {detail}")
+
 logger = structlog.get_logger()
 router = APIRouter()
 
@@ -220,6 +231,10 @@ async def ingest_image(
         )
     except ClaudeUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        if _AnthropicAPIStatusError and isinstance(exc, _AnthropicAPIStatusError):
+            raise _claude_error_to_http(exc)
+        raise
     return event.model_dump()
 
 
@@ -229,6 +244,10 @@ async def ingest_email(payload: dict):
         events = email_adapter.adapt(payload)
     except ClaudeUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        if _AnthropicAPIStatusError and isinstance(exc, _AnthropicAPIStatusError):
+            raise _claude_error_to_http(exc)
+        raise
     attachments_count = max(0, len(events) - 1)  # one body event + N attachments
     return {
         "events": [e.model_dump() for e in events],
@@ -244,6 +263,10 @@ async def ingest_chat(payload: dict):
         event = chat_adapter.adapt(messages, applicant_id=applicant_id)
     except ClaudeUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        if _AnthropicAPIStatusError and isinstance(exc, _AnthropicAPIStatusError):
+            raise _claude_error_to_http(exc)
+        raise
     return {
         "extracted": event.extracted_fields,
         "missing_fields": event.missing_fields,

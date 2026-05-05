@@ -241,6 +241,8 @@ chat_overall_conf = None
 chat_missing: list[str] = []
 chat_documents_needed: list[str] = []
 chat_next_question = None
+chat_failed = False
+chat_failure_detail = None
 
 if claude_available:
     try:
@@ -250,20 +252,29 @@ if claude_available:
             headers=HEADERS_JSON,
             timeout=60,
         )
-        r.raise_for_status()
-        body = r.json()
-        chat_extracted = body.get("extracted") or {}
-        chat_overall_conf = body.get("overall_confidence")
-        chat_missing = body.get("missing_fields") or []
-        chat_documents_needed = body.get("documents_needed") or []
-        chat_next_question = body.get("next_question_suggestion")
-        ok(f"Chat extraction succeeded — overall_confidence={chat_overall_conf}")
-        show_json("Extracted (truncated)", chat_extracted, max_lines=35)
-        info(f"missing_fields:    {chat_missing}")
-        info(f"documents_needed:  {chat_documents_needed}")
-        if chat_next_question:
-            info(f"next_question:     \"{chat_next_question}\"")
+        if r.status_code != 200:
+            chat_failed = True
+            try:
+                chat_failure_detail = r.json().get("detail") or r.text
+            except Exception:
+                chat_failure_detail = r.text
+            warn(f"Chat ingest failed (HTTP {r.status_code}): {chat_failure_detail}")
+        else:
+            body = r.json()
+            chat_extracted = body.get("extracted") or {}
+            chat_overall_conf = body.get("overall_confidence")
+            chat_missing = body.get("missing_fields") or []
+            chat_documents_needed = body.get("documents_needed") or []
+            chat_next_question = body.get("next_question_suggestion")
+            ok(f"Chat extraction succeeded — overall_confidence={chat_overall_conf}")
+            show_json("Extracted (truncated)", chat_extracted, max_lines=35)
+            info(f"missing_fields:    {chat_missing}")
+            info(f"documents_needed:  {chat_documents_needed}")
+            if chat_next_question:
+                info(f"next_question:     \"{chat_next_question}\"")
     except Exception as e:
+        chat_failed = True
+        chat_failure_detail = str(e)
         warn(f"Chat ingest failed: {e}")
 else:
     warn("Skipping live chat — set ANTHROPIC_API_KEY to exercise this path.")
@@ -317,6 +328,7 @@ email_payload = {
 }
 
 paystub_event = None
+email_body_failed = False
 try:
     r = httpx.post(
         f"{API_URL}/ingest/email",
@@ -324,19 +336,31 @@ try:
         headers=HEADERS_JSON,
         timeout=60,
     )
-    r.raise_for_status()
-    body = r.json()
-    events = body.get("events", [])
-    info(f"events returned: {len(events)} (1 body + {body.get('documents_processed')} attachment)")
-    for ev in events:
-        if ev["source_channel"] == ChannelType.EMAIL.value:
-            ok(f"body event — confidence={ev['confidence']:.2f}, hint={ev.get('document_type')}")
-        elif ev["source_channel"] == ChannelType.PDF_UPLOAD.value:
-            paystub_event = ev
-            ok(f"attachment event — {ev['document_type']} confidence={ev['confidence']:.2f}")
-            ef = ev["extracted_fields"]
-            info(f"gross_pay  = ${ef.get('gross_pay'):,.2f}    ytd_gross = ${ef.get('ytd_gross'):,.2f}")
-            info(f"net_pay    = ${ef.get('net_pay'):,.2f}")
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail") or r.text
+        except Exception:
+            detail = r.text
+        warn(f"Email ingest failed (HTTP {r.status_code}): {detail}")
+    else:
+        body = r.json()
+        events = body.get("events", [])
+        info(f"events returned: {len(events)} (1 body + {body.get('documents_processed')} attachment)")
+        for ev in events:
+            if ev["source_channel"] == ChannelType.EMAIL.value:
+                ef = ev.get("extracted_fields") or {}
+                if "_claude_error" in ef:
+                    email_body_failed = True
+                    warn(f"body event — Claude failed, fell back to low-confidence (confidence={ev['confidence']:.2f})")
+                    info(f"reason: {ef['_claude_error']}")
+                else:
+                    ok(f"body event — confidence={ev['confidence']:.2f}, hint={ev.get('document_type')}")
+            elif ev["source_channel"] == ChannelType.PDF_UPLOAD.value:
+                paystub_event = ev
+                ok(f"attachment event — {ev['document_type']} confidence={ev['confidence']:.2f}")
+                ef = ev["extracted_fields"]
+                info(f"gross_pay  = ${ef.get('gross_pay'):,.2f}    ytd_gross = ${ef.get('ytd_gross'):,.2f}")
+                info(f"net_pay    = ${ef.get('net_pay'):,.2f}")
 except Exception as e:
     warn(f"Email ingest failed: {e}")
 
@@ -531,14 +555,34 @@ print(f"{BOLD}{GREEN}  LOCAL SIMULATION COMPLETE{RESET}")
 print(f"{BOLD}{GREEN}{'='*72}{RESET}")
 
 artifact_count = len(artifacts)
+
+
+def _chat_status() -> str:
+    if chat_extracted:
+        return "✓ live"
+    if chat_failed:
+        return f"failed (live error: {chat_failure_detail[:60]}…)" if chat_failure_detail else "failed (live error)"
+    return "skipped (no key)"
+
+
+def _email_status() -> str:
+    if paystub_event and not email_body_failed:
+        return "✓ body + attachment"
+    if paystub_event and email_body_failed:
+        return "partial (attachment ✓, body failed live)"
+    if email_body_failed:
+        return "body failed live (no attachment processed)"
+    return "skipped (no key)" if not claude_available else "(body only)"
+
+
 print(f"""
   Documents generated and saved to {LOCAL_STORAGE/'demo'}:
     {artifact_count} files ({sum(len(c) for _, c in artifacts):,} bytes total)
 
   Channels exercised this run:
-    chat       {'✓ live' if claude_available and chat_extracted else 'skipped (no key)'}
+    chat       {_chat_status()}
     pdf        ✓ deterministic (pymupdf)
-    email+pdf  {'✓' if paystub_event else '(body only)'}
+    email+pdf  {_email_status()}
     api        ✓ POST /loans
 
   Postgres now contains:
