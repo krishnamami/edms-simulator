@@ -41,7 +41,9 @@ from core.ingestion.mismo import (
     ENCOMPASS_TO_INTERNAL,
     MISMO_TO_INTERNAL,
 )
+from core.ingestion.pipeline import IngestionPipeline
 from core.ingestion.router import IngestRouter
+from core.storage.raw_ingestion_store import RawIngestionStore
 
 try:
     from anthropic import APIStatusError as _AnthropicAPIStatusError  # type: ignore
@@ -212,29 +214,83 @@ def _next_question_for(missing: list[str]) -> Optional[str]:
     return f"Could you share your {pretty}?"
 
 
+def _build_pipeline(request: Request) -> IngestionPipeline:
+    """Per-request pipeline; reuses the app.state singletons for s3 +
+    postgres, default-constructs RawIngestionStore (stateless)."""
+    return IngestionPipeline(
+        postgres_store=request.app.state.postgres_store,
+        redis_store=request.app.state.redis_store,
+        s3_client=request.app.state.s3_client,
+        raw_store=getattr(request.app.state, "raw_store", None) or RawIngestionStore(),
+    )
+
+
+def _claude_or_anthropic_to_http(exc: Exception) -> HTTPException:
+    if isinstance(exc, ClaudeUnavailable):
+        return HTTPException(status_code=503, detail=str(exc))
+    if _AnthropicAPIStatusError and isinstance(exc, _AnthropicAPIStatusError):
+        return _claude_error_to_http(exc)
+    return HTTPException(status_code=500, detail=str(exc))
+
+
 @router.post("/ingest/pdf", dependencies=[Depends(verify_api_key)])
 async def ingest_pdf(
+    request: Request,
     file: UploadFile = File(...),
     applicant_id: Optional[str] = Form(None),
     borrower_role: str = Form("primary"),
 ):
     body = await file.read()
-    event = pdf_adapter.adapt(
-        body, applicant_id=applicant_id, borrower_role=borrower_role,
+    pipeline = _build_pipeline(request)
+    result = await pipeline.ingest(
+        channel=ChannelType.PDF_UPLOAD,
+        payload=body,
+        applicant_id=applicant_id,
+        filename=file.filename,
     )
-    return event.model_dump()
+    return {
+        **result["event"].model_dump(),
+        "ingest_id": result["ingest_id"],
+        "raw_s3_key": result["raw_s3_key"],
+    }
 
 
 @router.post("/ingest/image", dependencies=[Depends(verify_api_key)])
 async def ingest_image(
+    request: Request,
     file: UploadFile = File(...),
     applicant_id: Optional[str] = Form(None),
     borrower_role: str = Form("primary"),
 ):
     body = await file.read()
+    pipeline = _build_pipeline(request)
     try:
-        event = image_adapter.adapt(
-            body, applicant_id=applicant_id, borrower_role=borrower_role,
+        result = await pipeline.ingest(
+            channel=ChannelType.IMAGE_UPLOAD,
+            payload=body,
+            applicant_id=applicant_id,
+            filename=file.filename,
+        )
+    except (ClaudeUnavailable, Exception) as exc:
+        if isinstance(exc, ClaudeUnavailable) or (
+            _AnthropicAPIStatusError and isinstance(exc, _AnthropicAPIStatusError)
+        ):
+            raise _claude_or_anthropic_to_http(exc)
+        raise
+    return {
+        **result["event"].model_dump(),
+        "ingest_id": result["ingest_id"],
+        "raw_s3_key": result["raw_s3_key"],
+    }
+
+
+@router.post("/ingest/email", dependencies=[Depends(verify_api_key)])
+async def ingest_email(request: Request, payload: dict):
+    pipeline = _build_pipeline(request)
+    try:
+        result = await pipeline.ingest(
+            channel=ChannelType.EMAIL,
+            payload=payload,
         )
     except ClaudeUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -242,38 +298,34 @@ async def ingest_image(
         if _AnthropicAPIStatusError and isinstance(exc, _AnthropicAPIStatusError):
             raise _claude_error_to_http(exc)
         raise
-    return event.model_dump()
-
-
-@router.post("/ingest/email", dependencies=[Depends(verify_api_key)])
-async def ingest_email(payload: dict):
-    try:
-        events = email_adapter.adapt(payload)
-    except ClaudeUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except Exception as exc:
-        if _AnthropicAPIStatusError and isinstance(exc, _AnthropicAPIStatusError):
-            raise _claude_error_to_http(exc)
-        raise
-    attachments_count = max(0, len(events) - 1)  # one body event + N attachments
+    events = result["event"]
+    attachments_count = max(0, len(events) - 1)
     return {
+        "ingest_id": result["ingest_id"],
+        "raw_s3_key": result["raw_s3_key"],
         "events": [e.model_dump() for e in events],
         "documents_processed": attachments_count,
     }
 
 
 @router.post("/ingest/chat", dependencies=[Depends(verify_api_key)])
-async def ingest_chat(payload: dict):
+async def ingest_chat(request: Request, payload: dict):
     messages = payload.get("messages") or []
     applicant_id = payload.get("applicant_id")
+    pipeline = _build_pipeline(request)
     try:
-        event = chat_adapter.adapt(messages, applicant_id=applicant_id)
+        result = await pipeline.ingest(
+            channel=ChannelType.CHAT,
+            payload=messages,
+            applicant_id=applicant_id,
+        )
     except ClaudeUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     except Exception as exc:
         if _AnthropicAPIStatusError and isinstance(exc, _AnthropicAPIStatusError):
             raise _claude_error_to_http(exc)
         raise
+    event = result["event"]
     return {
         "extracted": event.extracted_fields,
         "missing_fields": event.missing_fields,
@@ -282,30 +334,125 @@ async def ingest_chat(payload: dict):
         "applicant_id": applicant_id,
         "next_question_suggestion": _next_question_for(event.missing_fields),
         "event": event.model_dump(),
+        "ingest_id": result["ingest_id"],
+        "raw_s3_key": result["raw_s3_key"],
     }
 
 
 @router.post("/ingest/form", dependencies=[Depends(verify_api_key)])
-async def ingest_form(payload: dict):
-    event = form_adapter.adapt(payload)
-    return event.model_dump()
+async def ingest_form(request: Request, payload: dict):
+    pipeline = _build_pipeline(request)
+    result = await pipeline.ingest(channel=ChannelType.FORM, payload=payload)
+    return {
+        **result["event"].model_dump(),
+        "ingest_id": result["ingest_id"],
+        "raw_s3_key": result["raw_s3_key"],
+    }
 
 
 @router.post("/ingest/csv", dependencies=[Depends(verify_api_key)])
-async def ingest_csv(file: UploadFile = File(...)):
+async def ingest_csv(request: Request, file: UploadFile = File(...)):
     body = await file.read()
-    events, report = csv_adapter.adapt(body)
+    pipeline = _build_pipeline(request)
+    result = await pipeline.ingest(
+        channel=ChannelType.CSV_BATCH,
+        payload=body,
+        filename=file.filename,
+    )
+    events, report = result["event"]
     return {
+        "ingest_id": result["ingest_id"],
+        "raw_s3_key": result["raw_s3_key"],
         **report,
         "applicants": [e.applicant_signals for e in events],
     }
 
 
 @router.post("/ingest/xml", dependencies=[Depends(verify_api_key)])
-async def ingest_xml(file: UploadFile = File(...)):
+async def ingest_xml(request: Request, file: UploadFile = File(...)):
     body = await file.read()
-    event = xml_adapter.adapt(body)
-    return event.model_dump()
+    pipeline = _build_pipeline(request)
+    result = await pipeline.ingest(
+        channel=ChannelType.XML,
+        payload=body,
+        filename=file.filename,
+    )
+    return {
+        **result["event"].model_dump(),
+        "ingest_id": result["ingest_id"],
+        "raw_s3_key": result["raw_s3_key"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase A: raw_ingestion observability
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/applicant/{applicant_id}/raw-ingestion",
+    dependencies=[Depends(verify_api_key)],
+)
+async def list_raw_ingestion(request: Request, applicant_id: str):
+    raw_store = getattr(request.app.state, "raw_store", None) or RawIngestionStore()
+    rows = await raw_store.get_for_applicant(applicant_id)
+    state = await raw_store.get_pipeline_state(applicant_id)
+    return {
+        "applicant_id":   applicant_id,
+        "pipeline_state": state,
+        "ingestions":     rows,
+    }
+
+
+@router.get(
+    "/ingest/{ingest_id}/raw",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_raw_ingestion(request: Request, ingest_id: str):
+    raw_store = getattr(request.app.state, "raw_store", None) or RawIngestionStore()
+    row = await raw_store.get(ingest_id)
+    if not row:
+        raise HTTPException(status_code=404, detail=f"no raw ingestion {ingest_id}")
+    return row
+
+
+@router.post(
+    "/ingest/{ingest_id}/reprocess",
+    dependencies=[Depends(verify_api_key)],
+)
+async def reprocess_raw_ingestion(request: Request, ingest_id: str):
+    pipeline = _build_pipeline(request)
+    try:
+        result = await pipeline.reprocess(ingest_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except ClaudeUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        if _AnthropicAPIStatusError and isinstance(exc, _AnthropicAPIStatusError):
+            raise _claude_error_to_http(exc)
+        raise
+    event = result["event"]
+    summary = (
+        event.model_dump() if hasattr(event, "model_dump")
+        else {"events_count": len(event) if isinstance(event, (list, tuple)) else 0}
+    )
+    return {
+        "ingest_id":   result["ingest_id"],
+        "status":      result["status"],
+        "raw_s3_key":  result["raw_s3_key"],
+        "result":      summary,
+    }
+
+
+@router.get(
+    "/pipeline/failed",
+    dependencies=[Depends(verify_api_key)],
+)
+async def list_failed_ingestions(request: Request, limit: int = 50):
+    raw_store = getattr(request.app.state, "raw_store", None) or RawIngestionStore()
+    rows = await raw_store.get_failed(limit=limit)
+    return {"count": len(rows), "ingestions": rows}
 
 
 # ---------------------------------------------------------------------------

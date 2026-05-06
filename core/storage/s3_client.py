@@ -84,3 +84,96 @@ class S3Client:
             return True
         except Exception:
             return False
+
+    # ---------------- Phase A: raw inbound storage -----------------
+
+    def store_raw(
+        self,
+        source_channel: str,
+        content: bytes,
+        filename: str | None = None,
+        applicant_id: str | None = None,
+    ) -> tuple[str, int]:
+        """Store an inbound raw payload BEFORE any extraction runs.
+
+        Key layout: ``raw/{channel}/{applicant_id?}/{YYYY/MM/DD}/{uuid}.{ext}``.
+        Returns ``(s3_key, size_bytes)``.
+        """
+        import uuid as _uuid
+        from datetime import datetime as _dt
+
+        ext = self._infer_extension(content, filename)
+        date_prefix = _dt.utcnow().strftime("%Y/%m/%d")
+        file_id = str(_uuid.uuid4())
+        applicant_prefix = f"{applicant_id}/" if applicant_id else ""
+        key = (
+            f"raw/{source_channel}/{applicant_prefix}{date_prefix}/{file_id}.{ext}"
+        )
+        size = len(content)
+
+        if self.use_local:
+            full_path = self.local_path / key
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_bytes(content)
+            logger.info("raw_local_saved", extra={"key": key, "size": size})
+            return key, size
+
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=content,
+                ContentType=self._infer_mime(content, filename),
+                ServerSideEncryption="aws:kms",
+                Metadata={
+                    "source_channel": source_channel,
+                    "applicant_id": applicant_id or "",
+                    "original_filename": filename or "",
+                },
+            )
+            logger.info("raw_s3_uploaded", extra={"key": key, "size": size})
+            return key, size
+        except Exception as e:
+            logger.error("raw_s3_upload_failed", extra={"key": key, "error": str(e)})
+            raise
+
+    def get_raw(self, s3_key: str) -> bytes:
+        """Read the raw bytes back. Used by the reprocess path."""
+        if self.use_local:
+            return (self.local_path / s3_key).read_bytes()
+        response = self.client.get_object(Bucket=self.bucket, Key=s3_key)
+        return response["Body"].read()
+
+    @staticmethod
+    def _infer_extension(content: bytes, filename: str | None = None) -> str:
+        if filename and "." in filename:
+            return filename.rsplit(".", 1)[-1].lower()
+        head = content[:8] if content else b""
+        if head[:4] == b"%PDF":
+            return "pdf"
+        if head[:2] == b"\xff\xd8":
+            return "jpg"
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if head[:4] == b"II*\x00" or head[:4] == b"MM\x00*":
+            return "tiff"
+        if head[:2] == b"PK":
+            return "docx"
+        if b"<?xml" in content[:100]:
+            return "xml"
+        if content[:1] in (b"{", b"["):
+            return "json"
+        return "bin"
+
+    def _infer_mime(self, content: bytes, filename: str | None = None) -> str:
+        ext = self._infer_extension(content, filename)
+        return {
+            "pdf":  "application/pdf",
+            "jpg":  "image/jpeg",
+            "png":  "image/png",
+            "tiff": "image/tiff",
+            "xml":  "application/xml",
+            "json": "application/json",
+            "csv":  "text/csv",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        }.get(ext, "application/octet-stream")

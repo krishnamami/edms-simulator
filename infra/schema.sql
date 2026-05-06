@@ -208,3 +208,47 @@ CREATE TABLE IF NOT EXISTS los_connectors (
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- =====================================================================
+-- Phase A: raw storage layer. Every inbound payload is persisted to
+-- S3 + raw_ingestion BEFORE extraction so re-extraction is always
+-- possible and the audit trail starts at the first byte received.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS raw_ingestion (
+    ingest_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- applicant_id / application_id are intentionally NOT foreign keys.
+    -- Phase A's premise is that raw payloads can arrive BEFORE the
+    -- applicant or application exists in the system; the audit row should
+    -- never be blocked by a missing parent. document_id IS a FK because
+    -- it's only set post-extraction, when the row exists.
+    applicant_id      VARCHAR,
+    application_id    VARCHAR,
+    source_channel    VARCHAR NOT NULL,
+    raw_s3_key        VARCHAR,
+    raw_payload_type  VARCHAR NOT NULL,
+    raw_size_bytes    INTEGER,
+    filename          VARCHAR,
+    mime_type         VARCHAR,
+    status            VARCHAR NOT NULL DEFAULT 'received'
+                      CHECK (status IN (
+                        'received',
+                        'extracting',
+                        'indexed',
+                        'failed',
+                        'reprocessing'
+                      )),
+    document_id       VARCHAR REFERENCES document_index(document_id),
+    extracted_at      TIMESTAMPTZ,
+    extraction_error  TEXT,
+    received_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_raw_applicant
+    ON raw_ingestion(applicant_id);
+CREATE INDEX IF NOT EXISTS idx_raw_status
+    ON raw_ingestion(status);
+CREATE INDEX IF NOT EXISTS idx_raw_channel
+    ON raw_ingestion(source_channel, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_raw_application
+    ON raw_ingestion(application_id);
+
