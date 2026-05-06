@@ -1,5 +1,6 @@
-"""asyncpg connection pool to Aurora Postgres (via RDS Proxy in production)."""
+"""asyncpg connection pool to Aurora/RDS Postgres."""
 import logging
+import os
 from typing import Optional
 
 import asyncpg
@@ -24,14 +25,23 @@ async def _create_pool() -> asyncpg.Pool:
         f"postgresql://{creds['username']}:{creds['password']}"
         f"@{creds['host']}:{creds['port']}/{creds['database']}"
     )
+    # RDS Postgres parameter groups commonly enable rds.force_ssl=1, so
+    # connections without TLS are rejected at pg_hba. In production we
+    # request encryption; locally we don't (the docker-compose Postgres
+    # has no TLS termination).
+    use_ssl = os.getenv("USE_AWS_SECRETS", "false").lower() == "true"
     pool = await asyncpg.create_pool(
         dsn=dsn,
         min_size=2,
         max_size=20,
         max_inactive_connection_lifetime=300,
         command_timeout=30,
+        ssl="require" if use_ssl else None,
     )
-    logger.info("aurora_pool_created", extra={"host": creds["host"]})
+    logger.info(
+        "aurora_pool_created",
+        extra={"host": creds["host"], "ssl": "require" if use_ssl else "off"},
+    )
     return pool
 
 
