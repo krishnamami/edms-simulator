@@ -244,6 +244,63 @@ class MISMOMapper:
         return None
 
     @staticmethod
+    def detect_type_from_filename(
+        filename: str, category: Optional[str] = None
+    ) -> Optional[str]:
+        """Heuristic detection from a file's name + category.
+
+        Used by the incremental indexer when scanning S3: the path layout
+        is ``loans/{los_id}/{category}/{filename}`` so the category is
+        already known. We anchor on the filename's tokens and disambiguate
+        with the category when needed (e.g. ``statement.pdf`` could be
+        income or asset; the parent path tells us).
+        """
+        if not filename:
+            return None
+        name = filename.lower()
+
+        rules: list[tuple[str, list[str]]] = [
+            ("W2_CURRENT",            ["w2_current", "w-2_current", "w2.current", "w2-current", "w2_2024", "w2_2025"]),
+            ("W2_PRIOR",              ["w2_prior", "w-2_prior", "w2.prior", "w2_2023", "w2_2022"]),
+            ("W2_CURRENT",            ["w2", "w-2"]),
+            ("PAYSTUB_CURRENT",       ["paystub_current", "pay_stub_current", "paystub.current"]),
+            ("PAYSTUB_CURRENT",       ["paystub", "pay_stub", "pay-stub"]),
+            ("CREDIT_REPORT",         ["credit_report", "credit-report", "credit.report", "tri_merge", "tri-merge"]),
+            ("BANK_STATEMENT_M1",     ["bank_statement", "bank-statement", "checking_statement", "savings_statement"]),
+            ("TAX_RETURN_1040_CURRENT", ["1040", "tax_return"]),
+            ("APPRAISAL_URAR",        ["appraisal_urar", "urar", "uniform_residential_appraisal", "appraisal"]),
+            ("HOI_BINDER",            ["hoi_binder", "hoi-binder", "homeowner", "hazard_insurance", "hazard-insurance"]),
+            ("FLOOD_CERT",            ["flood_cert", "flood-cert", "flood_determination", "fema_flood"]),
+            ("PROPERTY_TAX_BILL",     ["property_tax", "tax_bill", "tax-bill", "county_tax"]),
+            ("TITLE_COMMITMENT",      ["title_commitment", "title-commitment", "title_binder"]),
+            ("HOA_CERT",              ["hoa_cert", "hoa-cert", "hoa_certification"]),
+            ("CONDO_QUESTIONNAIRE",   ["condo_questionnaire", "condo-questionnaire"]),
+            ("IDENTITY_DL",           ["drivers_license", "driver_license", "drivers-license"]),
+            ("SSA_AWARD_LETTER",      ["ssa_award", "social_security_award", "ssa-award"]),
+            ("LES",                   ["les", "leave_earnings"]),
+            ("AUS_DU_FINDINGS",       ["du_findings", "du-findings", "desktop_underwriter"]),
+            ("AUS_LP_FINDINGS",       ["lp_findings", "lp-findings", "loan_prospector", "lpa_findings"]),
+        ]
+        for internal_type, signals in rules:
+            if any(s in name for s in signals):
+                return internal_type
+
+        # Category-only fallbacks when the filename doesn't match any rule
+        if category:
+            cat = category.lower()
+            if cat == "income":
+                return "PAYSTUB_CURRENT"
+            if cat == "asset":
+                return "BANK_STATEMENT_M1"
+            if cat == "credit":
+                return "CREDIT_REPORT"
+            if cat == "property":
+                return "APPRAISAL_URAR"
+            if cat == "identity":
+                return "IDENTITY_DL"
+        return None
+
+    @staticmethod
     def get_document_category(internal_type: str) -> str:
         """Map an internal doc-type to ``document_category`` for ``document_index``.
 

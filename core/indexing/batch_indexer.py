@@ -1,0 +1,312 @@
+"""BatchIndexer — incremental S3 → document_index → re-assembly pipeline.
+
+Run lifecycle (per source, default ``s3``)::
+
+  watermark.get(source)         # last_indexed_at, defaults to epoch
+    ↓
+  S3Scanner.scan_new(since=...) # files strictly newer than watermark
+    ↓
+  group_by_los(...)             # batch by LOS / applicant
+    ↓
+  for each group:
+    pg.get_application_by_los_id(los_id)
+    for each new doc:
+        s3.get_raw → extract → save_document
+    if income_touched: agg._run_assembly(...)
+    if property_touched: redis.invalidate_property_profile(...)
+    redis.invalidate_context(application_id)
+    ↓
+  watermark.update(source, now, stats)
+  watermark.complete_run(run_id, stats)
+"""
+from __future__ import annotations
+
+import logging
+import time
+from datetime import datetime, timezone
+from typing import Optional
+
+from core.indexing.s3_scanner import S3Document, S3Scanner
+from core.indexing.watermark import WatermarkStore
+from core.storage.s3_client import S3Client
+
+logger = logging.getLogger(__name__)
+
+
+_PROPERTY_DOC_TYPES = {
+    "APPRAISAL_URAR", "APPRAISAL_UPDATE", "APPRAISAL_DESK", "APPRAISAL_FIELD",
+    "AVM_REPORT", "TITLE_COMMITMENT", "TITLE_INSURANCE", "HOI_BINDER",
+    "HOI_DECLARATIONS", "FLOOD_CERT", "PROPERTY_TAX_BILL",
+    "PROPERTY_TAX_TRANSCRIPT", "SURVEY", "PEST_INSPECTION", "HOA_CERT",
+    "CONDO_QUESTIONNAIRE", "PURCHASE_AGREEMENT",
+}
+
+
+class BatchIndexer:
+    def __init__(
+        self,
+        postgres_store,
+        redis_store,
+        aggregation_service,
+        s3_client: Optional[S3Client] = None,
+        scanner: Optional[S3Scanner] = None,
+    ):
+        self.pg = postgres_store
+        self.redis = redis_store
+        self.agg = aggregation_service
+        self.s3 = s3_client or S3Client()
+        self.watermarks = WatermarkStore(postgres_store)
+        self.scanner = scanner or S3Scanner()
+
+    async def run(
+        self, source: str = "s3", dry_run: bool = False
+    ) -> dict:
+        start = time.time()
+        now = datetime.now(tz=timezone.utc)
+        since = await self.watermarks.get(source)
+        run_id = await self.watermarks.create_run(source, since, now)
+
+        logger.info(
+            "batch_index_started",
+            extra={
+                "source":  source,
+                "since":   since.isoformat(),
+                "run_id":  run_id,
+                "dry_run": dry_run,
+            },
+        )
+        await self.watermarks.mark_running(source)
+
+        stats: dict = {
+            "found":               0,
+            "processed":           0,
+            "skipped":             0,
+            "applicants_affected": 0,
+            "errors":              0,
+            "error_details":       [],
+            "run_id":              run_id,
+            "watermark_from":      since.isoformat(),
+            "watermark_to":        now.isoformat(),
+            "dry_run":             dry_run,
+        }
+
+        try:
+            new_docs = self.scanner.scan_new(since=since)
+            stats["found"] = len(new_docs)
+
+            if not new_docs:
+                logger.info("batch_index_nothing_new", extra={"source": source})
+            else:
+                groups = self.scanner.group_by_los(new_docs)
+                logger.info(
+                    "batch_index_groups",
+                    extra={"applicants": len(groups), "files": len(new_docs)},
+                )
+                for los_id, docs in groups.items():
+                    try:
+                        affected = await self._process_applicant(
+                            los_id=los_id, new_docs=docs, dry_run=dry_run
+                        )
+                        if affected:
+                            stats["processed"] += len(docs)
+                            stats["applicants_affected"] += 1
+                        else:
+                            # Unknown LOS — count as skipped, not error
+                            stats["skipped"] += len(docs)
+                    except Exception as exc:
+                        stats["errors"] += 1
+                        stats["error_details"].append({
+                            "los_id": los_id, "error": str(exc)[:200],
+                        })
+                        logger.error(
+                            "batch_index_applicant_error",
+                            extra={"los_id": los_id, "error": str(exc)[:200]},
+                        )
+
+            if not dry_run:
+                stats["duration_ms"] = int((time.time() - start) * 1000)
+                await self.watermarks.update(source, now, stats)
+            else:
+                stats["duration_ms"] = int((time.time() - start) * 1000)
+
+        except Exception as exc:
+            stats["errors"] += 1
+            stats["error_details"].append({"error": str(exc)[:200]})
+            logger.error("batch_index_failed", extra={"error": str(exc)})
+            stats.setdefault("duration_ms", int((time.time() - start) * 1000))
+
+        await self.watermarks.complete_run(run_id, stats)
+        logger.info("batch_index_complete", extra={**stats})
+        return stats
+
+    # ------------------------------------------------------------------
+
+    async def _process_applicant(
+        self, los_id: str, new_docs: list[S3Document], dry_run: bool
+    ) -> bool:
+        app = await self.pg.get_application_by_los_id(los_id)
+        if not app:
+            logger.warning(
+                "batch_index_unknown_los",
+                extra={"los_id": los_id, "files": len(new_docs)},
+            )
+            return False
+
+        applicant_id = app["applicant_id"]
+        application_id = app["application_id"]
+        logger.info(
+            "batch_index_processing_applicant",
+            extra={
+                "los_id":       los_id,
+                "applicant_id": applicant_id,
+                "new_docs":     len(new_docs),
+            },
+        )
+
+        if dry_run:
+            for doc in new_docs:
+                logger.info(
+                    "dry_run_would_index",
+                    extra={"key": doc.key, "type": doc.doc_type},
+                )
+            return True
+
+        property_touched = False
+        income_touched = False
+        for s3_doc in new_docs:
+            try:
+                pdf_bytes = self.s3.get_raw(s3_doc.key)
+            except Exception as exc:
+                logger.error(
+                    "batch_index_s3_read_failed",
+                    extra={"key": s3_doc.key, "error": str(exc)[:200]},
+                )
+                continue
+
+            extracted = self._extract(pdf_bytes, s3_doc.doc_type)
+
+            doc_id = f"DOC-{s3_doc.los_id}-{s3_doc.filename}"
+            doc_record = {
+                "document_id":      doc_id,
+                "applicant_id":     applicant_id,
+                "application_id":   application_id,
+                "document_type":    s3_doc.doc_type,
+                "document_category": s3_doc.category,
+                "borrower_role":    "primary",
+                "s3_key":           s3_doc.key,
+                "status":           "indexed",
+                "is_current":       True,
+                "extracted_fields": extracted["fields"],
+                "confidence_score": extracted["confidence"],
+            }
+            try:
+                await self.pg.save_document(doc_record)
+            except Exception as exc:
+                logger.error(
+                    "batch_index_save_failed",
+                    extra={"key": s3_doc.key, "error": str(exc)[:200]},
+                )
+                continue
+
+            cat = (s3_doc.category or "").lower()
+            if cat == "property" or s3_doc.doc_type in _PROPERTY_DOC_TYPES:
+                property_touched = True
+            elif cat in ("income", "credit", "asset"):
+                income_touched = True
+
+            logger.info(
+                "batch_index_doc_indexed",
+                extra={
+                    "doc_id":     doc_id,
+                    "type":       s3_doc.doc_type,
+                    "confidence": extracted["confidence"],
+                },
+            )
+
+        # Re-assemble only the layers that actually changed.
+        if income_touched:
+            try:
+                docs = await self.pg.get_documents_for_applicant(applicant_id)
+                await self.agg._run_assembly(
+                    applicant_id=applicant_id,
+                    application_id=application_id,
+                    co_applicant_id=app.get("co_applicant_id"),
+                    documents=docs,
+                    loan_data={},
+                )
+                logger.info(
+                    "batch_index_income_reassembled",
+                    extra={"applicant_id": applicant_id},
+                )
+            except Exception as exc:
+                logger.error(
+                    "batch_index_reassembly_failed",
+                    extra={"applicant_id": applicant_id, "error": str(exc)[:200]},
+                )
+
+        if property_touched and app.get("property_id"):
+            try:
+                self.redis.invalidate_property_profile(app["property_id"])
+                logger.info(
+                    "batch_index_property_invalidated",
+                    extra={"property_id": app["property_id"]},
+                )
+            except Exception as exc:
+                logger.error(
+                    "batch_index_property_invalidate_failed",
+                    extra={"error": str(exc)[:200]},
+                )
+
+        try:
+            self.redis.invalidate_context(application_id)
+        except Exception:
+            pass
+        return True
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract(pdf_bytes: bytes, doc_type: str) -> dict:
+        """Pick a pymupdf extractor by doc-type. Falls back to empty
+        fields with confidence=0.5 when no specific extractor exists."""
+        from core.documents.extractors.pymupdf_extractor import (
+            extract_bank_statement,
+            extract_credit_report,
+            extract_paystub,
+            extract_w2,
+        )
+        from core.property.extractors import (
+            extract_appraisal_pdf,
+            extract_flood_pdf,
+            extract_hoi_pdf,
+            extract_tax_pdf,
+        )
+
+        extractors = {
+            "W2_CURRENT":            extract_w2,
+            "W2_PRIOR":              extract_w2,
+            "PAYSTUB_CURRENT":       extract_paystub,
+            "PAYSTUB_PRIOR":         extract_paystub,
+            "BANK_STATEMENT_M1":     extract_bank_statement,
+            "CREDIT_REPORT":         extract_credit_report,
+            "APPRAISAL_URAR":        extract_appraisal_pdf,
+            "APPRAISAL_UPDATE":      extract_appraisal_pdf,
+            "APPRAISAL_DESK":        extract_appraisal_pdf,
+            "APPRAISAL_FIELD":       extract_appraisal_pdf,
+            "HOI_BINDER":            extract_hoi_pdf,
+            "HOI_DECLARATIONS":      extract_hoi_pdf,
+            "FLOOD_CERT":            extract_flood_pdf,
+            "PROPERTY_TAX_BILL":     extract_tax_pdf,
+        }
+        extractor = extractors.get(doc_type)
+        if extractor is None:
+            return {"fields": {}, "confidence": 0.5}
+        try:
+            fields, confidence = extractor(pdf_bytes)
+            return {"fields": fields, "confidence": float(confidence or 0.5)}
+        except Exception as exc:
+            logger.warning(
+                "batch_index_extract_failed",
+                extra={"doc_type": doc_type, "error": str(exc)[:200]},
+            )
+            return {"fields": {}, "confidence": 0.5}

@@ -1,5 +1,6 @@
 """FastAPI app entry point. Lifespan-managed dependency wiring."""
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import structlog
@@ -62,7 +63,64 @@ async def lifespan(app: FastAPI):
         redis_store=app.state.redis_store,
         postgres_store=app.state.postgres_store,
     )
+
+    # Incremental indexer background scheduler. Off by default; flip on
+    # in production via ENABLE_SCHEDULER=true. Avoids spurious S3 calls
+    # in local development and keeps tests deterministic.
+    app.state.scheduler = None
+    if os.getenv("ENABLE_SCHEDULER", "false").lower() == "true":
+        try:
+            from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+            from core.indexing.batch_indexer import BatchIndexer
+
+            interval = int(os.getenv("INDEX_INTERVAL_MINUTES", "15"))
+
+            async def _scheduled_index():
+                try:
+                    indexer = BatchIndexer(
+                        postgres_store=app.state.postgres_store,
+                        redis_store=app.state.redis_store,
+                        aggregation_service=app.state.aggregation_service,
+                        s3_client=app.state.s3_client,
+                    )
+                    stats = await indexer.run(source="s3")
+                    logging.info(
+                        "scheduled_index_complete",
+                        extra={k: stats.get(k) for k in (
+                            "found", "processed", "skipped",
+                            "applicants_affected", "errors", "run_id",
+                        )},
+                    )
+                except Exception as exc:
+                    logging.error(
+                        "scheduled_index_failed", extra={"error": str(exc)}
+                    )
+
+            sched = AsyncIOScheduler()
+            sched.add_job(
+                _scheduled_index,
+                "interval",
+                minutes=interval,
+                id="incremental_indexer",
+                max_instances=1,
+                coalesce=True,
+            )
+            sched.start()
+            app.state.scheduler = sched
+            logging.info(
+                "scheduler_started",
+                extra={"interval_minutes": interval},
+            )
+        except Exception as exc:
+            logging.warning("scheduler_start_failed: %s", exc)
+
     yield
+    try:
+        if getattr(app.state, "scheduler", None):
+            app.state.scheduler.shutdown(wait=False)
+    except Exception:
+        pass
     try:
         await db.close_pool()
     except Exception:

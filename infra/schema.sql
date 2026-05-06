@@ -366,3 +366,44 @@ CREATE INDEX IF NOT EXISTS idx_context_versions_app
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook
     ON webhook_deliveries(webhook_id, delivered_at DESC);
 
+-- =====================================================================
+-- Incremental indexer: watermark per source + per-run audit history.
+-- The scheduler reads watermarks.last_indexed_at, scans S3 for files
+-- modified after it, processes only those, then advances the watermark.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS indexing_watermarks (
+    watermark_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source          VARCHAR NOT NULL UNIQUE,
+    last_indexed_at TIMESTAMPTZ NOT NULL DEFAULT '1970-01-01',
+    last_run_at     TIMESTAMPTZ,
+    files_processed INT DEFAULT 0,
+    files_skipped   INT DEFAULT 0,
+    errors          INT DEFAULT 0,
+    status          VARCHAR DEFAULT 'idle'
+                    CHECK (status IN ('idle','running','complete','failed')),
+    run_duration_ms INT
+);
+
+CREATE TABLE IF NOT EXISTS indexing_runs (
+    run_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source          VARCHAR NOT NULL,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at    TIMESTAMPTZ,
+    watermark_from  TIMESTAMPTZ NOT NULL,
+    watermark_to    TIMESTAMPTZ NOT NULL,
+    files_found     INT DEFAULT 0,
+    files_processed INT DEFAULT 0,
+    files_skipped   INT DEFAULT 0,
+    applicants_affected INT DEFAULT 0,
+    errors          INT DEFAULT 0,
+    error_details   JSONB DEFAULT '[]',
+    status          VARCHAR DEFAULT 'running'
+);
+
+CREATE INDEX IF NOT EXISTS idx_indexing_runs_source
+    ON indexing_runs(source, started_at DESC);
+
+INSERT INTO indexing_watermarks (source, last_indexed_at, status)
+VALUES ('s3', '1970-01-01', 'idle')
+ON CONFLICT (source) DO NOTHING;
+

@@ -54,6 +54,7 @@ def _row_to_dict(row) -> Optional[dict]:
             "context_data",
             "payload",
             "events",
+            "error_details",
         ):
             try:
                 out[k] = json.loads(v)
@@ -374,6 +375,154 @@ class PostgresStore:
             limit,
         )
         return [_row_to_dict(r) for r in rows]
+
+    # ---------------- incremental indexer (watermarks + runs) -----------------
+
+    async def get_watermark(self, source: str) -> Optional[dict]:
+        row = await db.fetchrow(
+            "SELECT * FROM indexing_watermarks WHERE source = $1", source
+        )
+        return _row_to_dict(row)
+
+    async def upsert_watermark_status(self, source: str, status: str) -> None:
+        await db.execute(
+            """
+            INSERT INTO indexing_watermarks (source, status)
+            VALUES ($1, $2)
+            ON CONFLICT (source) DO UPDATE SET status = EXCLUDED.status
+            """,
+            source,
+            status,
+        )
+
+    async def upsert_watermark_complete(
+        self,
+        source: str,
+        last_indexed_at,
+        files_processed: int,
+        files_skipped: int,
+        errors: int,
+        run_duration_ms: Optional[int] = None,
+    ) -> None:
+        status = "failed" if errors and not files_processed else "complete"
+        await db.execute(
+            """
+            INSERT INTO indexing_watermarks (
+                source, last_indexed_at, last_run_at,
+                files_processed, files_skipped, errors,
+                status, run_duration_ms
+            ) VALUES (
+                $1, $2::timestamptz, NOW(), $3, $4, $5, $6, $7
+            )
+            ON CONFLICT (source) DO UPDATE SET
+                last_indexed_at = EXCLUDED.last_indexed_at,
+                last_run_at     = NOW(),
+                files_processed = EXCLUDED.files_processed,
+                files_skipped   = EXCLUDED.files_skipped,
+                errors          = EXCLUDED.errors,
+                status          = EXCLUDED.status,
+                run_duration_ms = EXCLUDED.run_duration_ms
+            """,
+            source,
+            _to_ts(last_indexed_at),
+            int(files_processed),
+            int(files_skipped),
+            int(errors),
+            status,
+            run_duration_ms,
+        )
+
+    async def set_watermark_timestamp(
+        self, source: str, last_indexed_at
+    ) -> None:
+        """Manual watermark adjustment — used by the PUT /indexing/watermark
+        admin endpoint. Does not touch the run-stat columns."""
+        await db.execute(
+            """
+            INSERT INTO indexing_watermarks (source, last_indexed_at)
+            VALUES ($1, $2::timestamptz)
+            ON CONFLICT (source) DO UPDATE SET
+                last_indexed_at = EXCLUDED.last_indexed_at
+            """,
+            source,
+            _to_ts(last_indexed_at),
+        )
+
+    async def create_indexing_run(
+        self, source: str, watermark_from, watermark_to
+    ) -> str:
+        new_id = await db.fetchval(
+            """
+            INSERT INTO indexing_runs (source, watermark_from, watermark_to)
+            VALUES ($1, $2::timestamptz, $3::timestamptz)
+            RETURNING run_id
+            """,
+            source,
+            _to_ts(watermark_from),
+            _to_ts(watermark_to),
+        )
+        return str(new_id)
+
+    async def complete_indexing_run(
+        self, run_id: str, stats: dict
+    ) -> None:
+        errors = int(stats.get("errors") or 0)
+        status = (
+            "complete_with_errors"
+            if errors and (stats.get("processed") or 0) > 0
+            else ("failed" if errors else "complete")
+        )
+        await db.execute(
+            """
+            UPDATE indexing_runs SET
+                completed_at        = NOW(),
+                files_found         = $1,
+                files_processed     = $2,
+                files_skipped       = $3,
+                applicants_affected = $4,
+                errors              = $5,
+                error_details       = $6::jsonb,
+                status              = $7
+             WHERE run_id = $8::uuid
+            """,
+            int(stats.get("found") or 0),
+            int(stats.get("processed") or 0),
+            int(stats.get("skipped") or 0),
+            int(stats.get("applicants_affected") or 0),
+            errors,
+            json.dumps(stats.get("error_details") or []),
+            status,
+            run_id,
+        )
+
+    async def get_indexing_runs(
+        self, source: Optional[str] = None, limit: int = 50
+    ) -> list:
+        if source:
+            rows = await db.fetch(
+                """
+                SELECT * FROM indexing_runs
+                WHERE source = $1
+                ORDER BY started_at DESC LIMIT $2
+                """,
+                source,
+                limit,
+            )
+        else:
+            rows = await db.fetch(
+                """
+                SELECT * FROM indexing_runs
+                ORDER BY started_at DESC LIMIT $1
+                """,
+                limit,
+            )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_indexing_run(self, run_id: str) -> Optional[dict]:
+        row = await db.fetchrow(
+            "SELECT * FROM indexing_runs WHERE run_id = $1::uuid", run_id
+        )
+        return _row_to_dict(row)
 
     async def get_context_at(
         self, application_id: str, timestamp: str

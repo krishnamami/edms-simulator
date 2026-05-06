@@ -36,6 +36,8 @@ class FakePostgresStore:
         self.webhooks: dict = {}
         self.webhook_deliveries: list = []
         self.context_versions: list = []
+        self.watermarks: dict = {}
+        self.indexing_runs: dict = {}
 
     async def save_golden_record(self, gr):
         # Round-trip storage so get_all_applicants / find_by_external_id can
@@ -99,6 +101,12 @@ class FakePostgresStore:
         return self.credit_profiles.get(applicant_id)
 
     async def save_document(self, doc):
+        # Mirror production's ON CONFLICT (document_id) DO UPDATE so the
+        # batch indexer's save → assembler save flow doesn't double-row.
+        for i, existing in enumerate(self.documents):
+            if existing.get("document_id") == doc.get("document_id"):
+                self.documents[i] = doc
+                return
         self.documents.append(doc)
 
     async def get_documents_for_applicant(self, applicant_id):
@@ -291,6 +299,79 @@ class FakePostgresStore:
             return None
         rows.sort(key=lambda r: r.get("assembled_at") or "", reverse=True)
         return rows[0]
+
+    # incremental indexer
+    async def get_watermark(self, source):
+        return self.watermarks.get(source)
+
+    async def upsert_watermark_status(self, source, status):
+        wm = self.watermarks.setdefault(
+            source, {"source": source, "last_indexed_at": None}
+        )
+        wm["status"] = status
+
+    async def upsert_watermark_complete(
+        self, source, last_indexed_at,
+        files_processed, files_skipped, errors,
+        run_duration_ms=None,
+    ):
+        status = "failed" if errors and not files_processed else "complete"
+        self.watermarks[source] = {
+            "source":          source,
+            "last_indexed_at": last_indexed_at,
+            "last_run_at":     last_indexed_at,
+            "files_processed": files_processed,
+            "files_skipped":   files_skipped,
+            "errors":          errors,
+            "status":          status,
+            "run_duration_ms": run_duration_ms,
+        }
+
+    async def set_watermark_timestamp(self, source, last_indexed_at):
+        wm = self.watermarks.setdefault(source, {"source": source})
+        wm["last_indexed_at"] = last_indexed_at
+
+    async def create_indexing_run(self, source, watermark_from, watermark_to):
+        import uuid as _uuid
+        run_id = str(_uuid.uuid4())
+        self.indexing_runs[run_id] = {
+            "run_id":         run_id,
+            "source":         source,
+            "watermark_from": watermark_from,
+            "watermark_to":   watermark_to,
+            "started_at":     watermark_to,
+            "status":         "running",
+        }
+        return run_id
+
+    async def complete_indexing_run(self, run_id, stats):
+        run = self.indexing_runs.get(run_id)
+        if run is None:
+            return
+        errors = int(stats.get("errors") or 0)
+        run.update({
+            "completed_at":        True,
+            "files_found":         stats.get("found", 0),
+            "files_processed":     stats.get("processed", 0),
+            "files_skipped":       stats.get("skipped", 0),
+            "applicants_affected": stats.get("applicants_affected", 0),
+            "errors":              errors,
+            "error_details":       stats.get("error_details") or [],
+            "status": (
+                "complete_with_errors"
+                if errors and (stats.get("processed") or 0) > 0
+                else ("failed" if errors else "complete")
+            ),
+        })
+
+    async def get_indexing_runs(self, source=None, limit=50):
+        rows = list(self.indexing_runs.values())
+        if source:
+            rows = [r for r in rows if r["source"] == source]
+        return rows[:limit]
+
+    async def get_indexing_run(self, run_id):
+        return self.indexing_runs.get(str(run_id))
 
 
 @pytest.fixture

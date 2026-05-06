@@ -26,6 +26,8 @@ from core.aggregation.events import (
     PropertyDocumentUploadedEvent,
 )
 from core.context.assembler import ContextAssembler
+from core.indexing.batch_indexer import BatchIndexer
+from core.indexing.watermark import WatermarkStore
 from core.context.models import (
     ComplianceSlice,
     CreditSlice,
@@ -2101,3 +2103,93 @@ async def application_timeline(request: Request, application_id: str):
 
     events.sort(key=lambda e: str(e.get("timestamp") or ""))
     return {"application_id": application_id, "events": events}
+
+
+# ---------------------------------------------------------------------------
+# Incremental indexer: status, run, runs history, watermark override
+# ---------------------------------------------------------------------------
+
+
+def _build_indexer(request: Request) -> BatchIndexer:
+    return BatchIndexer(
+        postgres_store=request.app.state.postgres_store,
+        redis_store=request.app.state.redis_store,
+        aggregation_service=request.app.state.aggregation_service,
+        s3_client=getattr(request.app.state, "s3_client", None),
+    )
+
+
+@router.get("/indexing/status", dependencies=[Depends(verify_api_key)])
+async def indexing_status(request: Request, source: str = "s3"):
+    pg = request.app.state.postgres_store
+    wm = await pg.get_watermark(source)
+    runs = await pg.get_indexing_runs(source=source, limit=1)
+    last_run = runs[0] if runs else None
+    return {
+        "source":          source,
+        "last_indexed_at": (wm or {}).get("last_indexed_at"),
+        "last_run_at":     (wm or {}).get("last_run_at"),
+        "status":          (wm or {}).get("status") or "idle",
+        "files_processed": (wm or {}).get("files_processed") or 0,
+        "files_skipped":   (wm or {}).get("files_skipped") or 0,
+        "errors":          (wm or {}).get("errors") or 0,
+        "last_run":        last_run,
+    }
+
+
+@router.post("/indexing/run", dependencies=[Depends(verify_api_key)])
+async def indexing_run(request: Request, body: dict | None = None):
+    body = body or {}
+    source = body.get("source", "s3")
+    dry_run = bool(body.get("dry_run", False))
+    indexer = _build_indexer(request)
+    stats = await indexer.run(source=source, dry_run=dry_run)
+    return stats
+
+
+@router.get("/indexing/runs", dependencies=[Depends(verify_api_key)])
+async def indexing_runs(
+    request: Request, source: Optional[str] = None, limit: int = 50
+):
+    pg = request.app.state.postgres_store
+    rows = await pg.get_indexing_runs(source=source, limit=limit)
+    return {"count": len(rows), "runs": rows}
+
+
+@router.get(
+    "/indexing/runs/{run_id}", dependencies=[Depends(verify_api_key)]
+)
+async def indexing_run_detail(request: Request, run_id: str):
+    pg = request.app.state.postgres_store
+    row = await pg.get_indexing_run(run_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="indexing run not found")
+    return row
+
+
+@router.put("/indexing/watermark", dependencies=[Depends(verify_api_key)])
+async def indexing_set_watermark(request: Request, body: dict):
+    """Manually move the watermark. ⚠ resets which files get re-indexed
+    on the next run. Use carefully.
+
+    Body: ``{"source": "s3", "timestamp": "2026-05-06T00:00:00Z"}``
+    """
+    source = body.get("source", "s3")
+    timestamp = body.get("timestamp")
+    if not timestamp:
+        raise HTTPException(status_code=400, detail="timestamp required")
+    pg = request.app.state.postgres_store
+    store = WatermarkStore(pg)
+    from datetime import datetime as _dt
+    try:
+        ts = _dt.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"invalid timestamp: {exc}"
+        )
+    await store.set_timestamp(source, ts)
+    wm = await pg.get_watermark(source)
+    return {
+        "source": source,
+        "last_indexed_at": (wm or {}).get("last_indexed_at"),
+    }

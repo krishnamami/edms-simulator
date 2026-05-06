@@ -36,6 +36,12 @@ PyYAML==6.0.3
 # --- Identity / matching ---
 RapidFuzz==3.14.5
 
+# --- Background scheduler (incremental indexer) ---
+APScheduler==3.10.4
+pytz==2026.2
+tzdata==2026.2
+tzlocal==5.3.1
+
 # --- Document generation + extraction ---
 reportlab==4.5.0
 PyMuPDF==1.27.2.3
