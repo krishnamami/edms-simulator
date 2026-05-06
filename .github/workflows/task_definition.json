@@ -39,7 +39,7 @@
         },
         {
           "name": "API_KEY",
-          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/api/keys-NLNCtu"
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/api/keys-NLNCtu:decision_os_api_key::"
         }
       ],
       "logConfiguration": {
