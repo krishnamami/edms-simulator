@@ -39,10 +39,24 @@ Redis port is **6380**.
 - Branch: `main`, all committed and pushed to `https://github.com/krishnamami/edms-simulator`
 - Tests: **122 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`)
 - `simulate_local.py` runs end-to-end with exit 0 on a clean DB
+- **Production ECS service is live** at `http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com` (`/health` and `/docs` returning 200). 2/2 Fargate tasks Running.
+- **AWS resources deployed:** ECS cluster + service + ALB + log group + execution role + task definition (CFN stack `edms-ecs`), ECR repo `edms-simulator`, IAM role `edms-simulator-task-role` (managed externally). **Not yet deployed:** RDS Postgres (`rds-postgres.yaml` committed but not applied), ElastiCache Redis (`elasticache.yaml` not applied), so app won't survive a real DB query yet.
 
-Latest 5 commits (top of `main`):
+Latest commits (top of `main`):
 
 ```
+fbd03d5  fix: enable public IP for ECS tasks in default VPC subnets   ← made the deploy work
+1a1002a  infra(ecs): take TaskRole ARN as a parameter, drop inline role
+6a66536  ci: add workflow_dispatch trigger to both workflows
+e41d244  ci(deploy): substitute ACCOUNT_ID in task_definition.json before render
+95c60ce  ci(deploy): self-heal missing ECR repo before push
+dc9d18b  ci: bump Python 3.10 -> 3.12 to match pinned requirements
+4137095  fix: pin exact package versions to prevent pip backtracking in Docker
+ead0fd3  config: production AWS endpoints + full secret ARNs
+43f459d  chore: rename aurora.yaml -> rds-postgres.yaml
+1eb884d  fix: replace Aurora with simple RDS Postgres for initial deploy
+19567d2  fix: aurora engine version 15.4 -> 15.8
+ef0d6fa  docs: add context.md (session-resume notes) + docs/PRD.md
 e1fa6b6  feat(ingestion): Phase E — resilience for upstream Claude failures
 bff35cc  feat(simulator): Phase D — 7-step walkthrough exercising all channels
 0d0b985  feat(ingestion): Phase C — chat, image, email, pdf, form, csv, xml adapters
@@ -61,6 +75,100 @@ bff35cc  feat(simulator): Phase D — 7-step walkthrough exercising all channels
 | **C** | `0d0b985` | All 7 channel adapters (chat / image / email / pdf / form / csv / xml). Anthropic SDK wired via shared `_claude_client.py` (model `claude-sonnet-4-6`, prompt-caching on system block). Adapters injectable for tests. `/ingest/*` endpoints replaced stubs with real implementations. |
 | **D** | `bff35cc` | `scripts/simulate_local.py` rewritten — 7-step walkthrough exercising every channel + verifying golden record / Redis / Postgres / xref. |
 | **E** | `e1fa6b6` | Resilience for upstream Claude errors. `email_adapter` body-extract falls back gracefully (attachments still process). `/ingest/{chat,image,email}` map `anthropic.APIStatusError` → HTTP 502 with detail. Simulator distinguishes **failed (live)** vs **skipped (no key)**. |
+
+---
+
+## AWS production bootstrap (the long Tuesday-night session)
+
+Took the simulator from "runs locally" to "running on Fargate behind an ALB". Multiple false starts; the ones below are the actual fixes that landed.
+
+### What's live in account 621646470377
+
+| Component | What | Where |
+|---|---|---|
+| ECR repo | `edms-simulator` (created by self-heal step on first GHA push) | `621646470377.dkr.ecr.us-east-1.amazonaws.com/edms-simulator` |
+| ECS cluster | `edms-simulator-cluster` | CFN stack `edms-ecs` |
+| ECS service | `edms-simulator-service`, Fargate, desired=2, running=2 | inside `edms-simulator-cluster` |
+| ALB | `edms-simulator-alb` | `edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com:80 → :8001` |
+| Task role | `edms-simulator-task-role` (4 broad managed policies attached out-of-band) | externally managed; passed to CFN as `TaskRoleArn` parameter |
+| Execution role | `edms-simulator-task-execution-role` (default ECS managed + scoped secrets:Get) | created by the `edms-ecs` stack |
+| Log group | `/ecs/edms-simulator`, 30-day retention | created by the stack |
+| Secrets Manager | `edms/aurora/credentials`, `edms/redis/endpoint`, `edms/api/keys` (with `-tNFwJM`/`-Z3uo92`/`-NLNCtu` suffixes) | pre-existing in account |
+| KMS key | `arn:aws:kms:us-east-1:621646470377:key/f61c6a3c-15aa-4e0d-b9dd-8665a8c88d26` | for `edms-simulator-loans` S3 bucket |
+
+**Not yet deployed (app will fail at first DB / Redis query):**
+
+- **RDS Postgres** — `infra/cloudformation/rds-postgres.yaml` committed but `aws cloudformation deploy --stack-name edms-rds ...` not run. Needs admin perms or expanded `github-cicd-live` policy (rds:CreateDBInstance, rds:CreateDBSubnetGroup, etc.).
+- **ElastiCache Redis** — `infra/cloudformation/elasticache.yaml` not deployed.
+
+### Hard-won lessons
+
+1. **`github-cicd-live` is intentionally narrow.** It can:
+   - ECR: GetAuthorizationToken, CreateRepository, layer-upload set, PutImage
+   - CFN: CreateStack, DescribeStacks, DescribeStackEvents, DeleteStack
+   - ECS: most things (cluster/service/task definition lifecycle)
+   - EC2: Describe* (read-only, no SG mutations)
+   - sts: GetCallerIdentity
+
+   It **cannot**:
+   - IAM: any role mutation (`iam:CreateRole`, `iam:DeleteRolePolicy`, etc.)
+   - RDS: most write paths (`rds:DescribeDBSubnetGroups` denied → CFN rollback)
+   - cloudformation:ListStackResources (so wedged stacks need an admin to inspect)
+
+   So any CFN template that creates an IAM role or RDS resource will fail under this identity. Workaround: take the role/resource as a parameter (externally-managed pattern); template stays declarative for everything else.
+
+2. **`AssignPublicIp: DISABLED` in default-VPC public subnets is broken.** The default VPC has only public subnets (with IGW routes) and no NAT gateway. With `AssignPublicIp: DISABLED`, Fargate tasks have no egress at all — fail immediately with `ResourceInitializationError: connection issue between the task and AWS Secrets Manager`. Fix: `ENABLED`. Trade-off: tasks have public IPs (still firewalled by `TaskSecurityGroup` to `:8001` from ALB only). For a real VPC with private subnets + NAT, flip back to DISABLED.
+
+3. **CFN template + manually-created resource = `AlreadyExists` failure.** An admin had pre-created `edms-simulator-task-role` between sessions with broad managed policies (S3FullAccess, SQSFullAccess, SecretsManagerReadWrite, CloudWatchLogsFullAccess). The original `ecs.yaml` declared it inline — first deploy failed at TaskRole. Refactor: drop inline `TaskRole`, add `TaskRoleArn` parameter pointing at the externally-managed role. CFN no longer owns it (drift detection won't catch policy changes), but conflict goes away.
+
+4. **`amazon-ecs-render-task-definition@v1` only swaps `image`.** Despite the name, it does **not** substitute placeholders elsewhere. The `executionRoleArn` / `taskRoleArn` `ACCOUNT_ID` placeholders had to be substituted by an explicit `sed` step before render: `aws sts get-caller-identity --query Account --output text` → `sed -i s/ACCOUNT_ID/.../g task_definition.json`.
+
+5. **ECR repo doesn't auto-create.** First push to a new account fails with "repository does not exist". `aws-actions/amazon-ecr-login@v2` only does auth, not provisioning. Self-heal step:
+   ```yaml
+   - name: Ensure ECR repository exists
+     run: |
+       aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" --region "$AWS_REGION" \
+         || aws ecr create-repository --repository-name "$ECR_REPOSITORY" --region "$AWS_REGION" \
+              --image-scanning-configuration scanOnPush=true --image-tag-mutability MUTABLE
+   ```
+
+6. **pip backtracking on `>=` constraints kills Docker builds.** With 16 packages all on `>=`, pip's resolver thrashed for 20+ minutes through Pillow / PyMuPDF / anyio / async_timeout permutations on `python:3.10-slim`. Fix: take a full `pip freeze` of the working venv, replace `requirements.txt` with all `==` pins. **Docker build now: 80s end-to-end, pip phase 20.5s, zero "looking at multiple versions" lines.** Side-effect: the lockfile required `networkx==3.6.1` which needs Python ≥3.11, so the Dockerfile bumped to `python:3.12-slim` and `ci.yaml`'s `setup-python` bumped to `"3.12"` to match.
+
+### Wedged AWS resources (orphans from earlier failed attempts)
+
+| Resource | Cause | Cleanup |
+|---|---|---|
+| Stack `edms-aurora` | First Aurora deploy: `rds:DescribeDBSubnetGroups` denied; rollback failed because `iam:DeleteRolePolicy` and `ec2:DeleteSecurityGroup` also denied | **Still wedged in `ROLLBACK_FAILED` last we checked.** Two orphan resources: IAM role `edms-aurora-RDSProxyRole-oBsVFktLB9Z3` and security group `sg-0050f77a029b4642f`. Admin needs to: detach + delete the role's inline policies, delete the role, delete the SG, then `aws cloudformation delete-stack --stack-name edms-aurora`. |
+
+The follow-up CFN replacement (`rds-postgres.yaml`) hasn't been deployed yet, so there's no second wedged stack to clean up.
+
+### How the GitHub Actions deploy now flows
+
+```
+push to main
+   │
+   ▼
+[CI] (ubuntu-latest, Python 3.12)
+   ├── checkout
+   ├── set up Python 3.12
+   ├── cache pip
+   ├── pip install -r requirements.txt + requirements-dev.txt
+   ├── psql apply infra/schema.sql
+   ├── pytest tests/ --ignore=tests/integration
+   └── python scripts/smoke_aggregation.py
+
+[Deploy to AWS] (parallel)
+   ├── checkout
+   ├── configure AWS credentials       (uses repo secrets)
+   ├── login to ECR                    (auth only)
+   ├── ensure ECR repo exists          (self-heal — describe || create)
+   ├── docker build + tag + push       (image:GITHUB_SHA + image:latest)
+   ├── substitute ACCOUNT_ID in task_definition.json   (sts:GetCallerIdentity + sed)
+   ├── render task definition          (amazon-ecs-render-task-definition@v1, only swaps `image`)
+   └── deploy to ECS                   (RegisterTaskDefinition + UpdateService, waits for stability)
+```
+
+Both workflows also accept `workflow_dispatch` for manual reruns from the Actions UI.
 
 ---
 
@@ -151,7 +259,38 @@ Errors:
 
 ---
 
-## Open follow-ups (latent, not blocked on the above)
+## Open follow-ups
+
+### AWS / production
+
+1. **Deploy `rds-postgres.yaml`** — committed but not applied. App is up but
+   any DB query returns connection-refused. Command:
+   ```bash
+   aws cloudformation deploy --template-file infra/cloudformation/rds-postgres.yaml \
+     --stack-name edms-rds --region us-east-1 \
+     --parameter-overrides \
+       VpcId=vpc-0768c1a9db95fa311 \
+       PrivateSubnetIds=subnet-06f6695e50577d0a6,subnet-0b78b46cb2ccadb8b \
+       DBSecretArn=arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/aurora/credentials-tNFwJM
+   ```
+   `github-cicd-live` likely lacks `rds:CreateDBInstance` etc. — needs admin
+   or expanded perms.
+2. **Deploy `elasticache.yaml`** — same situation. Redis cluster missing.
+3. **Clean up `edms-aurora` wedged stack + 2 orphan resources** — admin to
+   delete IAM role `edms-aurora-RDSProxyRole-oBsVFktLB9Z3` (inline policies
+   first) and SG `sg-0050f77a029b4642f`, then `aws cloudformation delete-stack
+   --stack-name edms-aurora`.
+4. **Rotate the leaked AWS access key** `AKIAZBPIELTUVVBGFZHN` (was pasted in
+   chat earlier in the session). Rotation gates everything else.
+5. **`AssignPublicIp: ENABLED`** is acceptable for the default-VPC dev deploy
+   but should flip back to `DISABLED` when this moves to a real VPC with
+   private subnets + NAT gateway. Documented in the commit message of `fbd03d5`.
+6. **Wire `infra/cloudformation/secrets.yaml` (or admin-provision) so the
+   three `edms/*` secrets are stack-managed** — currently they exist
+   out-of-band; their ARN suffixes are hard-coded in `task_definition.json`,
+   so any rotation or recreate breaks the deploy.
+
+### Application
 
 1. **`XRefStore` is in-memory** — wiped on uvicorn restart while Postgres
    persists. After a restart, the resolver can create a fresh `applicant_id`
@@ -238,6 +377,8 @@ set -a; source <(grep -v '^#' .env | grep -v '^$' | sed 's/^/export /'); set +a
 
 ## Helpful one-liners
 
+### Local dev
+
 ```bash
 # truncate everything for a clean simulate run
 docker exec edms-simulator-postgres-1 psql -U edms -d edms -c \
@@ -252,4 +393,65 @@ docker exec edms-simulator-redis-1 redis-cli GET "income:APL-00001-P"
 
 # list documents written by S3Client local fallback
 ls -R local_storage/
+
+# refresh the lockfile after adding a runtime dep
+.venv/Scripts/python -m pip install <pkg>
+.venv/Scripts/python -m pip freeze | grep -v -E '^(pytest|pytest-asyncio|fakeredis|iniconfig|pluggy|Pygments|sortedcontainers)' > /tmp/freeze
+# manually merge /tmp/freeze into requirements.txt preserving the section comments
+```
+
+### AWS / production observability
+
+```bash
+# poll a CFN stack until it reaches a terminal state
+until s=$(aws cloudformation describe-stacks --stack-name STACK --query 'Stacks[0].StackStatus' --output text 2>/dev/null) \
+  && [[ "$s" != *_IN_PROGRESS && -n "$s" ]]; do sleep 15; done; echo "$s"
+
+# why a stack failed (CREATE_FAILED events with reasons)
+aws cloudformation describe-stack-events --stack-name STACK \
+  --query 'StackEvents[?ResourceStatus==`CREATE_FAILED`].{Resource:LogicalResourceId,Reason:ResourceStatusReason}' \
+  --output table
+
+# what just happened to a fargate task that died
+aws ecs list-tasks --cluster edms-simulator-cluster --desired-status STOPPED --max-results 3 \
+  --query 'taskArns' --output text \
+  | xargs -n1 -I{} aws ecs describe-tasks --cluster edms-simulator-cluster --tasks {} \
+    --query 'tasks[0].{StoppedReason:stoppedReason,StopCode:stopCode,Containers:containers[0].reason}'
+
+# tail container logs (after the service is up)
+aws logs tail /ecs/edms-simulator --follow --region us-east-1
+
+# hit the live ALB
+curl -s http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com/health
+
+# rerun a github action manually (workflow_dispatch is wired on both)
+# UI: Actions > [workflow] > Run workflow > main
+```
+
+### Bootstrap (when starting fresh in a new account)
+
+```bash
+# 1. discover the default VPC + subnets
+VPC_ID=$(aws ec2 describe-vpcs --query "Vpcs[?IsDefault==\`true\`].VpcId" --output text)
+SUBNETS=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'Subnets[*].SubnetId' --output text | tr '\t' ',')
+
+# 2. create the three secrets first (or use AWS Console)
+for s in edms/aurora/credentials edms/redis/endpoint edms/api/keys; do
+  aws secretsmanager create-secret --name "$s" --secret-string '{"placeholder":"replace"}' --region us-east-1
+done
+
+# 3. pre-create the task role (with broad managed policies, since CFN no longer manages it)
+aws iam create-role --role-name edms-simulator-task-role \
+  --assume-role-policy-document file://.aws-bootstrap/trust-policy.json
+for p in AmazonS3FullAccess AmazonSQSFullAccess SecretsManagerReadWrite CloudWatchLogsFullAccess; do
+  aws iam attach-role-policy --role-name edms-simulator-task-role \
+    --policy-arn arn:aws:iam::aws:policy/$p
+done
+
+# 4. deploy DB + cache (admin needed for RDS)
+aws cloudformation deploy --template-file infra/cloudformation/rds-postgres.yaml --stack-name edms-rds ...
+aws cloudformation deploy --template-file infra/cloudformation/elasticache.yaml --stack-name edms-cache ...
+
+# 5. push to main → GHA builds image + deploys ECS service
 ```
