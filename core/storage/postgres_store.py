@@ -381,3 +381,75 @@ class PostgresStore:
             "conflict_count":     len(conflicts),
             "requires_review":    len(conflicts) > 0,
         }
+
+    # ---------------- external IDs / LOS integration -----------------
+
+    async def find_by_external_id(
+        self, source_system: str, external_id: str
+    ) -> Optional[dict]:
+        """Return the applicant whose ``external_ids`` contains the
+        ``{source_system: external_id}`` pair, or ``None``."""
+        rows = await db.fetch(
+            "SELECT * FROM applicants WHERE external_ids @> $1::jsonb LIMIT 1",
+            json.dumps({source_system: external_id}),
+        )
+        return _row_to_dict(rows[0]) if rows else None
+
+    async def add_external_id(
+        self, applicant_id: str, source_system: str, external_id: str
+    ) -> None:
+        """Merge ``{source_system: external_id}`` into the applicant's
+        ``external_ids`` JSONB blob (overwrites any prior value for the
+        same source_system)."""
+        await db.execute(
+            """
+            UPDATE applicants
+               SET external_ids = external_ids || $1::jsonb,
+                   updated_at   = NOW()
+             WHERE applicant_id = $2
+            """,
+            json.dumps({source_system: external_id}),
+            applicant_id,
+        )
+
+    async def get_application_by_external_loan_id(
+        self, external_loan_id: str
+    ) -> Optional[dict]:
+        """Look up an application by the LOS's loan number."""
+        row = await db.fetchrow(
+            "SELECT * FROM applications WHERE external_loan_id = $1",
+            external_loan_id,
+        )
+        return _row_to_dict(row)
+
+    async def update_application_loan_fields(
+        self, application_id: str, loan_data: dict
+    ) -> None:
+        """Patch loan terms / URLA fields on an existing application.
+        Only non-None values overwrite — uses ``COALESCE`` to preserve
+        prior values for fields the caller didn't provide."""
+        urla = loan_data.get("urla_fields")
+        await db.execute(
+            """
+            UPDATE applications SET
+                loan_amount      = COALESCE($1, loan_amount),
+                interest_rate    = COALESCE($2, interest_rate),
+                loan_term_months = COALESCE($3, loan_term_months),
+                loan_purpose     = COALESCE($4, loan_purpose),
+                loan_type        = COALESCE($5, loan_type),
+                occupancy        = COALESCE($6, occupancy),
+                external_loan_id = COALESCE($7, external_loan_id),
+                urla_fields      = COALESCE($8::jsonb, urla_fields),
+                updated_at       = NOW()
+             WHERE application_id = $9
+            """,
+            loan_data.get("loan_amount"),
+            loan_data.get("interest_rate"),
+            loan_data.get("loan_term_months"),
+            loan_data.get("loan_purpose"),
+            loan_data.get("loan_type"),
+            loan_data.get("occupancy"),
+            loan_data.get("external_loan_id"),
+            _to_jsonb(urla) if urla is not None else None,
+            application_id,
+        )

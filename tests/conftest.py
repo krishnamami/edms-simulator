@@ -101,6 +101,40 @@ class FakePostgresStore:
             "requires_review":    len(conflicts) > 0,
         }
 
+    # external IDs / LOS integration
+    async def find_by_external_id(self, source_system, external_id):
+        for a in self.applicants.values():
+            ext = a.get("external_ids") or {}
+            if ext.get(source_system) == external_id:
+                return a
+        return None
+
+    async def add_external_id(self, applicant_id, source_system, external_id):
+        a = self.applicants.get(applicant_id)
+        if a is None:
+            return
+        ext = a.get("external_ids") or {}
+        ext[source_system] = external_id
+        a["external_ids"] = ext
+
+    async def get_application_by_external_loan_id(self, external_loan_id):
+        for app in self.applications.values():
+            if app.get("external_loan_id") == external_loan_id:
+                return app
+        return None
+
+    async def update_application_loan_fields(self, application_id, loan_data):
+        app = self.applications.get(application_id)
+        if app is None:
+            return
+        for k in (
+            "loan_amount", "interest_rate", "loan_term_months",
+            "loan_purpose", "loan_type", "occupancy", "external_loan_id",
+            "urla_fields",
+        ):
+            if loan_data.get(k) is not None:
+                app[k] = loan_data[k]
+
 
 @pytest.fixture
 def xref_store():

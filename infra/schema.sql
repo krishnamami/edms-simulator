@@ -140,3 +140,71 @@ SELECT
 FROM document_relationships r
 JOIN document_index s ON r.source_doc_id = s.document_id
 JOIN document_index t ON r.target_doc_id = t.document_id;
+
+-- =====================================================================
+-- Phase 0: MISMO compatibility — external IDs + LOS / type registries
+-- =====================================================================
+
+-- External-system IDs on applicants. JSONB blob like
+-- {"encompass": "CONTACT-12345", "mismo_party": "P-001-A"}.
+ALTER TABLE applicants
+  ADD COLUMN IF NOT EXISTS external_ids JSONB NOT NULL DEFAULT '{}';
+
+CREATE INDEX IF NOT EXISTS idx_applicant_external_ids
+  ON applicants USING gin(external_ids);
+
+-- External loan identifier and the URLA / HMDA / loan-terms surface on
+-- applications. All optional — older rows stay valid.
+ALTER TABLE applications
+  ADD COLUMN IF NOT EXISTS external_loan_id VARCHAR,
+  ADD COLUMN IF NOT EXISTS loan_type        VARCHAR,
+  ADD COLUMN IF NOT EXISTS loan_purpose     VARCHAR
+    CHECK (loan_purpose IN (
+      'purchase','refinance_rate_term','refinance_cash_out',
+      'construction','home_equity','reverse','other'
+    )),
+  ADD COLUMN IF NOT EXISTS occupancy        VARCHAR
+    CHECK (occupancy IN (
+      'primary_residence','second_home','investment_property'
+    )),
+  ADD COLUMN IF NOT EXISTS loan_amount      NUMERIC,
+  ADD COLUMN IF NOT EXISTS interest_rate    NUMERIC,
+  ADD COLUMN IF NOT EXISTS loan_term_months INT DEFAULT 360,
+  ADD COLUMN IF NOT EXISTS urla_fields      JSONB DEFAULT '{}',
+  ADD COLUMN IF NOT EXISTS hmda_fields      JSONB DEFAULT '{}',
+  ADD COLUMN IF NOT EXISTS updated_at       TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_app_external_loan
+  ON applications(external_loan_id)
+  WHERE external_loan_id IS NOT NULL;
+
+-- MISMO 3.4 doc-type registry. Maps external LOS doc type codes to
+-- internal canonical types (W2_CURRENT, etc.) so any new LOS can be
+-- onboarded without code changes — just inserts here.
+CREATE TABLE IF NOT EXISTS mismo_doc_type_registry (
+    registry_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_system     VARCHAR NOT NULL,
+    external_type     VARCHAR NOT NULL,
+    internal_type     VARCHAR NOT NULL,
+    mismo_type        VARCHAR,
+    field_mapping     JSONB DEFAULT '{}',
+    confidence_weight FLOAT DEFAULT 1.0,
+    is_active         BOOLEAN DEFAULT TRUE,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (source_system, external_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mismo_source
+  ON mismo_doc_type_registry(source_system, is_active);
+
+-- LOS connector registry. Useful for surfacing which systems are wired.
+CREATE TABLE IF NOT EXISTS los_connectors (
+    connector_id    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            VARCHAR NOT NULL UNIQUE,
+    display_name    VARCHAR NOT NULL,
+    base_url        VARCHAR,
+    auth_type       VARCHAR DEFAULT 'api_key',
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+

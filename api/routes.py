@@ -36,6 +36,11 @@ from core.ingestion.adapters import (
     xml_adapter,
 )
 from core.ingestion.events import ChannelType
+from core.ingestion.los_connector import get_connector
+from core.ingestion.mismo import (
+    ENCOMPASS_TO_INTERNAL,
+    MISMO_TO_INTERNAL,
+)
 from core.ingestion.router import IngestRouter
 
 try:
@@ -383,4 +388,214 @@ async def reconcile_applicant(request: Request, applicant_id: str):
         "applicant_id": applicant_id,
         "relationships_created": total_rels,
         "conflicts_found": total_conflicts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 0: MISMO compatibility — universal LOS endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.post("/ingest/los", dependencies=[Depends(verify_api_key)])
+async def ingest_los(request: Request, body: dict):
+    """Universal LOS document receiver.
+
+    Body shape::
+
+        {
+          "source_system": "encompass" | "mismo_34" | ...,
+          "payload": { ... whatever the LOS sends ... }
+        }
+
+    The connector translates the payload to the internal model. If the
+    LOS loan number maps to an existing application, the document is
+    persisted into ``document_index`` and reconciled against the
+    applicant's other docs. Otherwise the translated event is returned
+    with ``status=pending_loan_creation`` so the caller can submit the
+    loan first via ``POST /loans/from-los``.
+    """
+    source_system = body.get("source_system") or ""
+    payload = body.get("payload") or {}
+    if not source_system or not payload:
+        raise HTTPException(
+            status_code=400,
+            detail="body must include source_system and payload",
+        )
+    connector = get_connector(source_system)
+    translated = connector.translate_document(payload)
+
+    pg = request.app.state.postgres_store
+    external_loan_id = translated.get("external_loan_id")
+    application = (
+        await pg.get_application_by_external_loan_id(external_loan_id)
+        if external_loan_id else None
+    )
+
+    if not application:
+        return {
+            "status": "pending_loan_creation",
+            "document_type_detected": translated["document_type"],
+            "applicant_id": None,
+            "external_loan_id": external_loan_id,
+            "translated": translated,
+        }
+
+    import uuid as _uuid
+    applicant_id = application["applicant_id"]
+    document_id = (
+        translated.get("external_doc_id")
+        or f"DOC-{source_system}-{_uuid.uuid4().hex[:12]}"
+    )
+    doc = {
+        "document_id":      document_id,
+        "applicant_id":     applicant_id,
+        "application_id":   application["application_id"],
+        "document_type":    translated["document_type"],
+        "document_category": translated["document_category"],
+        "borrower_role":    "primary",
+        "s3_key":           None,
+        "status":           "received",
+        "is_current":       True,
+        "extracted_fields": translated["extracted_fields"],
+        "confidence_score": translated["confidence_score"],
+    }
+    try:
+        await pg.save_document(doc)
+        new_rels = await DocumentReconciler(pg).reconcile(applicant_id, doc)
+    except Exception as exc:
+        logger.warning("ingest_los_persist_failed", extra={"error": str(exc)})
+        return {
+            "status": "translation_only",
+            "document_type_detected": translated["document_type"],
+            "applicant_id": applicant_id,
+            "external_loan_id": external_loan_id,
+            "translated": translated,
+            "error": str(exc),
+        }
+
+    return {
+        "status": "persisted",
+        "ingest_id": document_id,
+        "document_type_detected": translated["document_type"],
+        "applicant_id": applicant_id,
+        "application_id": application["application_id"],
+        "external_loan_id": external_loan_id,
+        "relationships_created": len(new_rels),
+        "translated": translated,
+    }
+
+
+@router.post("/loans/from-los", dependencies=[Depends(verify_api_key)])
+async def create_loan_from_los(request: Request, body: dict):
+    """Create a loan from a LOS-shaped payload.
+
+    Translates via the connector, then drives the existing
+    APPLICATION_SUBMITTED pipeline. Stores the LOS's loan number on the
+    new application row and merges any external IDs onto the applicant.
+    """
+    source_system = body.get("source_system") or ""
+    payload = body.get("payload") or {}
+    if not source_system or not payload:
+        raise HTTPException(
+            status_code=400,
+            detail="body must include source_system and payload",
+        )
+    connector = get_connector(source_system)
+    translated = connector.translate_loan(payload)
+
+    inner_payload = {
+        "los_id":      translated["los_id"],
+        "borrower":    translated["borrower"],
+        "co_borrower": translated.get("co_borrower"),
+        "loan":        {
+            "loan_amount": (translated["loan"] or {}).get("loan_amount"),
+            "credit_band": (translated["loan"] or {}).get("credit_band", "near-prime"),
+        },
+        "documents":   [],
+    }
+    service = request.app.state.aggregation_service
+    event = ApplicationSubmittedEvent(
+        event_type=EventType.APPLICATION_SUBMITTED, payload=inner_payload
+    )
+    result = await service.handle(event)
+
+    pg = request.app.state.postgres_store
+    external_loan_id = translated.get("los_id")
+    loan_terms = translated.get("loan") or {}
+    try:
+        await pg.update_application_loan_fields(
+            application_id=result["application_id"],
+            loan_data={
+                "loan_amount":      loan_terms.get("loan_amount"),
+                "interest_rate":    loan_terms.get("interest_rate"),
+                "loan_term_months": loan_terms.get("loan_term_months"),
+                "loan_purpose":     loan_terms.get("loan_purpose"),
+                "loan_type":        loan_terms.get("loan_type"),
+                "external_loan_id": external_loan_id,
+                "urla_fields":      translated.get("urla_fields") or {},
+            },
+        )
+        for sys_name, ext_id in (translated.get("external_ids") or {}).items():
+            await pg.add_external_id(result["applicant_id"], sys_name, ext_id)
+    except Exception as exc:
+        logger.warning("loans_from_los_patch_failed", extra={"error": str(exc)})
+
+    return {
+        "applicant_id":     result["applicant_id"],
+        "co_applicant_id":  result.get("co_applicant_id"),
+        "application_id":   result["application_id"],
+        "external_loan_id": external_loan_id,
+        "match_method":     result["match_method"],
+        "is_new_record":    result["is_new_record"],
+        "source_system":    source_system,
+    }
+
+
+@router.get(
+    "/resolve/external/{source_system}/{external_id}",
+    dependencies=[Depends(verify_api_key)],
+)
+async def resolve_external(
+    request: Request, source_system: str, external_id: str
+):
+    """Reverse-lookup: given a real LOS loan number / contact id, return
+    the simulator's internal ids."""
+    pg = request.app.state.postgres_store
+    application = await pg.get_application_by_external_loan_id(external_id)
+    if application:
+        return {
+            "applicant_id":     application["applicant_id"],
+            "co_applicant_id":  application.get("co_applicant_id"),
+            "application_id":   application["application_id"],
+            "los_id":           application.get("los_id"),
+            "external_loan_id": application.get("external_loan_id"),
+            "matched_via":      "applications.external_loan_id",
+        }
+    applicant = await pg.find_by_external_id(source_system, external_id)
+    if applicant:
+        return {
+            "applicant_id":   applicant["applicant_id"],
+            "external_ids":   applicant.get("external_ids", {}),
+            "matched_via":    "applicants.external_ids",
+        }
+    raise HTTPException(
+        status_code=404,
+        detail=f"no record found for {source_system}/{external_id}",
+    )
+
+
+@router.get("/mismo/doc-types", dependencies=[Depends(verify_api_key)])
+async def mismo_doc_types():
+    """Return the supported MISMO 3.4 + Encompass type mappings.
+
+    Useful for an LOS integration team to discover what types we
+    recognise without running test traffic.
+    """
+    return {
+        "mismo_34": MISMO_TO_INTERNAL,
+        "encompass": ENCOMPASS_TO_INTERNAL,
+        "totals": {
+            "mismo": len(MISMO_TO_INTERNAL),
+            "encompass": len(ENCOMPASS_TO_INTERNAL),
+        },
     }
