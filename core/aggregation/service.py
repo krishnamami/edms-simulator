@@ -293,6 +293,20 @@ class AggregationService:
         if co_credit:
             self.redis_store.set_credit_profile(co_applicant_id, co_credit)
 
+        # The borrower layer just changed — drop the cached context so the
+        # next GET /application/{id}/context re-assembles with fresh data.
+        if application_id:
+            self.redis_store.invalidate_context(application_id)
+        else:
+            try:
+                app = await self.postgres_store.get_application_by_applicant(
+                    applicant_id
+                )
+                if app:
+                    self.redis_store.invalidate_context(app["application_id"])
+            except Exception as exc:
+                logger.warning("invalidate_context_failed", extra={"error": str(exc)})
+
         # Persist documents into document_index, then reconcile each one
         # against existing docs for the same applicant. The reconciler writes
         # typed graph edges (confirms / corroborates / contradicts).
@@ -403,7 +417,7 @@ class AggregationService:
         await self.postgres_store.save_property_profile(profile_dict)
         self.redis_store.set_property_profile(property_id, profile_dict)
         if application_id:
-            self.redis_store.invalidate_application_context(application_id)
+            self.redis_store.invalidate_context(application_id)
 
         piti_total = (profile.piti_components.total_piti
                       if profile.piti_components else None)

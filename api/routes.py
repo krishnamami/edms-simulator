@@ -24,6 +24,7 @@ from core.aggregation.events import (
     EventType,
     PropertyDocumentUploadedEvent,
 )
+from core.context.assembler import ContextAssembler
 from core.property.extractors import (
     extract_appraisal_pdf,
     extract_flood_pdf,
@@ -989,4 +990,105 @@ async def mismo_doc_types():
             "mismo": len(MISMO_TO_INTERNAL),
             "encompass": len(ENCOMPASS_TO_INTERNAL),
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase C: application context — single-call assembly for Decision OS
+# ---------------------------------------------------------------------------
+
+
+def _context_assembler(request: Request) -> ContextAssembler:
+    return ContextAssembler(
+        postgres_store=request.app.state.postgres_store,
+        redis_store=request.app.state.redis_store,
+    )
+
+
+@router.get(
+    "/application/{application_id}/context",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_application_context(request: Request, application_id: str):
+    """The single endpoint Decision OS calls — folded borrower + property
+    + readiness + DTI/LTV. Redis cache → re-assemble if stale."""
+    redis = request.app.state.redis_store
+    cached = redis.get_application_context(application_id)
+    if cached:
+        return {"source": "cache", "data": cached}
+
+    assembler = _context_assembler(request)
+    try:
+        ctx = await assembler.assemble(application_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"source": "database", "data": ctx.model_dump()}
+
+
+@router.get(
+    "/application/{application_id}/readiness",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_application_readiness(request: Request, application_id: str):
+    """Lightweight readiness flags for "are we ready for AUS?" polling."""
+    redis = request.app.state.redis_store
+    cached = redis.get_application_context(application_id)
+    if cached:
+        return {
+            "application_id": application_id,
+            "readiness":      cached.get("readiness") or {},
+            "source":         "cache",
+        }
+    assembler = _context_assembler(request)
+    try:
+        ctx = await assembler.assemble(application_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {
+        "application_id": application_id,
+        "readiness":      ctx.readiness.model_dump(),
+        "source":         "database",
+    }
+
+
+@router.post(
+    "/application/{application_id}/refresh-context",
+    dependencies=[Depends(verify_api_key)],
+)
+async def refresh_application_context(request: Request, application_id: str):
+    """Force re-assembly even if cached. Useful after a batch upload."""
+    redis = request.app.state.redis_store
+    redis.invalidate_context(application_id)
+    assembler = _context_assembler(request)
+    try:
+        ctx = await assembler.assemble(application_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"source": "database", "data": ctx.model_dump()}
+
+
+@router.get(
+    "/application/{application_id}/dti",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_application_dti(request: Request, application_id: str):
+    """DTI breakdown — derives PITI, income, and obligations from context."""
+    redis = request.app.state.redis_store
+    cached = redis.get_application_context(application_id)
+    if not cached:
+        assembler = _context_assembler(request)
+        try:
+            ctx = await assembler.assemble(application_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        cached = ctx.model_dump()
+
+    property_block = cached.get("property") or {}
+    return {
+        "application_id":              application_id,
+        "front_end_dti":               cached.get("front_end_dti"),
+        "back_end_dti":                cached.get("back_end_dti"),
+        "piti_total":                  property_block.get("piti_total"),
+        "combined_qualifying_monthly": cached.get("combined_qualifying_monthly"),
+        "total_obligations":           cached.get("total_monthly_obligations"),
     }

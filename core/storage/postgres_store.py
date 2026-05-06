@@ -177,6 +177,36 @@ class PostgresStore:
         )
         return _row_to_dict(row)
 
+    async def get_application(self, application_id: str) -> Optional[dict]:
+        """Lookup an application by its primary key."""
+        row = await db.fetchrow(
+            "SELECT * FROM applications WHERE application_id = $1",
+            application_id,
+        )
+        return _row_to_dict(row)
+
+    async def get_application_by_applicant(
+        self, applicant_id: str
+    ) -> Optional[dict]:
+        """Return the most-recent application that has ``applicant_id`` as
+        primary or co-applicant. Used by the service layer to invalidate
+        the right context cache after a borrower-side update."""
+        row = await db.fetchrow(
+            """
+            SELECT * FROM applications
+            WHERE applicant_id = $1 OR co_applicant_id = $1
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            applicant_id,
+        )
+        return _row_to_dict(row)
+
+    async def update_application_loan_data(
+        self, application_id: str, loan_data: dict
+    ) -> None:
+        """Phase C alias for :meth:`update_application_loan_fields`."""
+        await self.update_application_loan_fields(application_id, loan_data)
+
     # ---------------- income profiles (versioned) -----------------
 
     async def save_income_profile(self, profile: dict) -> str:

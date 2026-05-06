@@ -56,6 +56,19 @@ class FakePostgresStore:
                 return app
         return None
 
+    async def get_application(self, application_id):
+        return self.applications.get(application_id)
+
+    async def get_application_by_applicant(self, applicant_id):
+        for app in self.applications.values():
+            if app.get("applicant_id") == applicant_id \
+                    or app.get("co_applicant_id") == applicant_id:
+                return app
+        return None
+
+    async def update_application_loan_data(self, application_id, loan_data):
+        await self.update_application_loan_fields(application_id, loan_data)
+
     async def save_income_profile(self, profile):
         applicant_id = profile["applicant_id"]
         prior = self.income_profiles.get(applicant_id)

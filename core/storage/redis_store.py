@@ -59,6 +59,8 @@ class RedisStore:
     TTL_APP_LOOKUP = 43200       # 12 hours
     TTL_GRAPH_SUMMARY = 3600     # 1 hour
     TTL_PROPERTY_PROFILE = 14400  # 4 hours
+    TTL_APPLICATION_CONTEXT = 1800  # 30 minutes
+    TTL_BORROWER_SNAPSHOT   = 7200  # 2 hours
 
     def __init__(self, client=None):
         self._r = client or get_redis()
@@ -207,8 +209,35 @@ class RedisStore:
             )
 
     def invalidate_application_context(self, application_id: str) -> None:
-        """Drop the cached application context so the next read recomputes
-        with the freshly-assembled property profile."""
+        """Backwards-compatible alias for :meth:`invalidate_context`."""
+        self.invalidate_context(application_id)
+
+    # ---------------- application context (Phase C) -----------------
+
+    def set_application_context(
+        self, application_id: str, ctx: dict, ttl: Optional[int] = None
+    ) -> bool:
+        try:
+            self._r.setex(
+                f"context:{application_id}",
+                ttl or self.TTL_APPLICATION_CONTEXT,
+                json.dumps(ctx, default=str),
+            )
+            return True
+        except Exception as e:
+            logger.warning("redis_set_context_failed", extra={"error": str(e)})
+            return False
+
+    def get_application_context(self, application_id: str) -> Optional[dict]:
+        try:
+            raw = self._r.get(f"context:{application_id}")
+            return json.loads(raw) if raw else None
+        except Exception as e:
+            logger.warning("redis_get_context_failed", extra={"error": str(e)})
+            return None
+
+    def invalidate_context(self, application_id: str) -> None:
+        """Drop the cached application context so the next read recomputes."""
         try:
             self._r.delete(f"context:{application_id}")
         except Exception as e:
