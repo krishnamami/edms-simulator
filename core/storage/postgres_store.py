@@ -51,6 +51,9 @@ def _row_to_dict(row) -> Optional[dict]:
             "source_value",
             "target_value",
             "piti_components",
+            "context_data",
+            "payload",
+            "events",
         ):
             try:
                 out[k] = json.loads(v)
@@ -206,6 +209,166 @@ class PostgresStore:
     ) -> None:
         """Phase C alias for :meth:`update_application_loan_fields`."""
         await self.update_application_loan_fields(application_id, loan_data)
+
+    # ---------------- Phase E: webhooks + context versioning -----------------
+
+    async def get_active_webhooks(self, event_type: str) -> list:
+        """Return every active webhook subscribed to ``event_type``.
+
+        Subscription is encoded as JSONB array on ``webhooks.events``;
+        the ``@>`` operator finds rows whose array contains the string.
+        """
+        rows = await db.fetch(
+            """
+            SELECT * FROM webhooks
+            WHERE is_active = TRUE
+              AND events @> $1::jsonb
+            ORDER BY created_at ASC
+            """,
+            json.dumps([event_type]),
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def list_webhooks(self) -> list:
+        rows = await db.fetch(
+            "SELECT * FROM webhooks ORDER BY created_at DESC"
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_webhook(self, webhook_id: str) -> Optional[dict]:
+        row = await db.fetchrow(
+            "SELECT * FROM webhooks WHERE webhook_id = $1::uuid", webhook_id
+        )
+        return _row_to_dict(row)
+
+    async def save_webhook(self, webhook: dict) -> str:
+        new_id = await db.fetchval(
+            """
+            INSERT INTO webhooks (
+                name, url, secret, events, is_active
+            ) VALUES (
+                $1, $2, $3, $4::jsonb, COALESCE($5, TRUE)
+            )
+            RETURNING webhook_id
+            """,
+            webhook["name"],
+            webhook["url"],
+            webhook.get("secret"),
+            json.dumps(webhook.get("events") or ["context_updated"]),
+            webhook.get("is_active"),
+        )
+        return str(new_id)
+
+    async def deactivate_webhook(self, webhook_id: str) -> None:
+        await db.execute(
+            "UPDATE webhooks SET is_active = FALSE WHERE webhook_id = $1::uuid",
+            webhook_id,
+        )
+
+    async def save_webhook_delivery(self, delivery: dict) -> None:
+        await db.execute(
+            """
+            INSERT INTO webhook_deliveries (
+                webhook_id, event_type, application_id, payload,
+                response_status, response_body, success
+            ) VALUES (
+                $1::uuid, $2, $3, $4::jsonb, $5, $6, $7
+            )
+            """,
+            delivery.get("webhook_id"),
+            delivery["event_type"],
+            delivery.get("application_id"),
+            _to_jsonb(delivery.get("payload")),
+            delivery.get("response_status"),
+            delivery.get("response_body"),
+            bool(delivery.get("success", False)),
+        )
+
+    async def get_webhook_deliveries(
+        self, webhook_id: str, limit: int = 50
+    ) -> list:
+        rows = await db.fetch(
+            """
+            SELECT * FROM webhook_deliveries
+            WHERE webhook_id = $1::uuid
+            ORDER BY delivered_at DESC LIMIT $2
+            """,
+            webhook_id,
+            limit,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def increment_webhook_failures(self, webhook_id) -> None:
+        if not webhook_id:
+            return
+        await db.execute(
+            """
+            UPDATE webhooks
+               SET failure_count = COALESCE(failure_count, 0) + 1,
+                   last_triggered = NOW()
+             WHERE webhook_id = $1::uuid
+            """,
+            str(webhook_id),
+        )
+
+    async def save_context_version(self, version: dict) -> str:
+        new_id = await db.fetchval(
+            """
+            INSERT INTO context_versions (
+                application_id, context_data, assembled_at,
+                trigger_event, trigger_doc_id
+            ) VALUES (
+                $1, $2::jsonb, $3::timestamptz, $4, $5
+            )
+            RETURNING version_id
+            """,
+            version["application_id"],
+            _to_jsonb(version["context_data"]),
+            _to_ts(version["assembled_at"]),
+            version.get("trigger_event"),
+            version.get("trigger_doc_id"),
+        )
+        return str(new_id)
+
+    async def get_context_versions(
+        self, application_id: str, limit: int = 10
+    ) -> list:
+        rows = await db.fetch(
+            """
+            SELECT version_id, application_id, assembled_at,
+                   trigger_event, trigger_doc_id, created_at
+            FROM context_versions
+            WHERE application_id = $1
+            ORDER BY assembled_at DESC LIMIT $2
+            """,
+            application_id,
+            limit,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_context_at(
+        self, application_id: str, timestamp: str
+    ) -> Optional[dict]:
+        """Return the most-recent context version assembled at or
+        before ``timestamp`` (ISO-8601). Used for audit replay."""
+        ts = _to_ts(timestamp)
+        row = await db.fetchrow(
+            """
+            SELECT * FROM context_versions
+            WHERE application_id = $1
+              AND assembled_at <= $2::timestamptz
+            ORDER BY assembled_at DESC LIMIT 1
+            """,
+            application_id,
+            ts,
+        )
+        if not row:
+            return None
+        out = _row_to_dict(row)
+        data = out.get("context_data")
+        if isinstance(data, str):
+            out["context_data"] = json.loads(data)
+        return out
 
     # ---------------- income profiles (versioned) -----------------
 

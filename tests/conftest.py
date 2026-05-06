@@ -33,6 +33,9 @@ class FakePostgresStore:
         self.relationships: list = []
         self.properties: dict = {}
         self.property_profiles: dict = {}
+        self.webhooks: dict = {}
+        self.webhook_deliveries: list = []
+        self.context_versions: list = []
 
     async def save_golden_record(self, gr):
         # Round-trip storage so get_all_applicants / find_by_external_id can
@@ -199,6 +202,86 @@ class FakePostgresStore:
         app = self.applications.get(application_id)
         if app is not None:
             app["property_id"] = property_id
+
+    # Phase E — webhooks + context versioning
+    async def get_active_webhooks(self, event_type):
+        return [
+            w for w in self.webhooks.values()
+            if w.get("is_active", True)
+            and event_type in (w.get("events") or ["context_updated"])
+        ]
+
+    async def list_webhooks(self):
+        return list(self.webhooks.values())
+
+    async def get_webhook(self, webhook_id):
+        return self.webhooks.get(str(webhook_id))
+
+    async def save_webhook(self, webhook):
+        import uuid as _uuid
+        new_id = str(_uuid.uuid4())
+        self.webhooks[new_id] = {
+            "webhook_id":     new_id,
+            "name":           webhook["name"],
+            "url":            webhook["url"],
+            "secret":         webhook.get("secret"),
+            "events":         webhook.get("events") or ["context_updated"],
+            "is_active":      webhook.get("is_active", True),
+            "failure_count":  0,
+        }
+        return new_id
+
+    async def deactivate_webhook(self, webhook_id):
+        wh = self.webhooks.get(str(webhook_id))
+        if wh is not None:
+            wh["is_active"] = False
+
+    async def save_webhook_delivery(self, delivery):
+        self.webhook_deliveries.append(dict(delivery))
+
+    async def get_webhook_deliveries(self, webhook_id, limit=50):
+        rows = [
+            d for d in self.webhook_deliveries
+            if str(d.get("webhook_id")) == str(webhook_id)
+        ]
+        return rows[-limit:][::-1]
+
+    async def increment_webhook_failures(self, webhook_id):
+        wh = self.webhooks.get(str(webhook_id))
+        if wh is not None:
+            wh["failure_count"] = (wh.get("failure_count") or 0) + 1
+
+    async def save_context_version(self, version):
+        import uuid as _uuid
+        row = {
+            "version_id":     str(_uuid.uuid4()),
+            "application_id": version["application_id"],
+            "context_data":   version["context_data"],
+            "assembled_at":   version["assembled_at"],
+            "trigger_event":  version.get("trigger_event"),
+            "trigger_doc_id": version.get("trigger_doc_id"),
+        }
+        self.context_versions.append(row)
+        return row["version_id"]
+
+    async def get_context_versions(self, application_id, limit=10):
+        rows = [
+            v for v in self.context_versions
+            if v["application_id"] == application_id
+        ]
+        rows.sort(key=lambda r: r.get("assembled_at") or "", reverse=True)
+        return rows[:limit]
+
+    async def get_context_at(self, application_id, timestamp):
+        rows = [
+            v for v in self.context_versions
+            if v["application_id"] == application_id
+            and (v.get("assembled_at") or "") <= timestamp
+        ]
+        if not rows:
+            return None
+        rows.sort(key=lambda r: r.get("assembled_at") or "", reverse=True)
+        return rows[0]
 
 
 @pytest.fixture

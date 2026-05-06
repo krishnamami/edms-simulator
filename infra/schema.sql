@@ -323,3 +323,46 @@ ALTER TABLE applications
     ADD COLUMN IF NOT EXISTS property_id VARCHAR
     REFERENCES properties(property_id);
 
+-- =====================================================================
+-- Phase E: webhooks + context versioning. Decision OS subscribes to
+-- context_updated; every assembly snapshots the full context for audit.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS webhooks (
+    webhook_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            VARCHAR NOT NULL,
+    url             VARCHAR NOT NULL,
+    secret          VARCHAR,
+    events          JSONB NOT NULL DEFAULT '["context_updated"]',
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    last_triggered  TIMESTAMPTZ,
+    failure_count   INT DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    delivery_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    webhook_id      UUID REFERENCES webhooks(webhook_id),
+    event_type      VARCHAR NOT NULL,
+    application_id  VARCHAR,
+    payload         JSONB NOT NULL,
+    response_status INT,
+    response_body   TEXT,
+    delivered_at    TIMESTAMPTZ DEFAULT NOW(),
+    success         BOOLEAN
+);
+
+CREATE TABLE IF NOT EXISTS context_versions (
+    version_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    application_id  VARCHAR NOT NULL,
+    context_data    JSONB NOT NULL,
+    assembled_at    TIMESTAMPTZ NOT NULL,
+    trigger_event   VARCHAR,
+    trigger_doc_id  VARCHAR,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_versions_app
+    ON context_versions(application_id, assembled_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook
+    ON webhook_deliveries(webhook_id, delivered_at DESC);
+

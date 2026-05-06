@@ -25,6 +25,14 @@ from core.aggregation.events import (
     PropertyDocumentUploadedEvent,
 )
 from core.context.assembler import ContextAssembler
+from core.context.models import (
+    ComplianceSlice,
+    CreditSlice,
+    FraudSlice,
+    IncomeSlice,
+    PropertySlice,
+    ReadinessFlags,
+)
 from core.ingestion.adapters.vendor_aus_adapter import VendorAUSAdapter
 from core.ingestion.adapters.vendor_fraud_adapter import VendorFraudAdapter
 from core.ingestion.adapters.vendor_ssn_adapter import (
@@ -1350,4 +1358,318 @@ async def run_vendor_checks(request: Request, application_id: str):
         "submitted":      submitted,
         "vendor_checks":  ctx.vendor_checks,
         "readiness":      ctx.readiness.model_dump(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase E: persona slices, webhooks, context versioning, missing-docs
+# ---------------------------------------------------------------------------
+
+
+async def _ctx_dict(request: Request, application_id: str) -> dict:
+    """Return the cached context dict, falling through to a fresh
+    assembly when nothing is cached. Raises 404 if the application
+    doesn't exist."""
+    redis = request.app.state.redis_store
+    cached = redis.get_application_context(application_id)
+    if cached:
+        return cached
+    assembler = _context_assembler(request)
+    try:
+        ctx = await assembler.assemble(application_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return ctx.model_dump()
+
+
+# ---- persona slices --------------------------------------------------------
+
+
+@router.get(
+    "/application/{application_id}/context/income",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_income_slice(request: Request, application_id: str):
+    ctx = await _ctx_dict(request, application_id)
+    primary = ctx.get("primary") or {}
+    co = ctx.get("co_borrower") or {}
+    slice_ = IncomeSlice(
+        application_id=application_id,
+        primary_qualifying_monthly=float(primary.get("qualifying_monthly") or 0),
+        primary_income_sources=primary.get("income_sources") or [],
+        primary_income_confidence=float(primary.get("income_confidence") or 0),
+        primary_income_verified=bool(primary.get("income_verified", False)),
+        co_borrower_qualifying=(
+            float(co.get("qualifying_monthly")) if co else None
+        ),
+        combined_qualifying_monthly=float(ctx.get("combined_qualifying_monthly") or 0),
+        dti_calculable=bool((ctx.get("readiness") or {}).get("dti_calculable", False)),
+        front_end_dti=ctx.get("front_end_dti"),
+        back_end_dti=ctx.get("back_end_dti"),
+        income_requires_review=bool(primary.get("income_requires_review", False)),
+        assembled_at=ctx.get("assembled_at", ""),
+    )
+    return slice_.model_dump()
+
+
+@router.get(
+    "/application/{application_id}/context/credit",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_credit_slice(request: Request, application_id: str):
+    ctx = await _ctx_dict(request, application_id)
+    primary = ctx.get("primary") or {}
+    co = ctx.get("co_borrower") or {}
+    derog = bool(primary.get("derogatory_marks") or 0)
+    slice_ = CreditSlice(
+        application_id=application_id,
+        primary_mid_score=int(primary.get("mid_score") or 0),
+        primary_credit_band=primary.get("credit_band") or "",
+        primary_obligations=float(primary.get("monthly_obligations") or 0),
+        co_borrower_mid_score=(int(co.get("mid_score")) if co else None),
+        qualifying_score_used=int(ctx.get("qualifying_score_used") or 0),
+        total_obligations=float(ctx.get("total_monthly_obligations") or 0),
+        derogatory_flags=derog,
+        assembled_at=ctx.get("assembled_at", ""),
+    )
+    return slice_.model_dump()
+
+
+@router.get(
+    "/application/{application_id}/context/property",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_property_slice(request: Request, application_id: str):
+    ctx = await _ctx_dict(request, application_id)
+    prop = ctx.get("property") or {}
+    readiness = ctx.get("readiness") or {}
+    slice_ = PropertySlice(
+        application_id=application_id,
+        appraised_value=prop.get("appraised_value"),
+        ltv=prop.get("ltv") if prop else ctx.get("ltv"),
+        piti_total=prop.get("piti_total"),
+        piti_breakdown=prop.get("piti_components"),
+        flood_zone=prop.get("flood_zone"),
+        condition_rating=prop.get("condition_rating"),
+        appraisal_complete=bool(readiness.get("appraisal_complete", False)),
+        requires_review=bool(ctx.get("requires_review", False)),
+        assembled_at=ctx.get("assembled_at", ""),
+    )
+    return slice_.model_dump()
+
+
+@router.get(
+    "/application/{application_id}/context/compliance",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_compliance_slice(request: Request, application_id: str):
+    ctx = await _ctx_dict(request, application_id)
+    pg = request.app.state.postgres_store
+    aus = (ctx.get("vendor_checks") or {}).get("aus_findings") or {}
+    app_row = await pg.get_application(application_id)
+    hmda = (app_row or {}).get("hmda_fields") or {}
+    if isinstance(hmda, str):
+        import json as _json
+        try:
+            hmda = _json.loads(hmda)
+        except Exception:
+            hmda = {}
+    slice_ = ComplianceSlice(
+        application_id=application_id,
+        readiness=ReadinessFlags(**(ctx.get("readiness") or {})),
+        missing_items=(ctx.get("readiness") or {}).get("missing_items") or [],
+        aus_recommendation=aus.get("recommendation"),
+        hmda_fields=hmda,
+        requires_review=bool(ctx.get("requires_review", False)),
+        assembled_at=ctx.get("assembled_at", ""),
+    )
+    return slice_.model_dump()
+
+
+@router.get(
+    "/application/{application_id}/context/fraud",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_fraud_slice(request: Request, application_id: str):
+    ctx = await _ctx_dict(request, application_id)
+    vc = ctx.get("vendor_checks") or {}
+    slice_ = FraudSlice(
+        application_id=application_id,
+        fraud_score=vc.get("fraud_score"),
+        fraud_band=vc.get("fraud_band"),
+        ssn_valid=vc.get("ssn_valid"),
+        ofac_clear=vc.get("ofac_clear"),
+        employment_verified=vc.get("employment_verified"),
+        requires_review=bool(vc.get("fraud_requires_review")),
+        assembled_at=ctx.get("assembled_at", ""),
+    )
+    return slice_.model_dump()
+
+
+# ---- webhooks --------------------------------------------------------------
+
+
+@router.post("/webhooks", dependencies=[Depends(verify_api_key)])
+async def register_webhook(request: Request, body: dict):
+    if not body.get("name") or not body.get("url"):
+        raise HTTPException(
+            status_code=400, detail="name and url required"
+        )
+    pg = request.app.state.postgres_store
+    webhook_id = await pg.save_webhook({
+        "name":   body["name"],
+        "url":    body["url"],
+        "secret": body.get("secret"),
+        "events": body.get("events") or ["context_updated"],
+    })
+    return {
+        "webhook_id": webhook_id,
+        "name":       body["name"],
+        "url":        body["url"],
+        "is_active":  True,
+    }
+
+
+@router.get("/webhooks", dependencies=[Depends(verify_api_key)])
+async def list_webhooks(request: Request):
+    pg = request.app.state.postgres_store
+    rows = await pg.list_webhooks()
+    return {"count": len(rows), "webhooks": rows}
+
+
+@router.delete(
+    "/webhooks/{webhook_id}", dependencies=[Depends(verify_api_key)]
+)
+async def deactivate_webhook(request: Request, webhook_id: str):
+    pg = request.app.state.postgres_store
+    await pg.deactivate_webhook(webhook_id)
+    return {"webhook_id": webhook_id, "is_active": False}
+
+
+@router.get(
+    "/webhooks/{webhook_id}/deliveries",
+    dependencies=[Depends(verify_api_key)],
+)
+async def list_webhook_deliveries(
+    request: Request, webhook_id: str, limit: int = 50
+):
+    pg = request.app.state.postgres_store
+    rows = await pg.get_webhook_deliveries(webhook_id, limit=limit)
+    return {"webhook_id": webhook_id, "count": len(rows), "deliveries": rows}
+
+
+# ---- context versioning ----------------------------------------------------
+
+
+@router.get(
+    "/application/{application_id}/context/history",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_context_history(
+    request: Request, application_id: str, limit: int = 10
+):
+    pg = request.app.state.postgres_store
+    rows = await pg.get_context_versions(application_id, limit=limit)
+    versions = [
+        {
+            "version_id":     r.get("version_id"),
+            "assembled_at":   r.get("assembled_at"),
+            "trigger_event":  r.get("trigger_event"),
+            "trigger_doc_id": r.get("trigger_doc_id"),
+        }
+        for r in rows
+    ]
+    return {"application_id": application_id, "versions": versions}
+
+
+@router.get(
+    "/application/{application_id}/context/at/{timestamp}",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_context_at_timestamp(
+    request: Request, application_id: str, timestamp: str
+):
+    pg = request.app.state.postgres_store
+    row = await pg.get_context_at(application_id, timestamp)
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no context version at or before {timestamp}",
+        )
+    return {
+        "application_id": application_id,
+        "timestamp":      timestamp,
+        "version":        {
+            "version_id":     row.get("version_id"),
+            "assembled_at":   row.get("assembled_at"),
+            "trigger_event":  row.get("trigger_event"),
+            "trigger_doc_id": row.get("trigger_doc_id"),
+        },
+        "context":        row.get("context_data"),
+    }
+
+
+# ---- missing documents -----------------------------------------------------
+
+
+_BORROWER_REQUIRED_DOCS = [
+    {"item": "W-2 — most recent year",          "required": True,  "category": "income",   "doc_type": "W2_CURRENT"},
+    {"item": "Pay stub — most recent",          "required": True,  "category": "income",   "doc_type": "PAYSTUB_CURRENT"},
+    {"item": "Bank statements — 2 months",      "required": True,  "category": "asset",    "doc_type": "BANK_STATEMENT_M1"},
+    {"item": "Driver's license",                "required": True,  "category": "identity", "doc_type": "ID_DRIVERS_LICENSE"},
+    {"item": "Credit report",                   "required": True,  "category": "credit",   "doc_type": "CREDIT_REPORT"},
+]
+
+_PROPERTY_REQUIRED_DOCS = [
+    {"item": "URAR appraisal",                  "required": True,  "category": "property", "doc_type": "APPRAISAL_URAR"},
+    {"item": "Title commitment",                "required": True,  "category": "property", "doc_type": "TITLE_COMMITMENT"},
+    {"item": "Homeowner's insurance binder",    "required": True,  "category": "property", "doc_type": "HOI_BINDER"},
+    {"item": "Flood certificate",               "required": True,  "category": "property", "doc_type": "FLOOD_CERT"},
+    {"item": "Property tax bill",               "required": True,  "category": "property", "doc_type": "PROPERTY_TAX_BILL"},
+]
+
+_VENDOR_REQUIRED_DOCS = [
+    {"item": "AUS findings (DU or LP)",         "required": True,  "category": "vendor",   "doc_type": "AUS_DU_FINDINGS"},
+    {"item": "Employment verification",         "required": False, "category": "vendor",   "doc_type": "EMPLOYMENT_VERIFICATION"},
+    {"item": "Fraud / KYC report",              "required": False, "category": "vendor",   "doc_type": "FRAUD_REPORT"},
+]
+
+
+@router.get(
+    "/application/{application_id}/missing-documents",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_missing_documents(request: Request, application_id: str):
+    pg = request.app.state.postgres_store
+    docs = await pg.get_documents_for_application(application_id)
+    have = {d.get("document_type") for d in docs}
+    # The borrower-required income / asset docs are usually rowed against
+    # the applicant rather than the application — pull those too.
+    app_row = await pg.get_application(application_id)
+    if app_row:
+        try:
+            applicant_docs = await pg.get_documents_for_applicant(
+                app_row["applicant_id"]
+            )
+        except Exception:
+            applicant_docs = []
+        have |= {d.get("document_type") for d in applicant_docs}
+
+    def _missing(catalog):
+        return [d for d in catalog if d["doc_type"] not in have and d["required"]]
+
+    borrower_missing = _missing(_BORROWER_REQUIRED_DOCS)
+    property_missing = _missing(_PROPERTY_REQUIRED_DOCS)
+    vendor_missing   = _missing(_VENDOR_REQUIRED_DOCS)
+
+    # AUS_DU_FINDINGS ⟂ AUS_LP_FINDINGS — either satisfies the gate.
+    if "AUS_LP_FINDINGS" in have:
+        vendor_missing = [v for v in vendor_missing if v["doc_type"] != "AUS_DU_FINDINGS"]
+
+    return {
+        "application_id":   application_id,
+        "borrower_missing": [m["doc_type"] for m in borrower_missing],
+        "property_missing": [m["doc_type"] for m in property_missing],
+        "vendor_missing":   [m["doc_type"] for m in vendor_missing],
+        "checklist":        borrower_missing + property_missing + vendor_missing,
     }

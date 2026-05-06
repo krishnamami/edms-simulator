@@ -15,16 +15,30 @@ from core.context.models import (
     PropertySnapshot,
     ReadinessFlags,
 )
+from core.context.webhook_publisher import WebhookPublisher
 
 logger = logging.getLogger(__name__)
 
 
 class ContextAssembler:
-    def __init__(self, postgres_store, redis_store):
+    def __init__(
+        self,
+        postgres_store,
+        redis_store,
+        webhook_publisher: Optional[WebhookPublisher] = None,
+    ):
         self.pg = postgres_store
         self.redis = redis_store
+        self.webhook_publisher = webhook_publisher or WebhookPublisher(
+            postgres_store
+        )
 
-    async def assemble(self, application_id: str) -> ApplicationContext:
+    async def assemble(
+        self,
+        application_id: str,
+        trigger_event: Optional[str] = None,
+        trigger_doc_id: Optional[str] = None,
+    ) -> ApplicationContext:
         """Read every layer for an application and return a fresh
         ``ApplicationContext``. Caches the result under
         ``context:{application_id}`` in Redis."""
@@ -140,6 +154,38 @@ class ContextAssembler:
         )
 
         self.redis.set_application_context(application_id, ctx.model_dump())
+
+        # Phase E — snapshot every assembly into context_versions for audit.
+        try:
+            await self.pg.save_context_version({
+                "application_id": application_id,
+                "context_data":   ctx.model_dump(),
+                "assembled_at":   ctx.assembled_at,
+                "trigger_event":  trigger_event or "manual",
+                "trigger_doc_id": trigger_doc_id,
+            })
+        except Exception as exc:
+            logger.warning(
+                "context_version_persist_failed", extra={"error": str(exc)}
+            )
+
+        # Fan out a context_updated event to any registered webhooks.
+        try:
+            await self.webhook_publisher.publish(
+                event_type="context_updated",
+                application_id=application_id,
+                payload={
+                    "application_id":  application_id,
+                    "requires_review": ctx.requires_review,
+                    "readiness":       ctx.readiness.model_dump(),
+                    "assembled_at":    ctx.assembled_at,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "context_webhook_publish_failed", extra={"error": str(exc)}
+            )
+
         logger.info(
             "context_assembled",
             extra={
