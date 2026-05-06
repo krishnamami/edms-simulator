@@ -29,6 +29,9 @@ Parameters:
     Type: String
   ApiKeySecretArn:
     Type: String
+  TaskRoleArn:
+    Type: String
+    Description: ARN of an externally-managed IAM role for ECS tasks (app permissions). Pre-create the role outside this stack.
 
 Resources:
   Cluster:
@@ -67,31 +70,10 @@ Resources:
                   - !Ref RedisSecretArn
                   - !Ref ApiKeySecretArn
 
-  TaskRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub ${EnvironmentName}-task-role
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: ecs-tasks.amazonaws.com }
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: AppPermissions
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - sqs:SendMessage
-                  - sqs:GetQueueUrl
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:GetObject
-                Resource: "*"
+  # TaskRole is managed externally and passed in via the TaskRoleArn parameter
+  # so that out-of-band changes to the role (e.g. policy attachments by an
+  # admin) don't drift relative to the stack. Pre-create the role with the
+  # ecs-tasks.amazonaws.com trust relationship before deploying.
 
   AlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -154,7 +136,7 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities: [FARGATE]
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
-      TaskRoleArn: !GetAtt TaskRole.Arn
+      TaskRoleArn: !Ref TaskRoleArn
       ContainerDefinitions:
         - Name: !Ref EnvironmentName
           Image: !Ref ContainerImage
