@@ -37,15 +37,25 @@ Redis port is **6380**.
 ## Repo state at end of last session
 
 - Branch: `main`, all committed and pushed to `https://github.com/krishnamami/edms-simulator`
-- Tests: **122 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`)
+- Tests: **160 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`)
 - `simulate_local.py` runs end-to-end with exit 0 on a clean DB
-- **Production ECS service is live** at `http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com` (`/health` and `/docs` returning 200). 2/2 Fargate tasks Running.
-- **AWS resources deployed:** ECS cluster + service + ALB + log group + execution role + task definition (CFN stack `edms-ecs`), ECR repo `edms-simulator`, IAM role `edms-simulator-task-role` (managed externally). **Not yet deployed:** RDS Postgres (`rds-postgres.yaml` committed but not applied), ElastiCache Redis (`elasticache.yaml` not applied), so app won't survive a real DB query yet.
+- **Production ECS service is live + DB-backed** at `http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com`. `/health` 200, `/docs` 200, **DB-touching endpoints (`/applicant/{id}/graph/summary`) return 200 with `source: "database"`**.
+- **MISMO + LOS endpoints live in prod**: `/loans/from-los`, `/ingest/los`, `/resolve/external/...`, `/mismo/doc-types` all verified end-to-end.
+- **XRefStore now hydrates from Postgres at startup** so `applicant_id` sequence + SSN / source-id lookups survive across redeploys (Phase 0.5).
 
 Latest commits (top of `main`):
 
 ```
-fbd03d5  fix: enable public IP for ECS tasks in default VPC subnets   ← made the deploy work
+ab27bf5  fix(los): connectors must compute ssn_hash so applicants don't collide
+047aa6d  fix: hydrate XRefStore from Postgres at startup
+c5b142a  feat(mismo): Phase 0 — MISMO compatibility + LOS connectors + external IDs
+920a15e  fix: extract decision_os_api_key field from secret instead of injecting whole JSON
+2d7d548  fix: enable SSL for ElastiCache Redis in production
+60c4d68  fix(db): enable SSL on the asyncpg pool when USE_AWS_SECRETS=true
+8c8cc5b  chore(ops): scripts/apply_schema.py — one-off RDS schema bootstrap
+a359ce6  chore: track IAM bootstrap policies + gitignore .logs/
+cac3b77  docs: update context.md with AWS production bootstrap notes
+fbd03d5  fix: enable public IP for ECS tasks in default VPC subnets
 1a1002a  infra(ecs): take TaskRole ARN as a parameter, drop inline role
 6a66536  ci: add workflow_dispatch trigger to both workflows
 e41d244  ci(deploy): substitute ACCOUNT_ID in task_definition.json before render
@@ -75,6 +85,9 @@ bff35cc  feat(simulator): Phase D — 7-step walkthrough exercising all channels
 | **C** | `0d0b985` | All 7 channel adapters (chat / image / email / pdf / form / csv / xml). Anthropic SDK wired via shared `_claude_client.py` (model `claude-sonnet-4-6`, prompt-caching on system block). Adapters injectable for tests. `/ingest/*` endpoints replaced stubs with real implementations. |
 | **D** | `bff35cc` | `scripts/simulate_local.py` rewritten — 7-step walkthrough exercising every channel + verifying golden record / Redis / Postgres / xref. |
 | **E** | `e1fa6b6` | Resilience for upstream Claude errors. `email_adapter` body-extract falls back gracefully (attachments still process). `/ingest/{chat,image,email}` map `anthropic.APIStatusError` → HTTP 502 with detail. Simulator distinguishes **failed (live)** vs **skipped (no key)**. |
+| **graph** | `d0e11e3` | Document knowledge graph — `core/graph/{models,reconciler,navigator}.py`. Reconciler writes typed edges (confirms / corroborates / contradicts) using the same `NUMERIC_CONFLICT_THRESHOLD` as `ConfidenceResolver`. Navigator answers questions over the graph (Claude with full reasoning_path when key set, rule-based fallback otherwise). 5 new endpoints under `/applicant/{id}/`. 18 new tests. |
+| **0**  | `c5b142a` | MISMO 3.4 compatibility + LOS connectors + external IDs. `core/ingestion/{mismo,los_connector}.py` with 55 MISMO + 20 Encompass mappings, `EncompassConnector` + `GenericMISMOConnector`. Schema adds `applicants.external_ids JSONB`, `applications.external_loan_id` + URLA / HMDA / loan-terms columns, `mismo_doc_type_registry` + `los_connectors` tables. New endpoints: `/ingest/los`, `/loans/from-los`, `/resolve/external/{system}/{id}`, `/mismo/doc-types`. 13 new tests. |
+| **0.5** | `047aa6d`, `ab27bf5` | Production data-integrity fixes triggered by Phase 0 prod test. (1) `XRefStore.hydrate_from_postgres()` called from `api/main.py` lifespan so applicant-id sequence + SSN lookups survive across restarts (was silently overwriting via `ON CONFLICT DO UPDATE`). (2) LOS connectors must populate `ssn_hash` from the full SSN — empty strings collide on `idx_applicant_ssn`. 7 new tests. |
 
 ---
 
@@ -96,10 +109,12 @@ Took the simulator from "runs locally" to "running on Fargate behind an ALB". Mu
 | Secrets Manager | `edms/aurora/credentials`, `edms/redis/endpoint`, `edms/api/keys` (with `-tNFwJM`/`-Z3uo92`/`-NLNCtu` suffixes) | pre-existing in account |
 | KMS key | `arn:aws:kms:us-east-1:621646470377:key/f61c6a3c-15aa-4e0d-b9dd-8665a8c88d26` | for `edms-simulator-loans` S3 bucket |
 
-**Not yet deployed (app will fail at first DB / Redis query):**
+**Backing services (admin-provisioned out-of-band, not via this repo's CFN):**
 
-- **RDS Postgres** — `infra/cloudformation/rds-postgres.yaml` committed but `aws cloudformation deploy --stack-name edms-rds ...` not run. Needs admin perms or expanded `github-cicd-live` policy (rds:CreateDBInstance, rds:CreateDBSubnetGroup, etc.).
-- **ElastiCache Redis** — `infra/cloudformation/elasticache.yaml` not deployed.
+- **RDS Postgres `edms-postgres-rdsinstance-ev3113lmj40h`** — running, private endpoint, `rds.force_ssl=1`, master user `edms_admin`. Schema applied via `scripts/apply_schema.py` one-off ECS task; 47 statements OK (Phase 0 added 27, prior phases added 20). The repo's `infra/cloudformation/rds-postgres.yaml` was never used to deploy the actual instance.
+- **ElastiCache Redis** — running with `TransitEncryptionEnabled=True`. `redis_store.py` triggers `ssl=True` when `ENVIRONMENT=production` or `REDIS_SSL=true`. The repo's `infra/cloudformation/elasticache.yaml` was never used.
+- **Secrets Manager** — `edms/aurora/credentials` (with `username` corrected from `edms` to `edms_admin`), `edms/redis/endpoint`, `edms/api/keys`. All admin-provisioned out-of-band. `task_definition.json` references them by ARN-with-suffix (`-tNFwJM` / `-Z3uo92` / `-NLNCtu`). The `API_KEY` reference uses ECS's JSON-key syntax (`...-NLNCtu:decision_os_api_key::`) so only the field value is injected, not the whole JSON blob.
+- **MISMO type registry seeded in production** — `scripts/seed_mismo_registry.py` ran as a one-off ECS task; 75 mappings + 5 LOS connectors loaded.
 
 ### Hard-won lessons
 
@@ -261,55 +276,67 @@ Errors:
 
 ## Open follow-ups
 
+### Resolved this session
+
+- ✅ **Leaked AWS key** `AKIAZBPIELTUVVBGFZHN` — **deactivated**. Any new AWS
+  CLI from this session needs fresh credentials.
+- ✅ **`XRefStore` in-memory bug** — fixed by Phase 0.5. `hydrate_from_postgres()`
+  loads existing applicants on lifespan startup; `next_sequence()` resumes
+  past the highest stored id; SSN + source-id indexes rebuilt.
+
 ### AWS / production
 
-1. **Deploy `rds-postgres.yaml`** — committed but not applied. App is up but
-   any DB query returns connection-refused. Command:
-   ```bash
-   aws cloudformation deploy --template-file infra/cloudformation/rds-postgres.yaml \
-     --stack-name edms-rds --region us-east-1 \
-     --parameter-overrides \
-       VpcId=vpc-0768c1a9db95fa311 \
-       PrivateSubnetIds=subnet-06f6695e50577d0a6,subnet-0b78b46cb2ccadb8b \
-       DBSecretArn=arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/aurora/credentials-tNFwJM
-   ```
-   `github-cicd-live` likely lacks `rds:CreateDBInstance` etc. — needs admin
-   or expanded perms.
-2. **Deploy `elasticache.yaml`** — same situation. Redis cluster missing.
-3. **Clean up `edms-aurora` wedged stack + 2 orphan resources** — admin to
+1. **Production data cleanup** (Phase 0/0.5 collateral damage):
+   - **James Okafor's data was overwritten.** First Phase 0 prod test triggered
+     the (now-fixed) overwrite bug — Maya Patel's data clobbered James's row at
+     `APL-00001-P`. Original LOS-PROD-001 application now points at an
+     applicant whose person details no longer match. Recovery requires the
+     original ingest payload from logs.
+   - **Maya's row has `ssn_hash=""`** stored from before the connector fix.
+     Won't collide with future real-hash inserts (everyone gets a real hash now)
+     but is itself broken — can't be deterministically matched on SSN.
+     One-off `aws ecs run-task` with an UPDATE statement to recompute her hash
+     would close it out.
+2. **Clean up `edms-aurora` wedged stack + 2 orphan resources** — admin to
    delete IAM role `edms-aurora-RDSProxyRole-oBsVFktLB9Z3` (inline policies
    first) and SG `sg-0050f77a029b4642f`, then `aws cloudformation delete-stack
-   --stack-name edms-aurora`.
-4. **Rotate the leaked AWS access key** `AKIAZBPIELTUVVBGFZHN` (was pasted in
-   chat earlier in the session). Rotation gates everything else.
-5. **`AssignPublicIp: ENABLED`** is acceptable for the default-VPC dev deploy
+   --stack-name edms-aurora`. (Pre-dates this session.)
+3. **CFN drift** — RDS, ElastiCache, and Secrets Manager were all
+   admin-provisioned out-of-band, not via the repo's CFN templates. Future
+   schema / config changes need to either route through admin-provisioned
+   parameter groups or finally take ownership in `infra/cloudformation/`.
+4. **`AssignPublicIp: ENABLED`** is acceptable for the default-VPC dev deploy
    but should flip back to `DISABLED` when this moves to a real VPC with
    private subnets + NAT gateway. Documented in the commit message of `fbd03d5`.
-6. **Wire `infra/cloudformation/secrets.yaml` (or admin-provision) so the
-   three `edms/*` secrets are stack-managed** — currently they exist
-   out-of-band; their ARN suffixes are hard-coded in `task_definition.json`,
-   so any rotation or recreate breaks the deploy.
+5. **Wire `infra/cloudformation/secrets.yaml` (or admin-provision) so the
+   three `edms/*` secrets are stack-managed** — currently their ARN suffixes
+   are hard-coded in `task_definition.json`, so any rotation or recreate
+   breaks the deploy.
 
 ### Application
 
-1. **`XRefStore` is in-memory** — wiped on uvicorn restart while Postgres
-   persists. After a restart, the resolver can create a fresh `applicant_id`
-   for an SSN that already exists in DB → `idx_applicant_ssn` UniqueViolation.
-   Workaround in dev: truncate Postgres before each fresh run. **Real fix:**
-   hydrate XRefStore from Postgres at startup, or have the resolver
-   fall back to a Postgres lookup on cache miss.
-2. **`_handle_normalized_ingest_event` only handles API channel** — for chat /
+1. **`_handle_normalized_ingest_event` only handles API channel** — for chat /
    pdf / etc., the adapter produces a `NormalizedIngestEvent` but the service
    raises `NotImplementedError`. BUILD 12 (full ConfidenceResolver merge into
    the income profile) was deferred. Today the `/ingest/*` endpoints return
    the event without merging into a profile.
-3. **`claude_extractor` body** — Phase B placed the file with the documented
+2. **`claude_extractor` body** — Phase B placed the file with the documented
    signature; Phase C extension never replaced the `NotImplementedError` body
    (the pdf_adapter's `claude_fallback` path catches it gracefully). Implement
    when there's a real document type that pymupdf can't handle.
-4. **`/ingest/csv` doesn't ingest** — the endpoint returns the report and
+3. **`/ingest/csv` doesn't ingest** — the endpoint returns the report and
    parsed signals but doesn't drive applicants into Postgres. Wire each event
    through the aggregation service when BUILD 12 is done.
+4. **`idx_applicant_ssn` is a strict UNIQUE** — if any caller forgets to
+   populate `ssn_hash`, the second arrival hits the constraint. Defensive
+   alternative: convert to a partial index (`WHERE ssn_hash <> ''`) so empty
+   hashes don't collide. Trade-off: hides connector bugs at insert time.
+   Current preference: keep strict and rely on connector tests
+   (`test_translate_loan_distinct_ssns_produce_distinct_hashes`).
+5. **Hydration is sequential and load-everything-into-memory.** Fine for
+   thousands of applicants, painful at hundreds of thousands. When the row
+   count grows, switch to a Postgres-backed `XRefStore` that does point
+   lookups instead of pre-loading.
 
 ---
 
@@ -331,6 +358,28 @@ Errors:
 - **Anthropic credit balance** — surfaces as `BadRequestError` with code 400.
   Phase E maps that to HTTP 502 with the upstream message; the email pipeline
   no longer breaks on it.
+- **ECS `secrets:` block injects the WHOLE SecretString.** If a secret is
+  stored as JSON, the env var ends up containing the JSON blob — not the
+  field value. Use ECS's JSON-key syntax (`<arn>:<json-key>::`) to extract
+  one field at task start. Bit us on `API_KEY` until commit `920a15e`.
+- **Git Bash + AWS CLI path mangling.** `/ecs/edms-simulator` becomes
+  `C:\Program Files\Git\ecs\edms-simulator` for AWS CLI args that look like
+  Linux paths. Workaround: `MSYS_NO_PATHCONV=1` prefix on the command, or
+  double-leading-slash (`//ecs/...`).
+- **Python on Windows can't see Bash's `/tmp`.** `curl > /tmp/x.txt`
+  (bash) followed by `python -c "open('/tmp/x.txt')"` (Windows Python) fails
+  with FileNotFoundError. Either pipe through stdin or use a Windows-style
+  path that both shell and Python interpret the same way.
+- **RDS Postgres rejects no-SSL connections by default.** Param group has
+  `rds.force_ssl=1`. Pass `ssl='require'` to `asyncpg.create_pool` (commit
+  `60c4d68`). The error message is misleading — it says "no pg_hba.conf entry"
+  with "no encryption" tacked on the end, looks like an auth problem first.
+- **ElastiCache TransitEncryptionEnabled requires `ssl=True` on the redis
+  client.** Without it, the handshake silently fails. Plus the corresponding
+  env var (`REDIS_SSL=true`) needs to be in the task definition.
+- **LOS connectors must compute `ssn_hash`.** If they only set `ssn_last4`
+  and leave the hash empty, two such inserts collide on `idx_applicant_ssn`.
+  All connectors now use `_hash_or_empty(ssn)` (commit `ab27bf5`).
 
 ---
 
