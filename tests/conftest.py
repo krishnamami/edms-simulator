@@ -24,6 +24,7 @@ class FakePostgresStore:
     """In-memory stand-in for PostgresStore — for unit tests only."""
 
     def __init__(self):
+        self.applicants: dict = {}
         self.applications: dict = {}
         self.income_profiles: dict = {}
         self.credit_profiles: dict = {}
@@ -31,7 +32,10 @@ class FakePostgresStore:
         self.xrefs: list = []
         self.relationships: list = []
 
-    async def save_golden_record(self, gr): pass
+    async def save_golden_record(self, gr):
+        # Round-trip storage so get_all_applicants / find_by_external_id can
+        # observe records written through the regular pipeline.
+        self.applicants[gr["applicant_id"]] = gr
     async def find_by_applicant_id(self, applicant_id): return None
     async def find_by_ssn_hash(self, ssn_hash): return None
     async def find_by_name_dob(self, last_name, dob): return []
@@ -72,6 +76,9 @@ class FakePostgresStore:
 
     async def get_documents_for_applicant(self, applicant_id):
         return [d for d in self.documents if d["applicant_id"] == applicant_id]
+
+    async def get_all_applicants(self):
+        return list(self.applicants.values())
 
     # graph methods
     async def save_relationship(self, rel):

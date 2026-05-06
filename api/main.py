@@ -38,6 +38,22 @@ async def lifespan(app: FastAPI):
     app.state.postgres_store = PostgresStore()
     app.state.s3_client = S3Client()
     app.state.xref_store = XRefStore()
+
+    # Hydrate the in-memory XRefStore from Postgres so that applicant_id
+    # sequence + SSN / source-id lookups survive across restarts. Without
+    # this, the first POST /loans after a redeploy collides on
+    # APL-00001-P and silently overwrites an existing applicant via
+    # save_golden_record's ON CONFLICT DO UPDATE.
+    try:
+        loaded, max_seq = await app.state.xref_store.hydrate_from_postgres(
+            app.state.postgres_store
+        )
+        logging.info(
+            "xref_store_hydrated", extra={"applicants": loaded, "max_seq": max_seq}
+        )
+    except Exception as e:
+        logging.warning("xref_store_hydration_failed: %s", e)
+
     app.state.aggregation_service = AggregationService(
         xref_store=app.state.xref_store,
         golden_record_store=app.state.xref_store,

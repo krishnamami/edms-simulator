@@ -320,6 +320,13 @@ class PostgresStore:
         )
         return [_row_to_dict(r) for r in rows]
 
+    async def get_all_applicants(self) -> list:
+        """Return every applicant row. Used at app startup to hydrate
+        the in-memory XRefStore so applicant_id sequence and SSN /
+        source-system lookups survive across restarts."""
+        rows = await db.fetch("SELECT * FROM applicants")
+        return [_row_to_dict(r) for r in rows]
+
     # ---------------- document knowledge graph -----------------
 
     async def save_relationship(self, rel: dict) -> None:
