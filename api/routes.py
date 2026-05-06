@@ -22,7 +22,15 @@ from core.aggregation.events import (
     ApplicationSubmittedEvent,
     DocumentUploadedEvent,
     EventType,
+    PropertyDocumentUploadedEvent,
 )
+from core.property.extractors import (
+    extract_appraisal_pdf,
+    extract_flood_pdf,
+    extract_hoi_pdf,
+    extract_tax_pdf,
+)
+from core.property.sources import PROPERTY_CONFIDENCE
 from core.graph.navigator import DocumentNavigator
 from core.graph.reconciler import DocumentReconciler
 from core.ingestion._claude_client import ClaudeUnavailable
@@ -729,6 +737,242 @@ async def resolve_external(
         status_code=404,
         detail=f"no record found for {source_system}/{external_id}",
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase B: property layer
+# ---------------------------------------------------------------------------
+
+
+_PROPERTY_EXTRACTORS = {
+    "APPRAISAL_URAR":    extract_appraisal_pdf,
+    "APPRAISAL_UPDATE":  extract_appraisal_pdf,
+    "APPRAISAL_DESK":    extract_appraisal_pdf,
+    "APPRAISAL_FIELD":   extract_appraisal_pdf,
+    "HOI_BINDER":        extract_hoi_pdf,
+    "HOI_DECLARATIONS":  extract_hoi_pdf,
+    "FLOOD_CERT":        extract_flood_pdf,
+    "PROPERTY_TAX_BILL": extract_tax_pdf,
+}
+
+_REQUIRED_PROPERTY_DOC_TYPES = [
+    "APPRAISAL_URAR",
+    "TITLE_COMMITMENT",
+    "HOI_BINDER",
+    "FLOOD_CERT",
+    "PROPERTY_TAX_BILL",
+]
+
+
+@router.post("/properties", dependencies=[Depends(verify_api_key)])
+async def create_property(request: Request, body: dict):
+    """Create a property record for an application.
+
+    Body shape::
+
+        {
+          "application_id": "APP-LOS-001",
+          "address": {
+            "line1": "123 Main St", "line2": null, "city": "...", "state": "CA",
+            "zip_code": "94105"
+          },
+          "property_type": "single_family",
+          "units": 1,
+          "year_built": 2005,
+          "sqft": 2400
+        }
+    """
+    application_id = body.get("application_id")
+    address = body.get("address") or {}
+    property_type = body.get("property_type", "single_family")
+    if not application_id:
+        raise HTTPException(status_code=400, detail="application_id required")
+    if not address.get("line1") or not address.get("city") \
+            or not address.get("state") or not address.get("zip_code"):
+        raise HTTPException(
+            status_code=400,
+            detail="address.line1, address.city, address.state, address.zip_code required",
+        )
+
+    import uuid as _uuid
+    pg = request.app.state.postgres_store
+    property_id = body.get("property_id") or f"PROP-{_uuid.uuid4().hex[:12]}"
+    prop = {
+        "property_id":    property_id,
+        "application_id": application_id,
+        "address_line1":  address["line1"],
+        "address_line2":  address.get("line2"),
+        "city":           address["city"],
+        "state":          address["state"],
+        "zip_code":       address["zip_code"],
+        "property_type":  property_type,
+        "units":          int(body.get("units", 1)),
+        "year_built":     body.get("year_built"),
+        "sqft":           body.get("sqft"),
+        "status":         "pending",
+    }
+    await pg.save_property(prop)
+    try:
+        await pg.update_application_property(application_id, property_id)
+    except Exception as exc:
+        logger.warning("update_application_property_failed", extra={"error": str(exc)})
+    return {"property_id": property_id, "status": "pending"}
+
+
+@router.get(
+    "/property/{property_id}/profile",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_property_profile(request: Request, property_id: str):
+    redis = request.app.state.redis_store
+    pg = request.app.state.postgres_store
+
+    cached = redis.get_property_profile(property_id)
+    if cached:
+        return {"source": "cache", "data": cached}
+
+    profile = await pg.get_property_profile(property_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Property profile not found")
+    redis.set_property_profile(property_id, profile)
+    return {"source": "database", "data": profile}
+
+
+@router.get(
+    "/property/{property_id}/pipeline-state",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_property_pipeline_state(request: Request, property_id: str):
+    pg = request.app.state.postgres_store
+    prop = await pg.get_property(property_id)
+    if not prop:
+        raise HTTPException(status_code=404, detail="Property not found")
+
+    docs = await pg.get_property_docs(property_id)
+    received_types = sorted({d.get("document_type") for d in docs if d.get("document_type")})
+    missing = [t for t in _REQUIRED_PROPERTY_DOC_TYPES if t not in received_types]
+
+    profile = await pg.get_property_profile(property_id)
+    piti_ready = bool(profile and profile.get("piti_components"))
+    ltv_ready = bool(profile and profile.get("appraised_value"))
+
+    return {
+        "property_id":        property_id,
+        "documents_received": received_types,
+        "documents_missing":  missing,
+        "piti_ready":         piti_ready,
+        "ltv_ready":          ltv_ready,
+        "profile":            profile,
+    }
+
+
+@router.post("/ingest/property-doc", dependencies=[Depends(verify_api_key)])
+async def ingest_property_doc(
+    request: Request,
+    file: UploadFile = File(...),
+    property_id: str = Form(...),
+    document_type: str = Form(...),
+):
+    """Upload a property PDF, extract, persist, and trigger reassembly."""
+    body = await file.read()
+
+    pg = request.app.state.postgres_store
+    s3 = request.app.state.s3_client
+    prop = await pg.get_property(property_id)
+    if not prop:
+        raise HTTPException(status_code=404, detail=f"property {property_id} not found")
+    application_id = prop.get("application_id") or ""
+    applicant_id = None
+    if application_id:
+        try:
+            app = await pg.get_application_by_los_id(application_id.replace("APP-", "")) \
+                if application_id.startswith("APP-") else None
+        except Exception:
+            app = None
+        # Also try direct lookup since application_id == APP-{los_id}
+        if not app:
+            try:
+                app = await pg.get_application_by_los_id(application_id)
+            except Exception:
+                app = None
+        if app:
+            applicant_id = app.get("applicant_id")
+
+    extractor = _PROPERTY_EXTRACTORS.get(document_type)
+    if extractor is None:
+        extracted_fields, confidence = ({}, PROPERTY_CONFIDENCE.get(document_type, 0.7))
+    else:
+        try:
+            extracted_fields, conf_from_extractor = extractor(body)
+        except Exception as exc:
+            logger.warning("property_extract_failed", extra={"error": str(exc)})
+            extracted_fields, conf_from_extractor = ({}, 0.0)
+        # Use the document-type's catalog confidence as the floor — the
+        # extractor confidence is the recovery rate, not the source weight.
+        confidence = max(
+            conf_from_extractor,
+            PROPERTY_CONFIDENCE.get(document_type, 0.7),
+        )
+
+    import uuid as _uuid
+    document_id = f"PROPDOC-{_uuid.uuid4().hex[:12]}"
+    s3_key = s3.upload_document(
+        application_id=application_id or "no-app",
+        category="property",
+        document_id=document_id,
+        content=body,
+        extension="pdf",
+        content_type="application/pdf",
+    )
+
+    if applicant_id:
+        try:
+            await pg.save_document({
+                "document_id":      document_id,
+                "applicant_id":     applicant_id,
+                "application_id":   application_id,
+                "document_type":    document_type,
+                "document_category": "property",
+                "borrower_role":    "primary",
+                "s3_key":           s3_key,
+                "status":           "received",
+                "is_current":       True,
+                "extracted_fields": extracted_fields,
+                "confidence_score": confidence,
+            })
+        except Exception as exc:
+            logger.warning("property_save_document_failed", extra={"error": str(exc)})
+
+    service = request.app.state.aggregation_service
+    new_doc_payload = {
+        "document_id":      document_id,
+        "document_type":    document_type,
+        "document_category": "property",
+        "extracted_fields": extracted_fields,
+        "confidence_score": confidence,
+    }
+    docs = await pg.get_property_docs(property_id) or []
+    if not any(d.get("document_id") == document_id for d in docs):
+        docs.append(new_doc_payload)
+
+    event = PropertyDocumentUploadedEvent(
+        payload={
+            "property_id":    property_id,
+            "application_id": application_id,
+            "property_docs":  docs,
+        }
+    )
+    result = await service.handle(event)
+    return {
+        "property_id":    property_id,
+        "document_id":    document_id,
+        "document_type":  document_type,
+        "s3_key":         s3_key,
+        "confidence":     confidence,
+        "extracted":      extracted_fields,
+        "piti_total":     result.get("piti_total"),
+        "profile":        result.get("profile"),
+    }
 
 
 @router.get("/mismo/doc-types", dependencies=[Depends(verify_api_key)])

@@ -14,6 +14,7 @@ class EventType(str, Enum):
     PROFILE_UPDATED = "profile_updated"
     AGGREGATION_FAILED = "aggregation_failed"
     CONFLICT_FLAGGED = "conflict_flagged"
+    PROPERTY_DOCUMENT_UPLOADED = "property_document_uploaded"
 
 
 class BaseEvent(BaseModel):
@@ -34,3 +35,7 @@ class DocumentUploadedEvent(BaseEvent):
 
 class IdentityResolvedEvent(BaseEvent):
     event_type: EventType = EventType.IDENTITY_RESOLVED
+
+
+class PropertyDocumentUploadedEvent(BaseEvent):
+    event_type: EventType = EventType.PROPERTY_DOCUMENT_UPLOADED

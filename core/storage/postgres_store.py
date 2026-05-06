@@ -50,6 +50,7 @@ def _row_to_dict(row) -> Optional[dict]:
             "extracted_fields",
             "source_value",
             "target_value",
+            "piti_components",
         ):
             try:
                 out[k] = json.loads(v)
@@ -428,6 +429,176 @@ class PostgresStore:
             external_loan_id,
         )
         return _row_to_dict(row)
+
+    # ---------------- properties (Phase B) -----------------
+
+    async def save_property(self, prop: dict) -> str:
+        """Insert or update a property row. Returns the property_id."""
+        await db.execute(
+            """
+            INSERT INTO properties (
+                property_id, application_id, address_line1, address_line2,
+                city, state, zip_code, property_type, units, year_built,
+                sqft, status, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, NOW(), NOW()
+            )
+            ON CONFLICT (property_id) DO UPDATE SET
+                application_id = EXCLUDED.application_id,
+                address_line1  = EXCLUDED.address_line1,
+                address_line2  = EXCLUDED.address_line2,
+                city           = EXCLUDED.city,
+                state          = EXCLUDED.state,
+                zip_code       = EXCLUDED.zip_code,
+                property_type  = EXCLUDED.property_type,
+                units          = EXCLUDED.units,
+                year_built     = EXCLUDED.year_built,
+                sqft           = EXCLUDED.sqft,
+                status         = EXCLUDED.status,
+                updated_at     = NOW()
+            """,
+            prop["property_id"],
+            prop.get("application_id"),
+            prop["address_line1"],
+            prop.get("address_line2"),
+            prop["city"],
+            prop["state"],
+            prop["zip_code"],
+            prop["property_type"],
+            int(prop.get("units", 1)),
+            prop.get("year_built"),
+            prop.get("sqft"),
+            prop.get("status", "pending"),
+        )
+        return prop["property_id"]
+
+    async def get_property(self, property_id: str) -> Optional[dict]:
+        row = await db.fetchrow(
+            "SELECT * FROM properties WHERE property_id = $1", property_id
+        )
+        return _row_to_dict(row)
+
+    async def get_property_by_application(
+        self, application_id: str
+    ) -> Optional[dict]:
+        row = await db.fetchrow(
+            """
+            SELECT * FROM properties WHERE application_id = $1
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            application_id,
+        )
+        return _row_to_dict(row)
+
+    async def save_property_profile(self, profile: dict) -> str:
+        """Insert a new property profile version, marking the prior current
+        version superseded."""
+        property_id = profile["property_id"]
+        current = await db.fetchrow(
+            """
+            SELECT profile_id, version
+            FROM property_profiles
+            WHERE property_id = $1 AND superseded_by IS NULL
+            """,
+            property_id,
+        )
+        version = (current["version"] + 1) if current else 1
+
+        new_id = await db.fetchval(
+            """
+            INSERT INTO property_profiles (
+                property_id, application_id, appraised_value, appraisal_date,
+                appraisal_type, appraisal_confidence, estimated_value,
+                tax_assessed_value, annual_taxes, monthly_taxes,
+                hoi_annual, hoi_monthly, flood_zone, flood_insurance_required,
+                flood_insurance_monthly, hoa_monthly, condition_rating,
+                piti_components, profile_data, lineage_hash, version,
+                assembled_at
+            ) VALUES (
+                $1, $2, $3, $4::date, $5, $6, $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16, $17, $18::jsonb, $19::jsonb, $20, $21,
+                $22::timestamptz
+            )
+            RETURNING profile_id
+            """,
+            property_id,
+            profile.get("application_id"),
+            profile.get("appraised_value"),
+            _to_date(profile.get("appraisal_date")),
+            profile.get("appraisal_type"),
+            profile.get("appraisal_confidence"),
+            profile.get("estimated_value"),
+            profile.get("tax_assessed_value"),
+            profile.get("annual_taxes"),
+            profile.get("monthly_taxes"),
+            profile.get("hoi_annual"),
+            profile.get("hoi_monthly"),
+            profile.get("flood_zone"),
+            bool(profile.get("flood_insurance_required", False)),
+            profile.get("flood_insurance_monthly"),
+            profile.get("hoa_monthly", 0),
+            profile.get("condition_rating"),
+            _to_jsonb(profile.get("piti_components")),
+            _to_jsonb(profile),
+            profile.get("lineage_hash", ""),
+            version,
+            _to_ts(profile.get("assembled_at")) or datetime.utcnow(),
+        )
+        if current:
+            await db.execute(
+                "UPDATE property_profiles SET superseded_by = $1 WHERE profile_id = $2",
+                new_id,
+                current["profile_id"],
+            )
+        return str(new_id)
+
+    async def get_property_profile(self, property_id: str) -> Optional[dict]:
+        row = await db.fetchrow(
+            """
+            SELECT profile_data, lineage_hash, version, assembled_at
+            FROM property_profiles
+            WHERE property_id = $1 AND superseded_by IS NULL
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            property_id,
+        )
+        if not row:
+            return None
+        data = row["profile_data"]
+        if isinstance(data, str):
+            data = json.loads(data)
+        data["_version"] = row["version"]
+        return data
+
+    async def get_property_docs(self, property_id: str) -> list:
+        """Property documents are tagged via document_index.application_id ->
+        properties.application_id. Resolve via the join."""
+        rows = await db.fetch(
+            """
+            SELECT di.* FROM document_index di
+            JOIN properties p ON di.application_id = p.application_id
+            WHERE p.property_id = $1
+              AND di.is_current = TRUE
+              AND di.document_category = 'property'
+            ORDER BY di.received_at DESC
+            """,
+            property_id,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def update_application_property(
+        self, application_id: str, property_id: str
+    ) -> None:
+        await db.execute(
+            """
+            UPDATE applications
+               SET property_id = $1
+             WHERE application_id = $2
+            """,
+            property_id,
+            application_id,
+        )
 
     async def update_application_loan_fields(
         self, application_id: str, loan_data: dict

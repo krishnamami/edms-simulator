@@ -252,3 +252,74 @@ CREATE INDEX IF NOT EXISTS idx_raw_channel
 CREATE INDEX IF NOT EXISTS idx_raw_application
     ON raw_ingestion(application_id);
 
+-- =====================================================================
+-- Phase B: property layer. Adds the collateral side of the loan —
+-- properties + property_profiles. Property docs (appraisal, HOI, flood,
+-- tax bill, HOA cert, ...) extract into the profile, which is what the
+-- DTI / LTV calculations consume downstream.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS properties (
+    property_id       VARCHAR PRIMARY KEY,
+    application_id    VARCHAR REFERENCES applications(application_id),
+    address_line1     VARCHAR NOT NULL,
+    address_line2     VARCHAR,
+    city              VARCHAR NOT NULL,
+    state             VARCHAR(2) NOT NULL,
+    zip_code          VARCHAR(10) NOT NULL,
+    property_type     VARCHAR NOT NULL
+                      CHECK (property_type IN (
+                        'single_family','condo','townhouse',
+                        'multi_family_2','multi_family_3',
+                        'multi_family_4','manufactured','co_op'
+                      )),
+    units             INT NOT NULL DEFAULT 1,
+    year_built        INT,
+    sqft              INT,
+    status            VARCHAR NOT NULL DEFAULT 'pending'
+                      CHECK (status IN (
+                        'pending',
+                        'active',
+                        'conflict',
+                        'complete'
+                      )),
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_property_application
+    ON properties(application_id);
+
+CREATE TABLE IF NOT EXISTS property_profiles (
+    profile_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    property_id         VARCHAR NOT NULL REFERENCES properties(property_id),
+    application_id      VARCHAR REFERENCES applications(application_id),
+    appraised_value     NUMERIC,
+    appraisal_date      DATE,
+    appraisal_type      VARCHAR,
+    appraisal_confidence FLOAT,
+    estimated_value     NUMERIC,
+    tax_assessed_value  NUMERIC,
+    annual_taxes        NUMERIC,
+    monthly_taxes       NUMERIC,
+    hoi_annual          NUMERIC,
+    hoi_monthly         NUMERIC,
+    flood_zone          VARCHAR,
+    flood_insurance_required BOOLEAN DEFAULT FALSE,
+    flood_insurance_monthly  NUMERIC,
+    hoa_monthly         NUMERIC DEFAULT 0,
+    condition_rating    VARCHAR,
+    piti_components     JSONB,
+    profile_data        JSONB NOT NULL,
+    lineage_hash        VARCHAR,
+    version             INT NOT NULL DEFAULT 1,
+    superseded_by       UUID REFERENCES property_profiles(profile_id),
+    assembled_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_prop_profile_property
+    ON property_profiles(property_id)
+    WHERE superseded_by IS NULL;
+
+ALTER TABLE applications
+    ADD COLUMN IF NOT EXISTS property_id VARCHAR
+    REFERENCES properties(property_id);
+

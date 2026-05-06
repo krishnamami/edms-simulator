@@ -31,6 +31,8 @@ class FakePostgresStore:
         self.documents: list = []
         self.xrefs: list = []
         self.relationships: list = []
+        self.properties: dict = {}
+        self.property_profiles: dict = {}
 
     async def save_golden_record(self, gr):
         # Round-trip storage so get_all_applicants / find_by_external_id can
@@ -141,6 +143,46 @@ class FakePostgresStore:
         ):
             if loan_data.get(k) is not None:
                 app[k] = loan_data[k]
+
+    # property layer
+    async def save_property(self, prop):
+        self.properties[prop["property_id"]] = dict(prop)
+        return prop["property_id"]
+
+    async def get_property(self, property_id):
+        return self.properties.get(property_id)
+
+    async def get_property_by_application(self, application_id):
+        for p in self.properties.values():
+            if p.get("application_id") == application_id:
+                return p
+        return None
+
+    async def save_property_profile(self, profile):
+        property_id = profile["property_id"]
+        prior = self.property_profiles.get(property_id)
+        version = (prior.get("_version", 0) + 1) if prior else 1
+        self.property_profiles[property_id] = {**profile, "_version": version}
+        return f"profile-{property_id}-{version}"
+
+    async def get_property_profile(self, property_id):
+        return self.property_profiles.get(property_id)
+
+    async def get_property_docs(self, property_id):
+        prop = self.properties.get(property_id)
+        if not prop:
+            return []
+        application_id = prop.get("application_id")
+        return [
+            d for d in self.documents
+            if d.get("application_id") == application_id
+            and d.get("document_category") == "property"
+        ]
+
+    async def update_application_property(self, application_id, property_id):
+        app = self.applications.get(application_id)
+        if app is not None:
+            app["property_id"] = property_id
 
 
 @pytest.fixture

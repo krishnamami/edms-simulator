@@ -18,6 +18,7 @@ from core.aggregation.events import (
 from core.aggregation.status import GoldenRecordStatus, StatusMachine
 from core.identity.resolver import IdentityResolver, IdentitySignals
 from core.ingestion.events import ChannelType, NormalizedIngestEvent
+from core.property.assembler import PropertyAssembler
 
 logger = structlog.get_logger()
 
@@ -38,6 +39,7 @@ class AggregationService:
         self.resolver = IdentityResolver(xref_store, golden_record_store)
         self.income_assembler = income_assembler
         self.credit_assembler = credit_assembler
+        self.property_assembler = PropertyAssembler()
         self.redis_store = redis_store
         self.postgres_store = postgres_store
         self.event_bus = event_bus
@@ -51,6 +53,7 @@ class AggregationService:
             EventType.APPLICATION_SUBMITTED: self._handle_application_submitted,
             EventType.DOCUMENT_UPLOADED: self._handle_document_uploaded,
             EventType.IDENTITY_RESOLVED: self._handle_identity_resolved,
+            EventType.PROPERTY_DOCUMENT_UPLOADED: self._handle_property_document_uploaded,
         }
         handler = handlers.get(event.event_type)
         if not handler:
@@ -351,6 +354,79 @@ class AggregationService:
                     conflicts=[r.reasoning for r in conflicts],
                 )
                 self.redis_store.invalidate_income_profile(doc_applicant)
+
+    async def _handle_property_document_uploaded(self, event) -> dict:
+        """Re-assemble a PropertyProfile after a new property doc lands.
+
+        Loads every property doc for the given property_id, runs
+        PropertyAssembler, persists the new versioned profile, and warms
+        ``property:{id}`` while invalidating ``context:{application_id}``.
+        """
+        p = event.payload
+        property_id = p["property_id"]
+        log = logger.bind(property_id=property_id, handler="property_doc_uploaded")
+
+        prop = await self.postgres_store.get_property(property_id)
+        if not prop:
+            raise ValueError(f"No property for: {property_id}")
+        application_id = prop.get("application_id") or p.get("application_id") or ""
+
+        property_docs = p.get("property_docs")
+        if property_docs is None:
+            property_docs = await self.postgres_store.get_property_docs(
+                property_id
+            )
+
+        loan_data = p.get("loan_data") or {}
+        if application_id and not loan_data:
+            try:
+                app = await self.postgres_store.get_application_by_los_id(
+                    application_id
+                )
+            except Exception:
+                app = None
+            if app:
+                loan_data = {
+                    "loan_amount":      app.get("loan_amount"),
+                    "interest_rate":    app.get("interest_rate"),
+                    "loan_term_months": app.get("loan_term_months"),
+                }
+
+        profile = self.property_assembler.assemble(
+            property_docs=property_docs or [],
+            loan_data=loan_data,
+            property_id=property_id,
+            application_id=application_id,
+        )
+        profile_dict = profile.model_dump()
+
+        await self.postgres_store.save_property_profile(profile_dict)
+        self.redis_store.set_property_profile(property_id, profile_dict)
+        if application_id:
+            self.redis_store.invalidate_application_context(application_id)
+
+        piti_total = (profile.piti_components.total_piti
+                      if profile.piti_components else None)
+        self._publish(
+            {
+                "event_type": EventType.PROFILE_UPDATED,
+                "property_id": property_id,
+                "application_id": application_id,
+                "trigger": "property_document_uploaded",
+                "piti_total": piti_total,
+            }
+        )
+        log.info(
+            "property_profile_updated",
+            property_id=property_id,
+            piti_total=piti_total,
+        )
+        return {
+            "property_id":    property_id,
+            "application_id": application_id,
+            "profile":        profile_dict,
+            "piti_total":     piti_total,
+        }
 
     def _publish(self, event_data: dict):
         # Convert enum to value for JSON-friendliness in tests/event sinks.

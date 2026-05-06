@@ -58,6 +58,7 @@ class RedisStore:
     TTL_GOLDEN_STATUS = 86400    # 24 hours
     TTL_APP_LOOKUP = 43200       # 12 hours
     TTL_GRAPH_SUMMARY = 3600     # 1 hour
+    TTL_PROPERTY_PROFILE = 14400  # 4 hours
 
     def __init__(self, client=None):
         self._r = client or get_redis()
@@ -172,3 +173,45 @@ class RedisStore:
             return json.loads(raw) if raw else None
         except Exception:
             return None
+
+    # ---------------- property profiles (Phase B) -----------------
+
+    def set_property_profile(
+        self, property_id: str, profile: dict, ttl: Optional[int] = None
+    ) -> bool:
+        try:
+            self._r.setex(
+                f"property:{property_id}",
+                ttl or self.TTL_PROPERTY_PROFILE,
+                json.dumps(profile, default=str),
+            )
+            return True
+        except Exception as e:
+            logger.warning("redis_set_property_failed", extra={"error": str(e)})
+            return False
+
+    def get_property_profile(self, property_id: str) -> Optional[dict]:
+        try:
+            raw = self._r.get(f"property:{property_id}")
+            return json.loads(raw) if raw else None
+        except Exception as e:
+            logger.warning("redis_get_property_failed", extra={"error": str(e)})
+            return None
+
+    def invalidate_property_profile(self, property_id: str) -> None:
+        try:
+            self._r.delete(f"property:{property_id}")
+        except Exception as e:
+            logger.warning(
+                "redis_invalidate_property_failed", extra={"error": str(e)}
+            )
+
+    def invalidate_application_context(self, application_id: str) -> None:
+        """Drop the cached application context so the next read recomputes
+        with the freshly-assembled property profile."""
+        try:
+            self._r.delete(f"context:{application_id}")
+        except Exception as e:
+            logger.warning(
+                "redis_invalidate_context_failed", extra={"error": str(e)}
+            )
