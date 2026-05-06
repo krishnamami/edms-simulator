@@ -31,17 +31,24 @@ def _create_client():
     secrets = get_secrets()
     creds = secrets.get_secret("edms/redis/endpoint")
     import redis
+    # ElastiCache TransitEncryptionEnabled requires ssl=True on the client.
+    # Trigger TLS on either an explicit REDIS_SSL=true (test/local override)
+    # or ENVIRONMENT=production (default in the ECS task definition).
+    use_ssl = (
+        os.getenv("REDIS_SSL", "false").lower() == "true"
+        or os.getenv("ENVIRONMENT", "local") == "production"
+    )
     client = redis.Redis(
         host=creds["host"],
         port=creds["port"],
         password=creds.get("password") or None,
         decode_responses=True,
-        ssl=os.getenv("REDIS_SSL", "false").lower() == "true",
+        ssl=use_ssl,
         socket_connect_timeout=5,
         socket_timeout=5,
         retry_on_timeout=True,
     )
-    logger.info("redis_connected", extra={"host": creds["host"]})
+    logger.info("redis_connected", extra={"host": creds["host"], "ssl": use_ssl})
     return client
 
 
