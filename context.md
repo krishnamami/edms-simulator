@@ -36,17 +36,31 @@ Redis port is **6380**.
 
 ## Repo state at end of last session
 
-- Branch: `main`, all committed and pushed to `https://github.com/krishnamami/edms-simulator`
-- Tests: **165 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`)
-- `simulate_local.py` runs end-to-end with exit 0 on a clean DB
-- **Production ECS service is live + DB-backed** at `http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com`. `/health` 200, `/docs` 200, **DB-touching endpoints (`/applicant/{id}/graph/summary`) return 200 with `source: "database"`**.
-- **MISMO + LOS endpoints live in prod**: `/loans/from-los`, `/ingest/los`, `/resolve/external/...`, `/mismo/doc-types` all verified end-to-end.
-- **XRefStore hydrates from Postgres at startup** so `applicant_id` sequence + SSN / source-id lookups survive across redeploys (Phase 0.5).
-- **Raw storage layer live in prod (Phase A)**. Every inbound `/ingest/*` payload is persisted to S3 + `raw_ingestion` BEFORE extraction. `POST /ingest/{ingest_id}/reprocess` re-runs extraction from the stored bytes. Verified end-to-end via `scripts/watch_pipeline.py --live`.
+- Branch: `main`, all committed (push pending). Origin: `https://github.com/krishnamami/edms-simulator`.
+- Tests: **245 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`).
+- `simulate_local.py` still runs end-to-end with exit 0; new `scripts/watch_pipeline.py --full` drives the complete mortgage scenario (borrower + property + AUS + context). New `scripts/simulate_s3_edms.py` exercises the incremental indexer.
+- **Production ECS service** still live + DB-backed at `http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com`. The Phases B → indexing changes have **not been deployed to prod yet** — only Phase 0/0.5/A are running there. Local docker-compose has every phase applied.
+- The pipeline now has three full layers in code:
+  1. **Borrower** — universal ingestion + raw storage + identity + income/credit assembly + document graph
+  2. **Property** — properties / property_profiles + URAR / HOI / flood / tax / title generators + extractors + PITI math
+  3. **Vendor** — DU / LP / Socure / TWN / SSA / OFAC adapters lands as `document_category='vendor'`
+- **One-call read shape** — Decision OS hits `GET /application/{id}/context` and gets borrower + co-borrower + property + vendor_checks + DTI/LTV/LTV-ready flags + missing_items + graph summary, all assembled lazily and cached under `context:{application_id}` (TTL 30m). Layer changes invalidate the cache so the next read re-assembles.
+- **Webhooks** — Decision OS subscribes via `POST /webhooks` with optional HMAC secret; every assembly fans out a `context_updated` event. Failed deliveries persist with status + error and increment `webhooks.failure_count`.
+- **Persona slices** — `/context/{income|credit|property|compliance|fraud}` for the 6 Decision OS personas (each gets only its slice, not the whole context).
+- **Audit trail** — every assembly snapshots into `context_versions`; `GET /application/{id}/context/at/{ts}` does point-in-time replay.
+- **Observability** — public `GET /dashboard` (HTML, auto-refresh 15s), auth-gated `GET /application/{id}/pipeline-state` (per-borrower docs, raw_ingestion counts, Redis TTLs, graph, vendor checks, readiness, pipeline_complete bool), `GET /application/{id}/timeline` (raw_ingestion + graph edges + context_versions sorted ascending).
+- **Incremental indexer** — watermark-driven S3 → document_index → re-assemble. `WatermarkStore` + `S3Scanner` + `BatchIndexer`. Background `AsyncIOScheduler` runs every 15 min when `ENABLE_SCHEDULER=true`. Endpoints: `/indexing/status`, `POST /indexing/run`, `/indexing/runs[/{id}]`, `PUT /indexing/watermark`.
 
 Latest commits (top of `main`):
 
 ```
+15b5c46  feat(indexing): incremental batch indexer with watermark
+5ba24a6  feat(observability): Phase F — dashboard, pipeline-state, timeline, watch_pipeline
+fc03352  feat(context): Phase E — persona slices, webhooks, context versioning
+22eb278  feat(vendors): Phase D — AUS, fraud, VOE, SSN, OFAC vendor adapters
+42e3a28  feat(context): Phase C — application context assembly + single endpoint
+1046058  feat(property): Phase B — property layer ingestion + assembly
+123f5c5  docs: refresh context.md with Phase A — raw storage layer
 ab4b547  fix(ops): apply_schema.py strips comments before splitting on ';'
 00a7d26  feat(raw): Phase A — raw storage layer before extraction
 2990e98  docs: refresh context.md after Phase 0 + 0.5 prod bootstrap
@@ -56,27 +70,9 @@ c5b142a  feat(mismo): Phase 0 — MISMO compatibility + LOS connectors + externa
 920a15e  fix: extract decision_os_api_key field from secret instead of injecting whole JSON
 2d7d548  fix: enable SSL for ElastiCache Redis in production
 60c4d68  fix(db): enable SSL on the asyncpg pool when USE_AWS_SECRETS=true
-8c8cc5b  chore(ops): scripts/apply_schema.py — one-off RDS schema bootstrap
-a359ce6  chore: track IAM bootstrap policies + gitignore .logs/
-cac3b77  docs: update context.md with AWS production bootstrap notes
-fbd03d5  fix: enable public IP for ECS tasks in default VPC subnets
-1a1002a  infra(ecs): take TaskRole ARN as a parameter, drop inline role
-6a66536  ci: add workflow_dispatch trigger to both workflows
-e41d244  ci(deploy): substitute ACCOUNT_ID in task_definition.json before render
-95c60ce  ci(deploy): self-heal missing ECR repo before push
-dc9d18b  ci: bump Python 3.10 -> 3.12 to match pinned requirements
-4137095  fix: pin exact package versions to prevent pip backtracking in Docker
-ead0fd3  config: production AWS endpoints + full secret ARNs
-43f459d  chore: rename aurora.yaml -> rds-postgres.yaml
-1eb884d  fix: replace Aurora with simple RDS Postgres for initial deploy
-19567d2  fix: aurora engine version 15.4 -> 15.8
-ef0d6fa  docs: add context.md (session-resume notes) + docs/PRD.md
-e1fa6b6  feat(ingestion): Phase E — resilience for upstream Claude failures
-bff35cc  feat(simulator): Phase D — 7-step walkthrough exercising all channels
-0d0b985  feat(ingestion): Phase C — chat, image, email, pdf, form, csv, xml adapters
-08ee2e9  feat(documents): Phase B — generators + pymupdf extractor (no Claude)
-75e3a46  feat(ingestion): Phase A — universal ingestion plumbing + persistence fixes
 ```
+
+(Earlier history — CFN bootstrap, Aurora→RDS pivot, CI fixes, original ingestion phases — preserved in `git log` from `123f5c5` back.)
 
 ---
 
@@ -93,6 +89,12 @@ bff35cc  feat(simulator): Phase D — 7-step walkthrough exercising all channels
 | **0**  | `c5b142a` | MISMO 3.4 compatibility + LOS connectors + external IDs. `core/ingestion/{mismo,los_connector}.py` with 55 MISMO + 20 Encompass mappings, `EncompassConnector` + `GenericMISMOConnector`. Schema adds `applicants.external_ids JSONB`, `applications.external_loan_id` + URLA / HMDA / loan-terms columns, `mismo_doc_type_registry` + `los_connectors` tables. New endpoints: `/ingest/los`, `/loans/from-los`, `/resolve/external/{system}/{id}`, `/mismo/doc-types`. 13 new tests. |
 | **0.5** | `047aa6d`, `ab27bf5` | Production data-integrity fixes triggered by Phase 0 prod test. (1) `XRefStore.hydrate_from_postgres()` called from `api/main.py` lifespan so applicant-id sequence + SSN lookups survive across restarts (was silently overwriting via `ON CONFLICT DO UPDATE`). (2) LOS connectors must populate `ssn_hash` from the full SSN — empty strings collide on `idx_applicant_ssn`. 7 new tests. |
 | **A** (raw) | `00a7d26`, `ab4b547` | Raw storage layer. Every inbound `/ingest/*` payload is now persisted to S3 (`raw/{channel}/{applicant?}/{date}/{uuid}.{ext}`) and tracked in a new `raw_ingestion` table BEFORE extraction. New `IngestionPipeline` (`core/ingestion/pipeline.py`) wraps the existing `IngestRouter` so the 7 channel endpoints all flow through `received → extracting → indexed` (or `failed`). `RawIngestionStore` exposes status transitions; new endpoints `GET /applicant/{id}/raw-ingestion`, `GET /ingest/{id}/raw`, `POST /ingest/{id}/reprocess`, `GET /pipeline/failed`. Reprocess re-reads the original bytes from S3. New `scripts/watch_pipeline.py` walks all storage layers (`--live` for prod). FK constraints on `raw_ingestion.applicant_id` / `application_id` deliberately omitted — raw arrives before parents may exist. 5 new tests. Followup `ab4b547` hardened `apply_schema.py` to strip `--` line comments before splitting on `;` after a `;` inside a comment broke the first prod schema apply. |
+| **B** (property) | `1046058` | **Property layer.** Schema adds `properties` + versioned `property_profiles` + `applications.property_id` FK. `core/property/{sources,rules,assembler,extractors}.py` — PropertyDocType enum, PROPERTY_CONFIDENCE ranking, PITIComponents math (`calculate_piti`), per-doc extractors (`extract_appraisal/hoi/flood/tax/hoa`), assembler that works with partial data + lineage hash + `requires_review` on C5/C6 condition or flood-zone insurance. 5 reportlab generators (`appraisal_generator` URAR, `title_generator`, `hoi_generator`, `flood_cert_generator`, `tax_bill_generator`) — all return `(pdf_bytes, metadata)`. pymupdf `core/property/extractors.py` mirrors the borrower extractor pattern. PostgresStore: `save_property`/`get_property`/`save_property_profile`/`get_property_docs`/`update_application_property`. Redis: `TTL_PROPERTY_PROFILE` + `set/get/invalidate_property_profile`. AggregationService gains a `PROPERTY_DOCUMENT_UPLOADED` handler that fans through PropertyAssembler, persists, warms `property:{id}`, and invalidates `context:{application_id}`. 4 endpoints: `POST /properties`, `GET /property/{id}/profile`, `GET /property/{id}/pipeline-state`, `POST /ingest/property-doc`. 23 new tests. |
+| **C** (context) | `42e3a28` | **One-call ApplicationContext.** New `core/context/{models,assembler}.py`. ContextAssembler folds borrower (income+credit+identity), property (PITI+LTV), and vendor layers into a single ApplicationContext. Co-borrower income resolves correctly off the primary's nested `co_borrower` section. Front-/back-end DTI + LTV computed inline; readiness flags (`income_verified`, `credit_pulled`, `appraisal_complete`, `insurance_bound`, `flood_cert_received`, `dti_calculable`, `ltv_calculable`, `aus_ready`) drive `missing_items`. Cached under `context:{application_id}` (TTL 30m); the service invalidates after every income or property re-assembly so the next read recomputes. 4 endpoints: `GET /application/{id}/context`, `/readiness`, `POST /refresh-context`, `GET /dti`. PostgresStore gains `get_application` / `get_application_by_applicant` / `update_application_loan_data`. 11 new tests. |
+| **D** (vendors) | `22eb278` | **Vendor return adapters.** 5 class-based adapters in `core/ingestion/adapters/`: `VendorAUSAdapter` (Fannie DU + Freddie LP XML, namespace-tolerant), `VendorFraudAdapter` (Socure + LexisNexis JSON, `requires_review` on `medium_risk`/`high_risk`), `VendorVOEAdapter` (TWN status="A" + Equifax "Yes"), `VendorSSNAdapter` + `VendorOFACAdapter`. `vendor_synthetic.py` generators for the demo path. ContextAssembler.`_get_vendor_checks` now reads `document_category='vendor'` rows from `document_index` and surfaces a flat summary (`aus_findings`, `fraud_score`, `fraud_band`, `fraud_requires_review`, `flood_determination`, `employment_verified`, `ssn_valid`, `ofac_clear`). Readiness rewired: `aus_ready` requires real DU/LP `approved=True`; `identity_verified` driven by SSN; `missing_items` adds `ofac_review_required`/`fraud_review_required` when those checks fail. 3 endpoints: `POST /ingest/vendor-return`, `GET /application/{id}/vendor-checks`, `POST /run-vendor-checks` (synthetic). 15 new tests. |
+| **E** (persona slices + webhooks) | `fc03352` | **Persona slices, webhooks, context versioning.** 5 slice models (`IncomeSlice`, `CreditSlice`, `PropertySlice`, `ComplianceSlice`, `FraudSlice`) — each Decision OS persona reads exactly its slice. Schema adds `webhooks` + `webhook_deliveries` + `context_versions`. `core/context/webhook_publisher.py` POSTs to subscribers with optional `X-EDMS-Signature: sha256=...` HMAC, persists every delivery attempt, increments `failure_count` on errors; never raises. ContextAssembler now snapshots every assembly into `context_versions` and fans out a `context_updated` event. New endpoints: 5 slices (`/context/{income\|credit\|property\|compliance\|fraud}`), 4 webhooks (POST/GET/DELETE/deliveries), 2 history (`/history`, `/at/{timestamp}`), 1 catalog (`GET /missing-documents` — borrower/property/vendor missing + structured checklist; treats `AUS_LP_FINDINGS` as satisfying the AUS slot). 12 new tests. |
+| **F** (observability) | `5ba24a6` | **Pipeline observability.** Public `GET /dashboard` — self-refreshing HTML with traffic-light coding (income/credit/appraisal/AUS/DTI/LTV/conflicts) + stat tiles. Auth-gated `GET /application/{id}/pipeline-state` — per-borrower docs + raw_ingestion counts + Redis TTLs (`income`/`credit`/`status`), property rollup, graph edges, vendor checks, context block (present + ttl_seconds + DTIs + LTV + requires_review), readiness, `pipeline_complete`. `GET /application/{id}/timeline` merges `application_submitted` + raw_ingestion `document_received`/`extraction_complete` + graph edges + context_versions, sorted ascending. PostgresStore: `get_all_applications`, `get_raw_ingestion_for_application` (JOINs against applications so docs that arrived under the applicant_id but pre-date the application_id are still picked up). RedisStore: `key_state(key)` → `{present, ttl_seconds}` (TTL `-2`→missing, `-1`→no expiry). `scripts/watch_pipeline.py` rewritten with 4 modes: default (single-W2), `--full` (POST /loans → W2 → property → all property docs → run-vendor-checks → final context + pipeline-state + timeline), `--application <id>`, `--upload <pdf> --type <DOCTYPE>`. Tracks failures via global `_FAIL_COUNT`; exit 1 if any `[FAIL]`. 6 new tests. |
+| **indexer** | `15b5c46` | **Incremental batch indexer.** Schema: `indexing_watermarks` (per source, status idle/running/complete/failed) + `indexing_runs` (per-run audit with watermark_from/to + JSONB error_details) + `idx_indexing_runs_source`. `s3` row seeded at epoch. `core/indexing/{watermark,s3_scanner,batch_indexer}.py`. WatermarkStore wraps PostgresStore for testability. S3Scanner walks `loans/{los_id}/{category}/{filename}`, filters strictly `LastModified > since`, supports both boto3 and local_storage modes. BatchIndexer.run() scans → groups by LOS → looks up application → `s3.get_raw` → routes to W2/paystub/bank/credit/appraisal/HOI/flood/tax extractor → upserts into `document_index` → re-assembles only the layers that changed (income/credit/asset → `agg._run_assembly`; property → `redis.invalidate_property_profile`) → invalidates `context:{application_id}` → advances watermark. Unknown LOS counted as `skipped`, not `error`. MISMOMapper gains `detect_type_from_filename(filename, category)` for path-anchored type detection with category fallback. PostgresStore: `get_watermark`, `upsert_watermark_status/_complete`, `set_watermark_timestamp`, `create/complete_indexing_run`, `get_indexing_runs[_{id}]`. 5 endpoints: `GET /indexing/status`, `POST /indexing/run` (`{source, dry_run}`), `GET /indexing/runs[?source=&limit=]`, `GET /indexing/runs/{id}`, `PUT /indexing/watermark` (`{source, timestamp}` — admin re-index from a point). `AsyncIOScheduler` background job (15-min default) when `ENABLE_SCHEDULER=true` (off by default). `scripts/simulate_s3_edms.py` drops files into local_storage and verifies skip-unchanged semantics; `--dry-run` and `--watch` flags. FakePostgresStore.save_document now upserts on `document_id` to mirror production's `ON CONFLICT DO UPDATE`. 13 new tests. |
 
 ---
 
@@ -193,6 +195,59 @@ Both workflows also accept `workflow_dispatch` for manual reruns from the Action
 
 ---
 
+## Endpoint surface (post-indexer)
+
+Auth: every endpoint except `/health`, `/ready`, and `/dashboard` requires `X-API-Key`. Local key is `edms_dev_key` (override via `EDMS_API_KEY`).
+
+| Surface | Endpoint | Notes |
+|---|---|---|
+| **Loan / borrower** | `POST /loans` | original ApplicationSubmittedEvent |
+| | `POST /loans/document`, `POST /documents/upload` | aliases |
+| | `GET /loan/{los_id}/applicant-id` | reverse lookup |
+| | `GET /applicant/{id}/income-profile` | Redis → PG fallback |
+| | `GET /applicant/{id}/credit-profile` | |
+| **Universal ingestion** | `POST /ingest/{pdf,image,email,chat,form,csv,xml}` | Phase C |
+| | `GET /applicant/{id}/raw-ingestion` | per-applicant pipeline state |
+| | `GET /ingest/{ingest_id}/raw` | one row |
+| | `POST /ingest/{ingest_id}/reprocess` | re-extract from S3 bytes |
+| | `GET /pipeline/failed?limit=` | system-wide failures |
+| **MISMO / LOS** | `POST /loans/from-los`, `POST /ingest/los` | Phase 0 universal LOS |
+| | `GET /resolve/external/{system}/{id}` | reverse lookup |
+| | `GET /mismo/doc-types` | discoverability |
+| **Document graph** | `GET /applicant/{id}/graph[/summary]` | nodes + edges |
+| | `GET /applicant/{id}/conflicts` | contradicts edges |
+| | `POST /applicant/{id}/navigate` | Q&A over graph |
+| | `POST /applicant/{id}/reconcile` | force re-run |
+| **Property (Phase B)** | `POST /properties` | create property row |
+| | `GET /property/{id}/profile` | versioned PropertyProfile |
+| | `GET /property/{id}/pipeline-state` | per-property doc state |
+| | `POST /ingest/property-doc` | multipart upload |
+| **Application context (Phase C)** | `GET /application/{id}/context` | the Decision OS one-shot |
+| | `GET /application/{id}/readiness` | flags only |
+| | `POST /application/{id}/refresh-context` | force re-assemble |
+| | `GET /application/{id}/dti` | DTI breakdown |
+| **Vendor returns (Phase D)** | `POST /ingest/vendor-return` | universal receiver (aus/fraud/voe/ssn/ofac/flood) |
+| | `GET /application/{id}/vendor-checks` | flat summary |
+| | `POST /application/{id}/run-vendor-checks` | demo: synthetic returns through every adapter |
+| **Persona slices (Phase E)** | `GET /application/{id}/context/{income\|credit\|property\|compliance\|fraud}` | one slice per Decision OS persona |
+| **Webhooks (Phase E)** | `POST /webhooks` | register `{name, url, secret?, events?}` |
+| | `GET /webhooks` | list |
+| | `DELETE /webhooks/{id}` | deactivate |
+| | `GET /webhooks/{id}/deliveries?limit=` | delivery audit |
+| **Versioning (Phase E)** | `GET /application/{id}/context/history?limit=` | versions list |
+| | `GET /application/{id}/context/at/{ts}` | point-in-time replay |
+| **Checklist (Phase E)** | `GET /application/{id}/missing-documents` | catalog-driven |
+| **Observability (Phase F)** | `GET /dashboard` | public HTML, refresh 15s |
+| | `GET /application/{id}/pipeline-state` | full machine-readable rollup |
+| | `GET /application/{id}/timeline` | sorted event log |
+| **Incremental indexer** | `GET /indexing/status?source=s3` | watermark + last run |
+| | `POST /indexing/run` | `{source, dry_run}` |
+| | `GET /indexing/runs[?source=&limit=]` | history |
+| | `GET /indexing/runs/{run_id}` | detail |
+| | `PUT /indexing/watermark` | `{source, timestamp}` — admin re-index |
+
+---
+
 ## Persistence fixes that landed during Phase A
 
 These were latent bugs surfaced by `simulate_local.py`:
@@ -282,19 +337,38 @@ Errors:
 
 ## Open follow-ups
 
-### Resolved this session
+### Resolved in earlier sessions
 
-- ✅ **Leaked AWS key** `AKIAZBPIELTUVVBGFZHN` — **deactivated**. Any new AWS
-  CLI from this session needs fresh credentials.
+- ✅ **Leaked AWS key** `AKIAZBPIELTUVVBGFZHN` — **deactivated**.
 - ✅ **`XRefStore` in-memory bug** — fixed by Phase 0.5. `hydrate_from_postgres()`
   loads existing applicants on lifespan startup; `next_sequence()` resumes
   past the highest stored id; SSN + source-id indexes rebuilt.
 - ✅ **Phase A schema applied to RDS prod**. `raw_ingestion` table + 4 indexes
-  live; `/ingest/*` endpoints route through `IngestionPipeline` and persist
-  raw payloads to S3 + Postgres before extraction. Verified via
-  `scripts/watch_pipeline.py --live`.
+  live; verified via `scripts/watch_pipeline.py --live`.
 
-### AWS / production
+### Resolved this session (Phases B → indexer)
+
+- ✅ **Property layer** — schema (`properties`, `property_profiles`) applied locally; PITI math live; PropertyAssembler + 5 generators + extractors + 4 endpoints + 23 tests.
+- ✅ **One-call ApplicationContext** — borrower + property + vendor folded into one cached read shape, with TTL-30m invalidation hooks on every income / property re-assembly.
+- ✅ **Vendor return adapters** — DU/LP, Socure/LexisNexis, TWN/Equifax VOE, SSA SSN, Treasury OFAC. Synthetic generators for the demo path.
+- ✅ **Persona slices + webhooks** — 5 slices, webhook fan-out with HMAC, context_versions audit trail, point-in-time replay endpoint.
+- ✅ **Observability** — `/dashboard` HTML, `/pipeline-state`, `/timeline`. `watch_pipeline.py --full` drives the complete scenario end-to-end.
+- ✅ **Incremental indexer** — watermark + S3Scanner + BatchIndexer + AsyncIOScheduler. `simulate_s3_edms.py` validates the skip-unchanged-applicant property.
+- ✅ **FakePostgresStore.save_document upserts on document_id** — caught by the indexer test where `_run_assembly` re-saves docs already persisted by the indexer; previously appended duplicates that production's `ON CONFLICT DO UPDATE` would have collapsed.
+
+### Production deploy of Phases B → indexer (NOT YET DEPLOYED)
+
+The local docker-compose has every phase applied. Production ECS still runs Phase 0/0.5/A.
+
+1. **Apply schema deltas to prod RDS.** New tables since the last prod apply: `properties`, `property_profiles`, `webhooks`, `webhook_deliveries`, `context_versions`, `indexing_watermarks`, `indexing_runs`. Plus `applications.property_id` ALTER. Use the same `scripts/apply_schema.py` ECS one-off task pattern that landed Phase A.
+2. **Push image with `apscheduler` deps.** `requirements.txt` gained `APScheduler==3.10.4` + `pytz` + `tzdata` + `tzlocal`. Re-pin via `pip freeze` and rebuild before deploy.
+3. **Decide whether to run the scheduler in ECS.** `ENABLE_SCHEDULER` is off by default. In ECS, only ONE of the N running tasks should run the scheduler (otherwise N concurrent batch indexers will fight over the watermark). Two clean options:
+   - Run one ECS service for the API (desired=N, `ENABLE_SCHEDULER=false`) and a separate ECS service for the scheduler (desired=1, `ENABLE_SCHEDULER=true`).
+   - Or: leave `ENABLE_SCHEDULER=false` and trigger `POST /indexing/run` from EventBridge on a 15-minute schedule. Simpler, no service-count fan-out.
+4. **`AssignPublicIp: ENABLED`** is acceptable for the default-VPC dev deploy but should flip back to `DISABLED` when this moves to a real VPC with private subnets + NAT gateway. Documented in commit `fbd03d5`.
+5. **Wire `infra/cloudformation/secrets.yaml`** so the three `edms/*` secrets are stack-managed — currently their ARN suffixes are hard-coded in `task_definition.json`, so any rotation breaks the deploy.
+
+### Pre-existing AWS / production (still open)
 
 1. **Production data cleanup** (Phase 0/0.5 collateral damage):
    - **James Okafor's data was overwritten.** First Phase 0 prod test triggered
@@ -315,13 +389,6 @@ Errors:
    admin-provisioned out-of-band, not via the repo's CFN templates. Future
    schema / config changes need to either route through admin-provisioned
    parameter groups or finally take ownership in `infra/cloudformation/`.
-4. **`AssignPublicIp: ENABLED`** is acceptable for the default-VPC dev deploy
-   but should flip back to `DISABLED` when this moves to a real VPC with
-   private subnets + NAT gateway. Documented in the commit message of `fbd03d5`.
-5. **Wire `infra/cloudformation/secrets.yaml` (or admin-provision) so the
-   three `edms/*` secrets are stack-managed** — currently their ARN suffixes
-   are hard-coded in `task_definition.json`, so any rotation or recreate
-   breaks the deploy.
 
 ### Application
 
@@ -341,8 +408,7 @@ Errors:
    populate `ssn_hash`, the second arrival hits the constraint. Defensive
    alternative: convert to a partial index (`WHERE ssn_hash <> ''`) so empty
    hashes don't collide. Trade-off: hides connector bugs at insert time.
-   Current preference: keep strict and rely on connector tests
-   (`test_translate_loan_distinct_ssns_produce_distinct_hashes`).
+   Current preference: keep strict and rely on connector tests.
 5. **Hydration is sequential and load-everything-into-memory.** Fine for
    thousands of applicants, painful at hundreds of thousands. When the row
    count grows, switch to a Postgres-backed `XRefStore` that does point
@@ -355,6 +421,31 @@ Errors:
    `service._persist_and_reconcile_documents` and `/ingest/los` look up the
    most recent matching `raw_ingestion` row by `(applicant_id, source_channel)`
    and update its `document_id` after `save_document` succeeds.
+7. **`/dashboard` is unauthenticated** — intentional, so a browser tab can sit
+   on it. It's a read-only summary; nothing sensitive leaks (just LOS IDs
+   and aggregate counts). If product wants this gated later, wrap with
+   `Depends(verify_api_key)` and switch to a `?api_key=` query string for the
+   browser refresh, or move it to a separate admin port.
+8. **Indexer scheduler in ECS needs single-task gating.** With desired-count=N
+   and `ENABLE_SCHEDULER=true`, every task fires its own batch indexer on the
+   same 15-minute clock and they race on the watermark. Two clean options:
+   split the API and scheduler into separate ECS services (scheduler
+   desired=1), or trigger `POST /indexing/run` from EventBridge instead of
+   APScheduler. See "Production deploy of Phases B → indexer" above.
+9. **Incremental indexer doesn't track per-applicant watermarks.** It uses
+   one source-level watermark. Means: if applicant A's docs are processed
+   in run T and applicant B uploads new ones during T, B's docs don't get
+   indexed until run T+1 — fine for a 15-minute cadence but could surprise
+   on demos. Multi-watermark per source/applicant is a Phase G item if it
+   matters.
+10. **Webhook delivery is in-process and synchronous-per-webhook.** Every
+    `assemble()` blocks on the round-trip to each subscriber. Fine for a
+    handful of webhooks; will need a queue (SQS + worker) at scale.
+11. **`/dashboard` does not flush stale Redis context.** It reads whatever
+    `redis.get_application_context` returns; if a context was last cached at
+    T-29min and an event-driven invalidation didn't fire (e.g. a back-end
+    process inserted into `document_index` directly), the dashboard shows
+    stale numbers until TTL elapses. Hit `POST /refresh-context` to force.
 
 ---
 
@@ -405,6 +496,28 @@ Errors:
   `--` line comments before splitting (commit `ab4b547`); the comment
   in `infra/schema.sql` was rewritten to drop the inline `;` for good
   measure.
+- **FakePostgresStore.save_document used to append, not upsert.** Real
+  Postgres has `ON CONFLICT (document_id) DO UPDATE`; the fake just
+  appended. Surfaced when the indexer saved a doc and `_run_assembly`
+  re-saved it through `_persist_and_reconcile_documents`, producing
+  2 rows where prod would have 1. Conftest now upserts by `document_id`.
+  Same trap could exist for any other dictionary-row-keyed table — check
+  before mirroring.
+- **JSONB column auto-decode list in `_row_to_dict`** has to be kept in
+  sync each time a new JSONB column is added. Currently includes:
+  `address_current`, `identity_xrefs`, `application_ids`, `profile_data`,
+  `extracted_fields`, `source_value`, `target_value`, `piti_components`,
+  `context_data`, `payload`, `events`, `error_details`. Forgetting to add
+  a column means callers see a JSON string instead of a dict.
+- **`AUS_DU_FINDINGS` ⟂ `AUS_LP_FINDINGS`.** The `/missing-documents`
+  catalog treats either one as satisfying the AUS slot — the indexer's
+  filename detection picks DU vs LP from `du_findings` / `lp_findings`
+  patterns. If a real LOS sends `aus.xml` with no marker in the name,
+  it currently falls back to `UNKNOWN`; the connector path handles that
+  via `MISMOMapper.detect_type_from_content`.
+- **APScheduler with multiple ECS tasks fights over the watermark.** See
+  follow-up #8 in the Application list. Split into a separate scheduler
+  service or use EventBridge instead.
 
 ---
 
@@ -422,6 +535,9 @@ Errors:
 | `API_KEY` | `api/routes.py:verify_api_key` | header `X-API-Key` |
 | `DECISION_OS_URL` | downstream call placeholder |  |
 | `ANTHROPIC_API_KEY` | `core/ingestion/_claude_client.py` | required for chat / image / email body. Account-level errors are fine — Phase E handles them. |
+| `ENABLE_SCHEDULER` | `api/main.py` lifespan | `true` starts APScheduler interval job for the indexer. Off by default — see follow-up #8 before flipping in ECS. |
+| `INDEX_INTERVAL_MINUTES` | `api/main.py` lifespan | indexer cadence; default `15`. |
+| `EDMS_API_URL` / `EDMS_API_KEY` | `scripts/watch_pipeline.py`, `scripts/simulate_s3_edms.py` | overrides for the dev scripts. Defaults: `http://localhost:8001` and `edms_dev_key`. |
 
 ---
 
@@ -472,6 +588,23 @@ ls -R local_storage/
 .venv/Scripts/python -m pip install <pkg>
 .venv/Scripts/python -m pip freeze | grep -v -E '^(pytest|pytest-asyncio|fakeredis|iniconfig|pluggy|Pygments|sortedcontainers)' > /tmp/freeze
 # manually merge /tmp/freeze into requirements.txt preserving the section comments
+
+# walk the full pipeline against local API
+.venv/Scripts/python scripts/watch_pipeline.py --full
+
+# drop synthetic files into local_storage and trigger the indexer
+.venv/Scripts/python scripts/simulate_s3_edms.py
+.venv/Scripts/python scripts/simulate_s3_edms.py --dry-run
+.venv/Scripts/python scripts/simulate_s3_edms.py --watch     # 30s loop
+
+# trigger one indexing run + see status
+curl -s -X POST http://localhost:8001/indexing/run \
+  -H "X-API-Key: edms_dev_key" -H "Content-Type: application/json" \
+  -d '{"source":"s3"}' | jq
+curl -s http://localhost:8001/indexing/status -H "X-API-Key: edms_dev_key" | jq
+
+# open the dashboard (no auth)
+open http://localhost:8001/dashboard
 ```
 
 ### AWS / production observability
