@@ -184,7 +184,7 @@ Resources:
         AwsvpcConfiguration:
           Subnets: !Ref PrivateSubnetIds
           SecurityGroups: [!Ref TaskSecurityGroup]
-          AssignPublicIp: DISABLED
+          AssignPublicIp: ENABLED
       LoadBalancers:
         - ContainerName: !Ref EnvironmentName
           ContainerPort: 8001
