@@ -23,20 +23,22 @@
         {"name": "USE_AWS_SQS", "value": "true"},
         {"name": "AWS_REGION", "value": "us-east-1"},
         {"name": "USE_LOCAL_STORAGE", "value": "false"},
-        {"name": "USE_FAKE_REDIS", "value": "false"}
+        {"name": "USE_FAKE_REDIS", "value": "false"},
+        {"name": "AWS_S3_BUCKET", "value": "edms-simulator-loans"},
+        {"name": "AWS_S3_BUCKET_KMS", "value": "arn:aws:kms:us-east-1:621646470377:key/f61c6a3c-15aa-4e0d-b9dd-8665a8c88d26"}
       ],
       "secrets": [
         {
           "name": "DB_CONNECTION",
-          "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:edms/aurora/credentials"
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/aurora/credentials-tNFwJM"
         },
         {
           "name": "REDIS_CONNECTION",
-          "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:edms/redis/endpoint"
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/redis/endpoint-Z3uo92"
         },
         {
           "name": "API_KEY",
-          "valueFrom": "arn:aws:secretsmanager:us-east-1:ACCOUNT_ID:secret:edms/api/keys"
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/api/keys-NLNCtu"
         }
       ],
       "logConfiguration": {
