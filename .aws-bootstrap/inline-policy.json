@@ -1,0 +1,59 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "S3LoanDocumentsReadWrite",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::edms-simulator",
+        "arn:aws:s3:::edms-simulator/*"
+      ]
+    },
+    {
+      "Sid": "SecretsManagerReadEdmsScope",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:*:*:secret:edms/*"
+    },
+    {
+      "Sid": "SqsEdmsQueuesSendReceive",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes",
+        "sqs:GetQueueUrl",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": [
+        "arn:aws:sqs:*:*:identity-resolution-queue.fifo",
+        "arn:aws:sqs:*:*:identity-resolution-queue-dlq.fifo",
+        "arn:aws:sqs:*:*:income-assembly-queue.fifo",
+        "arn:aws:sqs:*:*:income-assembly-queue-dlq.fifo",
+        "arn:aws:sqs:*:*:document-ingestion-queue.fifo",
+        "arn:aws:sqs:*:*:document-ingestion-queue-dlq.fifo"
+      ]
+    },
+    {
+      "Sid": "CloudWatchLogsWrite",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogStreams"
+      ],
+      "Resource": "arn:aws:logs:*:*:*"
+    }
+  ]
+}
