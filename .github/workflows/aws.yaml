@@ -49,6 +49,12 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
+      - name: Substitute ACCOUNT_ID in task definition
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "Substituting ACCOUNT_ID -> $AWS_ACCOUNT_ID in task_definition.json"
+          sed -i "s/ACCOUNT_ID/$AWS_ACCOUNT_ID/g" .github/workflows/task_definition.json
+
       - name: Fill in new image in ECS task definition
         id: task-def
         uses: aws-actions/amazon-ecs-render-task-definition@v1
