@@ -37,15 +37,19 @@ Redis port is **6380**.
 ## Repo state at end of last session
 
 - Branch: `main`, all committed and pushed to `https://github.com/krishnamami/edms-simulator`
-- Tests: **160 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`)
+- Tests: **165 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`)
 - `simulate_local.py` runs end-to-end with exit 0 on a clean DB
 - **Production ECS service is live + DB-backed** at `http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com`. `/health` 200, `/docs` 200, **DB-touching endpoints (`/applicant/{id}/graph/summary`) return 200 with `source: "database"`**.
 - **MISMO + LOS endpoints live in prod**: `/loans/from-los`, `/ingest/los`, `/resolve/external/...`, `/mismo/doc-types` all verified end-to-end.
-- **XRefStore now hydrates from Postgres at startup** so `applicant_id` sequence + SSN / source-id lookups survive across redeploys (Phase 0.5).
+- **XRefStore hydrates from Postgres at startup** so `applicant_id` sequence + SSN / source-id lookups survive across redeploys (Phase 0.5).
+- **Raw storage layer live in prod (Phase A)**. Every inbound `/ingest/*` payload is persisted to S3 + `raw_ingestion` BEFORE extraction. `POST /ingest/{ingest_id}/reprocess` re-runs extraction from the stored bytes. Verified end-to-end via `scripts/watch_pipeline.py --live`.
 
 Latest commits (top of `main`):
 
 ```
+ab4b547  fix(ops): apply_schema.py strips comments before splitting on ';'
+00a7d26  feat(raw): Phase A — raw storage layer before extraction
+2990e98  docs: refresh context.md after Phase 0 + 0.5 prod bootstrap
 ab27bf5  fix(los): connectors must compute ssn_hash so applicants don't collide
 047aa6d  fix: hydrate XRefStore from Postgres at startup
 c5b142a  feat(mismo): Phase 0 — MISMO compatibility + LOS connectors + external IDs
@@ -88,6 +92,7 @@ bff35cc  feat(simulator): Phase D — 7-step walkthrough exercising all channels
 | **graph** | `d0e11e3` | Document knowledge graph — `core/graph/{models,reconciler,navigator}.py`. Reconciler writes typed edges (confirms / corroborates / contradicts) using the same `NUMERIC_CONFLICT_THRESHOLD` as `ConfidenceResolver`. Navigator answers questions over the graph (Claude with full reasoning_path when key set, rule-based fallback otherwise). 5 new endpoints under `/applicant/{id}/`. 18 new tests. |
 | **0**  | `c5b142a` | MISMO 3.4 compatibility + LOS connectors + external IDs. `core/ingestion/{mismo,los_connector}.py` with 55 MISMO + 20 Encompass mappings, `EncompassConnector` + `GenericMISMOConnector`. Schema adds `applicants.external_ids JSONB`, `applications.external_loan_id` + URLA / HMDA / loan-terms columns, `mismo_doc_type_registry` + `los_connectors` tables. New endpoints: `/ingest/los`, `/loans/from-los`, `/resolve/external/{system}/{id}`, `/mismo/doc-types`. 13 new tests. |
 | **0.5** | `047aa6d`, `ab27bf5` | Production data-integrity fixes triggered by Phase 0 prod test. (1) `XRefStore.hydrate_from_postgres()` called from `api/main.py` lifespan so applicant-id sequence + SSN lookups survive across restarts (was silently overwriting via `ON CONFLICT DO UPDATE`). (2) LOS connectors must populate `ssn_hash` from the full SSN — empty strings collide on `idx_applicant_ssn`. 7 new tests. |
+| **A** (raw) | `00a7d26`, `ab4b547` | Raw storage layer. Every inbound `/ingest/*` payload is now persisted to S3 (`raw/{channel}/{applicant?}/{date}/{uuid}.{ext}`) and tracked in a new `raw_ingestion` table BEFORE extraction. New `IngestionPipeline` (`core/ingestion/pipeline.py`) wraps the existing `IngestRouter` so the 7 channel endpoints all flow through `received → extracting → indexed` (or `failed`). `RawIngestionStore` exposes status transitions; new endpoints `GET /applicant/{id}/raw-ingestion`, `GET /ingest/{id}/raw`, `POST /ingest/{id}/reprocess`, `GET /pipeline/failed`. Reprocess re-reads the original bytes from S3. New `scripts/watch_pipeline.py` walks all storage layers (`--live` for prod). FK constraints on `raw_ingestion.applicant_id` / `application_id` deliberately omitted — raw arrives before parents may exist. 5 new tests. Followup `ab4b547` hardened `apply_schema.py` to strip `--` line comments before splitting on `;` after a `;` inside a comment broke the first prod schema apply. |
 
 ---
 
@@ -111,8 +116,9 @@ Took the simulator from "runs locally" to "running on Fargate behind an ALB". Mu
 
 **Backing services (admin-provisioned out-of-band, not via this repo's CFN):**
 
-- **RDS Postgres `edms-postgres-rdsinstance-ev3113lmj40h`** — running, private endpoint, `rds.force_ssl=1`, master user `edms_admin`. Schema applied via `scripts/apply_schema.py` one-off ECS task; 47 statements OK (Phase 0 added 27, prior phases added 20). The repo's `infra/cloudformation/rds-postgres.yaml` was never used to deploy the actual instance.
+- **RDS Postgres `edms-postgres-rdsinstance-ev3113lmj40h`** — running, private endpoint, `rds.force_ssl=1`, master user `edms_admin`. Schema applied via `scripts/apply_schema.py` one-off ECS task. After Phase A, the live DB has the full set: applicants / applications / xref / income_profiles / credit_profiles / document_index / document_relationships / mismo_doc_type_registry / los_connectors / **raw_ingestion** + indexes. The repo's `infra/cloudformation/rds-postgres.yaml` was never used to deploy the actual instance.
 - **ElastiCache Redis** — running with `TransitEncryptionEnabled=True`. `redis_store.py` triggers `ssl=True` when `ENVIRONMENT=production` or `REDIS_SSL=true`. The repo's `infra/cloudformation/elasticache.yaml` was never used.
+- **S3 (`edms-simulator-loans`)** — production raw payloads now land at `raw/{channel}/{applicant?}/{YYYY/MM/DD}/{uuid}.{ext}` via Phase A. The original `loans/{application_id}/{category}/...` layout (Phase B generators) still works for assembled documents.
 - **Secrets Manager** — `edms/aurora/credentials` (with `username` corrected from `edms` to `edms_admin`), `edms/redis/endpoint`, `edms/api/keys`. All admin-provisioned out-of-band. `task_definition.json` references them by ARN-with-suffix (`-tNFwJM` / `-Z3uo92` / `-NLNCtu`). The `API_KEY` reference uses ECS's JSON-key syntax (`...-NLNCtu:decision_os_api_key::`) so only the field value is injected, not the whole JSON blob.
 - **MISMO type registry seeded in production** — `scripts/seed_mismo_registry.py` ran as a one-off ECS task; 75 mappings + 5 LOS connectors loaded.
 
@@ -283,6 +289,10 @@ Errors:
 - ✅ **`XRefStore` in-memory bug** — fixed by Phase 0.5. `hydrate_from_postgres()`
   loads existing applicants on lifespan startup; `next_sequence()` resumes
   past the highest stored id; SSN + source-id indexes rebuilt.
+- ✅ **Phase A schema applied to RDS prod**. `raw_ingestion` table + 4 indexes
+  live; `/ingest/*` endpoints route through `IngestionPipeline` and persist
+  raw payloads to S3 + Postgres before extraction. Verified via
+  `scripts/watch_pipeline.py --live`.
 
 ### AWS / production
 
@@ -337,6 +347,14 @@ Errors:
    thousands of applicants, painful at hundreds of thousands. When the row
    count grows, switch to a Postgres-backed `XRefStore` that does point
    lookups instead of pre-loading.
+6. **`raw_ingestion.document_id` stays NULL on success** — the FK fires only
+   when an actual `document_index` row exists. Phase A persists the raw
+   payload but doesn't create the index row itself; the aggregation service
+   / `/ingest/los` create the index row but don't backfill
+   `raw_ingestion.document_id`. One-line fix when the linkage matters: have
+   `service._persist_and_reconcile_documents` and `/ingest/los` look up the
+   most recent matching `raw_ingestion` row by `(applicant_id, source_channel)`
+   and update its `document_id` after `save_document` succeeds.
 
 ---
 
@@ -380,6 +398,13 @@ Errors:
 - **LOS connectors must compute `ssn_hash`.** If they only set `ssn_last4`
   and leave the hash empty, two such inserts collide on `idx_applicant_ssn`.
   All connectors now use `_hash_or_empty(ssn)` (commit `ab27bf5`).
+- **A `;` inside a `--` comment breaks naive `split(';')`.** First Phase A
+  schema apply against prod failed because the comment block describing
+  why `applicant_id` is not a FK contained "system; the audit row". The
+  splitter cut the CREATE TABLE in half. `apply_schema.py` now strips
+  `--` line comments before splitting (commit `ab4b547`); the comment
+  in `infra/schema.sql` was rewritten to drop the inline `;` for good
+  measure.
 
 ---
 
