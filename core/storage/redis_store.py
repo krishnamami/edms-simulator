@@ -146,6 +146,22 @@ class RedisStore:
         except Exception:
             return False
 
+    def key_state(self, key: str) -> dict:
+        """Return ``{"present": bool, "ttl_seconds": int|None}`` for a key.
+
+        ``ttl_seconds`` is ``None`` when the key has no expiry (TTL=-1) or
+        does not exist (TTL=-2). Used by the Phase F observability
+        endpoints to surface every cache key with its remaining lifetime.
+        """
+        try:
+            ttl = int(self._r.ttl(key))
+        except Exception as e:
+            logger.warning("redis_ttl_failed", extra={"error": str(e)})
+            return {"present": False, "ttl_seconds": None}
+        if ttl == -2:
+            return {"present": False, "ttl_seconds": None}
+        return {"present": True, "ttl_seconds": ttl if ttl >= 0 else None}
+
     # ---------------- document knowledge graph -----------------
 
     def invalidate_income_profile(self, applicant_id: str) -> None:

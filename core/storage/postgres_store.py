@@ -188,6 +188,35 @@ class PostgresStore:
         )
         return _row_to_dict(row)
 
+    async def get_all_applications(self, limit: int = 50) -> list:
+        """Return the N most-recent applications. Used by the dashboard."""
+        rows = await db.fetch(
+            "SELECT * FROM applications ORDER BY created_at DESC LIMIT $1",
+            limit,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_raw_ingestion_for_application(
+        self, application_id: str
+    ) -> list:
+        """Phase F: timeline reads raw_ingestion rows scoped to an
+        application_id. Includes rows where applicant_id matches the
+        application's primary or co-applicant, since some channels land
+        the row before the application_id is known."""
+        rows = await db.fetch(
+            """
+            SELECT r.*
+            FROM raw_ingestion r
+            LEFT JOIN applications a ON a.application_id = $1
+            WHERE r.application_id = $1
+               OR r.applicant_id    = a.applicant_id
+               OR r.applicant_id    = a.co_applicant_id
+            ORDER BY r.received_at ASC
+            """,
+            application_id,
+        )
+        return [_row_to_dict(r) for r in rows]
+
     async def get_application_by_applicant(
         self, applicant_id: str
     ) -> Optional[dict]:

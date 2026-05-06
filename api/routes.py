@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import structlog
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse
 
 from api.schemas import (
     ApplicantIdResponse,
@@ -1673,3 +1674,430 @@ async def get_missing_documents(request: Request, application_id: str):
         "vendor_missing":   [m["doc_type"] for m in vendor_missing],
         "checklist":        borrower_missing + property_missing + vendor_missing,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase F: pipeline observability — dashboard, pipeline-state, timeline
+# ---------------------------------------------------------------------------
+
+
+async def _get_borrower_name(pg, applicant_id: str) -> str:
+    if not applicant_id:
+        return "—"
+    try:
+        gr = await pg.find_by_applicant_id(applicant_id)
+    except Exception:
+        gr = None
+    return (gr or {}).get("full_name") or applicant_id
+
+
+def _flag_html(val: bool) -> str:
+    cls = "green" if val else "red"
+    sym = "&#10003;" if val else "&#10007;"  # ✓ / ✗
+    return f'<span class="{cls}">{sym}</span>'
+
+
+def _render_dashboard(summaries: list) -> str:
+    rows = ""
+    for s in summaries:
+        front_dti = s.get("front_dti")
+        ltv = s.get("ltv")
+        dti_class = "red" if (front_dti or 0) > 43 else (
+            "yellow" if (front_dti or 0) > 36 else "green"
+        )
+        ltv_class = "red" if (ltv or 0) > 95 else (
+            "yellow" if (ltv or 0) > 80 else "green"
+        )
+        row_class = "review" if s.get("requires_review") else ""
+        rows += (
+            f'<tr class="{row_class}" data-href="/application/{s["application_id"]}/pipeline-state">'
+            f'<td><code>{s["application_id"]}</code></td>'
+            f'<td>{s.get("los_id","")}</td>'
+            f'<td>{s.get("borrower_name","")}</td>'
+            f'<td>{_flag_html(s.get("income_verified"))}</td>'
+            f'<td>{_flag_html(s.get("credit_pulled"))}</td>'
+            f'<td>{_flag_html(s.get("appraisal_done"))}</td>'
+            f'<td>{_flag_html(s.get("aus_ready"))}</td>'
+            f'<td class="{dti_class}">'
+            f'{f"{front_dti:.1f}%" if front_dti is not None else "&mdash;"}'
+            f'</td>'
+            f'<td class="{ltv_class}">'
+            f'{f"{ltv:.1f}%" if ltv is not None else "&mdash;"}'
+            f'</td>'
+            f'<td class="{"red" if s.get("conflicts",0) > 0 else "green"}">'
+            f'{s.get("conflicts",0)}</td>'
+            f'<td class="{"red" if s.get("requires_review") else "green"}">'
+            f'{"&#9888; Review" if s.get("requires_review") else "&#10003; OK"}'
+            f'</td>'
+            f'</tr>'
+        )
+    total = len(summaries)
+    aus_ready = sum(1 for s in summaries if s.get("aus_ready"))
+    review_n  = sum(1 for s in summaries if s.get("requires_review"))
+    missing_n = sum(1 for s in summaries if s.get("missing_count", 0) > 0)
+
+    empty_row = (
+        '<tr><td colspan="11" style="text-align:center;color:#8b949e">'
+        'No applications yet. POST /loans or run scripts/watch_pipeline.py.'
+        '</td></tr>'
+    )
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <title>EDMS Pipeline Dashboard</title>
+  <meta http-equiv="refresh" content="15">
+  <style>
+    body {{ font-family: monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }}
+    h1 {{ color: #58a6ff; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+    th {{ background: #161b22; color: #8b949e; padding: 8px 12px; text-align: left;
+          border-bottom: 1px solid #30363d; font-size: 11px; text-transform: uppercase; }}
+    td {{ padding: 8px 12px; border-bottom: 1px solid #21262d; font-size: 12px; }}
+    tr:hover {{ background: #161b22; cursor: pointer; }}
+    tr.review {{ background: #2d1a1a; }}
+    .green {{ color: #3fb950; }}
+    .yellow {{ color: #d29922; }}
+    .red {{ color: #f85149; }}
+    .stats {{ display: flex; gap: 20px; margin: 20px 0; }}
+    .stat {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+             padding: 12px 20px; }}
+    .stat-val {{ font-size: 24px; font-weight: bold; color: #58a6ff; }}
+    .stat-lbl {{ font-size: 11px; color: #8b949e; margin-top: 4px; }}
+    code {{ background: #161b22; padding: 2px 6px; border-radius: 3px;
+            font-size: 11px; color: #79c0ff; }}
+  </style>
+</head>
+<body>
+  <h1>EDMS Pipeline Dashboard</h1>
+  <p style="color:#8b949e; font-size:12px">
+    Auto-refreshes every 15 seconds &nbsp;|&nbsp;
+    {total} applications &nbsp;|&nbsp;
+    Click any row for detail JSON.
+  </p>
+  <div class="stats">
+    <div class="stat"><div class="stat-val">{total}</div><div class="stat-lbl">Total Applications</div></div>
+    <div class="stat"><div class="stat-val green">{aus_ready}</div><div class="stat-lbl">AUS Ready</div></div>
+    <div class="stat"><div class="stat-val red">{review_n}</div><div class="stat-lbl">Requires Review</div></div>
+    <div class="stat"><div class="stat-val yellow">{missing_n}</div><div class="stat-lbl">Missing Documents</div></div>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Application ID</th><th>LOS ID</th><th>Borrower</th>
+        <th>Income</th><th>Credit</th><th>Appraisal</th><th>AUS</th>
+        <th>Front DTI</th><th>LTV</th><th>Conflicts</th><th>Status</th>
+      </tr>
+    </thead>
+    <tbody>{rows if rows else empty_row}</tbody>
+  </table>
+  <script>
+    document.querySelectorAll("tr[data-href]").forEach(r => {{
+      r.addEventListener("click", () => window.location = r.dataset.href);
+    }});
+  </script>
+</body>
+</html>"""
+
+
+@router.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    """Live HTML dashboard. No auth — read-only summary view; safe to
+    leave open in a browser tab.
+    """
+    pg = request.app.state.postgres_store
+    redis = request.app.state.redis_store
+    apps = await pg.get_all_applications(limit=50)
+
+    summaries: list = []
+    for app in apps:
+        ctx = redis.get_application_context(app["application_id"]) or {}
+        primary = ctx.get("primary") or {}
+        summaries.append({
+            "application_id":  app["application_id"],
+            "los_id":          app.get("los_id", "") or "",
+            "borrower_name":   await _get_borrower_name(pg, app.get("applicant_id")),
+            "status":          app.get("status", "active"),
+            "income_verified": bool(primary.get("income_verified")),
+            "credit_pulled":   (primary.get("mid_score") or 0) > 300,
+            "appraisal_done":  bool(ctx.get("property")),
+            "aus_ready":       bool((ctx.get("readiness") or {}).get("aus_ready")),
+            "front_dti":       ctx.get("front_end_dti"),
+            "ltv":             ctx.get("ltv"),
+            "conflicts":       (ctx.get("graph_summary") or {}).get("conflict_count", 0),
+            "requires_review": bool(ctx.get("requires_review")),
+            "missing_count":   len((ctx.get("readiness") or {}).get("missing_items") or []),
+        })
+    return HTMLResponse(_render_dashboard(summaries))
+
+
+# ---- pipeline-state --------------------------------------------------------
+
+
+@router.get(
+    "/application/{application_id}/pipeline-state",
+    dependencies=[Depends(verify_api_key)],
+)
+async def application_pipeline_state(request: Request, application_id: str):
+    pg = request.app.state.postgres_store
+    redis = request.app.state.redis_store
+    raw_store = getattr(request.app.state, "raw_store", None) or RawIngestionStore()
+
+    app = await pg.get_application(application_id)
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    ctx = redis.get_application_context(application_id)
+    if not ctx:
+        try:
+            ctx_obj = await ContextAssembler(pg, redis).assemble(application_id)
+            ctx = ctx_obj.model_dump()
+        except Exception:
+            ctx = {}
+
+    # Per-borrower roll-up
+    borrowers: list = []
+    for role, applicant_id in (
+        ("primary", app.get("applicant_id")),
+        ("co_borrower", app.get("co_applicant_id")),
+    ):
+        if not applicant_id:
+            continue
+        gr = await pg.find_by_applicant_id(applicant_id)
+        try:
+            docs = await pg.get_documents_for_applicant(applicant_id)
+        except Exception:
+            docs = []
+        try:
+            raw_state = await raw_store.get_pipeline_state(applicant_id)
+        except Exception:
+            raw_state = {"received": 0, "extracting": 0, "indexed": 0,
+                         "failed": 0, "reprocessing": 0, "total": 0}
+        income = await pg.get_income_profile(applicant_id) or {}
+        credit = await pg.get_credit_profile(applicant_id) or {}
+        section_key = "co_borrower" if role == "co_borrower" else "primary_borrower"
+        section = (income.get(section_key) or {}) if income else {}
+        borrowers.append({
+            "applicant_id":   applicant_id,
+            "full_name":      (gr or {}).get("full_name") or applicant_id,
+            "role":           role,
+            "raw_ingestion":  raw_state,
+            "documents":      [
+                {
+                    "document_id":   d.get("document_id"),
+                    "document_type": d.get("document_type"),
+                    "confidence":    d.get("confidence_score"),
+                    "received_at":   str(d.get("received_at") or ""),
+                }
+                for d in docs
+            ],
+            "income": {
+                "qualifying_monthly": section.get("qualifying_monthly"),
+                "confidence":         section.get("overall_confidence"),
+                "assembled_at":       income.get("assembled_at"),
+            },
+            "credit": {
+                "mid_score":   credit.get("mid_score"),
+                "band":        credit.get("credit_band"),
+                "obligations": credit.get("total_monthly_obligations"),
+            },
+            "redis_keys": {
+                "income": redis.key_state(f"income:{applicant_id}"),
+                "credit": redis.key_state(f"credit:{applicant_id}"),
+                "status": redis.key_state(f"status:{applicant_id}"),
+            },
+        })
+
+    # Property roll-up
+    property_block = None
+    property_id = app.get("property_id")
+    if property_id:
+        prop = await pg.get_property(property_id)
+        try:
+            prop_docs = await pg.get_property_docs(property_id)
+        except Exception:
+            prop_docs = []
+        profile = await pg.get_property_profile(property_id) or {}
+        piti = profile.get("piti_components") or {}
+        appraised = profile.get("appraised_value")
+        loan_amount = app.get("loan_amount")
+        ltv = (
+            round(float(loan_amount) / float(appraised) * 100, 2)
+            if appraised and loan_amount else None
+        )
+        address = ""
+        if prop:
+            address = (
+                f"{prop.get('address_line1','')}, "
+                f"{prop.get('city','')}, "
+                f"{prop.get('state','')}"
+            )
+        property_block = {
+            "property_id":  property_id,
+            "address":      address,
+            "documents":    [
+                {"type": d.get("document_type"),
+                 "confidence": d.get("confidence_score")}
+                for d in prop_docs
+            ],
+            "profile": {
+                "appraised_value": appraised,
+                "piti_total":      piti.get("total_piti"),
+                "ltv":             ltv,
+                "flood_zone":      profile.get("flood_zone"),
+            },
+            "redis_key": redis.key_state(f"property:{property_id}"),
+        }
+
+    # Graph
+    primary_id = app.get("applicant_id")
+    try:
+        graph_summary = await pg.get_graph_summary(primary_id) if primary_id else {}
+    except Exception:
+        graph_summary = {}
+    try:
+        rels = (
+            await pg.get_relationships_for_applicant(primary_id)
+            if primary_id else []
+        )
+    except Exception:
+        rels = []
+    edges = [
+        {
+            "type":         r.get("relationship_type"),
+            "field":        r.get("field_name"),
+            "source_value": r.get("source_value"),
+            "target_value": r.get("target_value"),
+            "delta_pct":    r.get("delta_pct"),
+            "confidence":   r.get("confidence"),
+        }
+        for r in rels[:25]
+    ]
+    graph_block = {
+        "node_count":     graph_summary.get("document_count", 0),
+        "edge_count":     graph_summary.get("relationship_count", 0),
+        "conflict_count": graph_summary.get("conflict_count", 0),
+        "edges":          edges,
+    }
+
+    vendor_checks = ctx.get("vendor_checks") or {}
+    readiness = ctx.get("readiness") or {}
+    context_block = {
+        "present":         redis.key_state(f"context:{application_id}").get("present", False),
+        "ttl_seconds":     redis.key_state(f"context:{application_id}").get("ttl_seconds"),
+        "front_end_dti":   ctx.get("front_end_dti"),
+        "back_end_dti":    ctx.get("back_end_dti"),
+        "ltv":             ctx.get("ltv"),
+        "requires_review": bool(ctx.get("requires_review")),
+    }
+
+    pipeline_complete = bool(
+        readiness.get("income_verified")
+        and readiness.get("credit_pulled")
+        and readiness.get("appraisal_complete")
+        and readiness.get("insurance_bound")
+        and readiness.get("aus_ready")
+        and not ctx.get("requires_review")
+    )
+
+    return {
+        "application_id": application_id,
+        "application": {
+            "los_id":       app.get("los_id"),
+            "status":       app.get("status"),
+            "loan_amount":  app.get("loan_amount"),
+            "loan_type":    app.get("loan_type"),
+            "loan_purpose": app.get("loan_purpose"),
+            "created_at":   str(app.get("created_at") or ""),
+        },
+        "borrowers":     borrowers,
+        "property":      property_block,
+        "graph":         graph_block,
+        "vendor_checks": vendor_checks,
+        "context":       context_block,
+        "readiness":     readiness,
+        "pipeline_complete": pipeline_complete,
+    }
+
+
+# ---- timeline --------------------------------------------------------------
+
+
+@router.get(
+    "/application/{application_id}/timeline",
+    dependencies=[Depends(verify_api_key)],
+)
+async def application_timeline(request: Request, application_id: str):
+    pg = request.app.state.postgres_store
+    app = await pg.get_application(application_id)
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    events: list = []
+    events.append({
+        "timestamp":   str(app.get("created_at") or ""),
+        "event_type":  "application_submitted",
+        "layer":       "borrower",
+        "description": f"Application created — LOS: {app.get('los_id','')}",
+    })
+
+    try:
+        raw = await pg.get_raw_ingestion_for_application(application_id)
+    except Exception:
+        raw = []
+    for r in raw:
+        size = r.get("raw_size_bytes") or 0
+        events.append({
+            "timestamp":   str(r.get("received_at") or ""),
+            "event_type":  "document_received",
+            "layer":       "document",
+            "description": (
+                f"{(r.get('source_channel') or '').upper()} — "
+                f"{r.get('filename') or 'unnamed'} ({size:,} bytes)"
+            ),
+        })
+        if r.get("extracted_at"):
+            events.append({
+                "timestamp":   str(r["extracted_at"]),
+                "event_type":  "extraction_complete",
+                "layer":       "document",
+                "description": (
+                    f"Extracted {r.get('document_id') or '?'} "
+                    f"status={r.get('status')}"
+                ),
+            })
+
+    primary_id = app.get("applicant_id")
+    if primary_id:
+        try:
+            rels = await pg.get_relationships_for_applicant(primary_id)
+        except Exception:
+            rels = []
+        for rel in rels:
+            reasoning = (rel.get("reasoning") or "")[:100]
+            field = rel.get("field_name") or "?"
+            rtype = rel.get("relationship_type") or "edge"
+            events.append({
+                "timestamp":   str(rel.get("created_at") or ""),
+                "event_type":  f"graph_edge_{rtype}",
+                "layer":       "graph",
+                "description": f"{rtype.upper()}: {field} — {reasoning}",
+            })
+
+    try:
+        versions = await pg.get_context_versions(application_id, limit=50)
+    except Exception:
+        versions = []
+    for v in versions:
+        version_id = str(v.get("version_id") or "")
+        events.append({
+            "timestamp":   str(v.get("assembled_at") or ""),
+            "event_type":  "context_assembled",
+            "layer":       "context",
+            "description": (
+                f"Context v{version_id[:8]} — trigger: "
+                f"{v.get('trigger_event') or 'manual'}"
+            ),
+        })
+
+    events.sort(key=lambda e: str(e.get("timestamp") or ""))
+    return {"application_id": application_id, "events": events}

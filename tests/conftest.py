@@ -62,6 +62,15 @@ class FakePostgresStore:
     async def get_application(self, application_id):
         return self.applications.get(application_id)
 
+    async def get_all_applications(self, limit=50):
+        rows = list(self.applications.values())
+        return rows[:limit]
+
+    async def get_raw_ingestion_for_application(self, application_id):
+        # FakePostgresStore doesn't model raw_ingestion at all today —
+        # callers handle the empty list path.
+        return []
+
     async def get_application_by_applicant(self, applicant_id):
         for app in self.applications.values():
             if app.get("applicant_id") == applicant_id \
