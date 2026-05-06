@@ -92,6 +92,9 @@ class FakePostgresStore:
     async def get_documents_for_applicant(self, applicant_id):
         return [d for d in self.documents if d["applicant_id"] == applicant_id]
 
+    async def get_documents_for_application(self, application_id):
+        return [d for d in self.documents if d.get("application_id") == application_id]
+
     async def get_all_applicants(self):
         return list(self.applicants.values())
 

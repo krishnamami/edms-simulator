@@ -292,6 +292,16 @@ async def test_readiness_aus_ready_all_green(
     await postgres_store.save_property_profile(_property_profile(
         piti_total=2500
     ))
+    # Phase D: aus_ready is now gated on a real AUS approval, so seed one.
+    await postgres_store.save_document({
+        "document_id":      "DOC-AUS-1",
+        "applicant_id":     "APL-PRI",
+        "application_id":   "APP-1",
+        "document_type":    "AUS_DU_FINDINGS",
+        "document_category": "vendor",
+        "borrower_role":    "primary",
+        "extracted_fields": {"recommendation": "Approve/Eligible"},
+    })
 
     ctx = await ContextAssembler(postgres_store, redis_store).assemble("APP-1")
 

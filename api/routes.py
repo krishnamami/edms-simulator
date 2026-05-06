@@ -25,6 +25,13 @@ from core.aggregation.events import (
     PropertyDocumentUploadedEvent,
 )
 from core.context.assembler import ContextAssembler
+from core.ingestion.adapters.vendor_aus_adapter import VendorAUSAdapter
+from core.ingestion.adapters.vendor_fraud_adapter import VendorFraudAdapter
+from core.ingestion.adapters.vendor_ssn_adapter import (
+    VendorOFACAdapter,
+    VendorSSNAdapter,
+)
+from core.ingestion.adapters.vendor_voe_adapter import VendorVOEAdapter
 from core.property.extractors import (
     extract_appraisal_pdf,
     extract_flood_pdf,
@@ -1091,4 +1098,256 @@ async def get_application_dti(request: Request, application_id: str):
         "piti_total":                  property_block.get("piti_total"),
         "combined_qualifying_monthly": cached.get("combined_qualifying_monthly"),
         "total_obligations":           cached.get("total_monthly_obligations"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase D: vendor return adapters
+# ---------------------------------------------------------------------------
+
+
+def _vendor_adapter_for(vendor_type: str, vendor: str):
+    vendor_type = (vendor_type or "").lower()
+    vendor = (vendor or "").lower()
+    if vendor_type == "aus":
+        return VendorAUSAdapter()
+    if vendor_type == "fraud":
+        return VendorFraudAdapter()
+    if vendor_type == "voe":
+        return VendorVOEAdapter()
+    if vendor_type == "ssn":
+        return VendorSSNAdapter()
+    if vendor_type == "ofac":
+        return VendorOFACAdapter()
+    if vendor_type == "flood":
+        # The flood vendor return is a simple JSON; reuse the property
+        # FLOOD_CERT shape directly via a passthrough adapter.
+        return None
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unknown vendor_type: {vendor_type!r}",
+    )
+
+
+def _vendor_payload_for_aus(payload: dict) -> dict:
+    """Translate the wrapped /ingest/vendor-return body into the AUS
+    adapter's expected shape. Accepts both ``response.xml_content`` and
+    a top-level ``xml_content``."""
+    response = payload.get("response") or {}
+    xml = response.get("xml_content") or payload.get("xml_content") or ""
+    return {
+        "aus_type":       (payload.get("vendor") or "DU").upper(),
+        "xml_content":    xml,
+        "applicant_id":   payload.get("applicant_id"),
+        "application_id": payload.get("application_id"),
+    }
+
+
+def _vendor_payload_passthrough(payload: dict) -> dict:
+    return {
+        "vendor":         payload.get("vendor"),
+        "response":       payload.get("response") or {},
+        "applicant_id":   payload.get("applicant_id"),
+        "application_id": payload.get("application_id"),
+    }
+
+
+@router.post("/ingest/vendor-return", dependencies=[Depends(verify_api_key)])
+async def ingest_vendor_return(request: Request, body: dict):
+    """Universal vendor-return receiver.
+
+    Body shape::
+
+        {
+          "vendor_type":   "aus" | "fraud" | "voe" | "ssn" | "ofac" | "flood",
+          "vendor":        "du" | "lp" | "socure" | "lexisnexis" | "twn" |
+                           "equifax_voe" | "ssa" | "ofac",
+          "response":      { ...vendor JSON or {xml_content: str} },
+          "application_id": "APP-...",
+          "applicant_id":   "APL-..."
+        }
+    """
+    vendor_type = (body.get("vendor_type") or "").lower()
+    application_id = body.get("application_id")
+    applicant_id = body.get("applicant_id")
+    if not vendor_type or not application_id:
+        raise HTTPException(
+            status_code=400,
+            detail="body must include vendor_type and application_id",
+        )
+
+    pg = request.app.state.postgres_store
+    redis = request.app.state.redis_store
+
+    if vendor_type == "flood":
+        # Flood returns reuse the FLOOD_CERT shape directly — no adapter,
+        # the response itself is the extracted_fields blob.
+        fields = body.get("response") or {}
+        document_type = "FLOOD_CERT"
+        confidence = 0.99
+    else:
+        adapter = _vendor_adapter_for(vendor_type, body.get("vendor") or "")
+        adapter_payload = (
+            _vendor_payload_for_aus(body) if vendor_type == "aus"
+            else _vendor_payload_passthrough(body)
+        )
+        event = adapter.process(adapter_payload)
+        fields = event.extracted_fields
+        document_type = event.document_type
+        confidence = event.confidence
+
+    import uuid as _uuid
+    document_id = f"VENDOR-{_uuid.uuid4().hex[:12]}"
+    if applicant_id:
+        try:
+            await pg.save_document({
+                "document_id":      document_id,
+                "applicant_id":     applicant_id,
+                "application_id":   application_id,
+                "document_type":    document_type,
+                "document_category": "vendor",
+                "borrower_role":    "primary",
+                "s3_key":           None,
+                "status":           "received",
+                "is_current":       True,
+                "extracted_fields": fields,
+                "confidence_score": confidence,
+            })
+        except Exception as exc:
+            logger.warning("vendor_save_document_failed", extra={"error": str(exc)})
+
+    # Drop the cached context — next /context call recomputes including
+    # the freshly-landed vendor return.
+    redis.invalidate_context(application_id)
+
+    return {
+        "ingest_id":             document_id,
+        "document_type":         document_type,
+        "vendor_checks_updated": True,
+        "extracted":             fields,
+    }
+
+
+@router.get(
+    "/application/{application_id}/vendor-checks",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_application_vendor_checks(
+    request: Request, application_id: str
+):
+    redis = request.app.state.redis_store
+    cached = redis.get_application_context(application_id)
+    if cached and cached.get("vendor_checks") is not None:
+        return {
+            "application_id": application_id,
+            "vendor_checks":  cached.get("vendor_checks") or {},
+            "source":         "cache",
+        }
+    assembler = _context_assembler(request)
+    try:
+        ctx = await assembler.assemble(application_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {
+        "application_id": application_id,
+        "vendor_checks":  ctx.vendor_checks,
+        "source":         "database",
+    }
+
+
+@router.post(
+    "/application/{application_id}/run-vendor-checks",
+    dependencies=[Depends(verify_api_key)],
+)
+async def run_vendor_checks(request: Request, application_id: str):
+    """Demo path — generate synthetic vendor responses, run every
+    adapter, and re-assemble the context. Useful for end-to-end tests."""
+    from core.ingestion.adapters import vendor_synthetic
+
+    pg = request.app.state.postgres_store
+    redis = request.app.state.redis_store
+
+    app = await pg.get_application(application_id)
+    if not app:
+        raise HTTPException(status_code=404, detail="Application not found")
+    applicant_id = app["applicant_id"]
+
+    cached = redis.get_application_context(application_id) or {}
+    primary = (cached.get("primary") or {}) if cached else {}
+    property_block = cached.get("property") if cached else None
+    credit_score = primary.get("mid_score") or 720
+    front_dti = cached.get("front_end_dti") or 38.0
+    ltv = cached.get("ltv") or 80.0
+    flood_zone = (property_block or {}).get("flood_zone") or "X"
+    employer_name = "Acme Corp"
+    annual_salary = 96_000.0
+
+    # Build synthetic returns and route each through its adapter
+    submissions = [
+        {
+            "vendor_type": "aus",
+            "vendor":      "du",
+            "response":    {"xml_content": vendor_synthetic.generate_du_response(
+                credit_score=credit_score,
+                dti=front_dti,
+                ltv=ltv,
+                loan_type=app.get("loan_type") or "conventional",
+            )},
+        },
+        {
+            "vendor_type": "fraud",
+            "vendor":      "socure",
+            "response":    vendor_synthetic.generate_fraud_response(applicant_id, "low"),
+        },
+        {
+            "vendor_type": "voe",
+            "vendor":      "twn",
+            "response":    vendor_synthetic.generate_voe_response(
+                employer_name, annual_salary
+            ),
+        },
+        {
+            "vendor_type": "ssn",
+            "vendor":      "ssa",
+            "response":    vendor_synthetic.generate_ssn_response(verified=True),
+        },
+        {
+            "vendor_type": "ofac",
+            "vendor":      "ofac",
+            "response":    vendor_synthetic.generate_ofac_response(hit=False),
+        },
+        {
+            "vendor_type": "flood",
+            "vendor":      "fema",
+            "response":    vendor_synthetic.generate_flood_response(flood_zone),
+        },
+    ]
+
+    submitted = []
+    for sub in submissions:
+        body = {
+            **sub,
+            "application_id": application_id,
+            "applicant_id":   applicant_id,
+        }
+        try:
+            result = await ingest_vendor_return(request, body)
+            submitted.append({
+                "vendor_type":   sub["vendor_type"],
+                "document_type": result["document_type"],
+                "ingest_id":     result["ingest_id"],
+            })
+        except HTTPException as exc:
+            submitted.append({
+                "vendor_type": sub["vendor_type"],
+                "error":       exc.detail,
+            })
+
+    redis.invalidate_context(application_id)
+    ctx = await _context_assembler(request).assemble(application_id)
+    return {
+        "application_id": application_id,
+        "submitted":      submitted,
+        "vendor_checks":  ctx.vendor_checks,
+        "readiness":      ctx.readiness.model_dump(),
     }

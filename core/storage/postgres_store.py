@@ -351,6 +351,17 @@ class PostgresStore:
         )
         return [_row_to_dict(r) for r in rows]
 
+    async def get_documents_for_application(self, application_id: str) -> list:
+        rows = await db.fetch(
+            """
+            SELECT * FROM document_index
+            WHERE application_id = $1 AND is_current = TRUE
+            ORDER BY received_at DESC
+            """,
+            application_id,
+        )
+        return [_row_to_dict(r) for r in rows]
+
     async def get_all_applicants(self) -> list:
         """Return every applicant row. Used at app startup to hydrate
         the in-memory XRefStore so applicant_id sequence and SSN /

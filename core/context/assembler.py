@@ -269,15 +269,82 @@ class ContextAssembler:
         )
 
     async def _get_vendor_checks(self, application_id: str) -> dict:
-        """Phase D will populate these. For now return the structured
-        slot so callers see the shape they'll eventually get."""
+        """Read vendor returns from ``document_index``.
+
+        Phase D adapters land their parsed payload as a row in
+        ``document_index`` keyed by document_type. We re-hydrate the most
+        recent row of each type and surface a flat summary that
+        Decision OS can consume directly off ``ApplicationContext``.
+        """
+        from core.ingestion.adapters.vendor_aus_adapter import VendorAUSAdapter
+        from core.ingestion.adapters.vendor_fraud_adapter import VendorFraudAdapter
+
+        vendor_doc_types = {
+            "AUS_DU_FINDINGS",
+            "AUS_LP_FINDINGS",
+            "FRAUD_REPORT",
+            "SSN_VALIDATION",
+            "OFAC_REPORT",
+            "EMPLOYMENT_VERIFICATION",
+            "FLOOD_CERT",
+        }
+
+        try:
+            docs = await self.pg.get_documents_for_application(application_id)
+        except Exception as exc:
+            logger.warning("vendor_docs_fetch_failed", extra={"error": str(exc)})
+            docs = []
+
+        # Most-recent doc of each type wins (the list is ORDER BY received_at DESC).
+        vendor_docs: dict[str, dict] = {}
+        for d in docs:
+            dt = d.get("document_type")
+            if dt in vendor_doc_types and dt not in vendor_docs:
+                vendor_docs[dt] = d
+
+        def _fields(doc_type: str):
+            doc = vendor_docs.get(doc_type)
+            if not doc:
+                return None
+            fields = doc.get("extracted_fields") or {}
+            if isinstance(fields, str):
+                import json as _json
+                try:
+                    fields = _json.loads(fields)
+                except Exception:
+                    fields = {}
+            return fields
+
+        aus_du = _fields("AUS_DU_FINDINGS")
+        aus_lp = _fields("AUS_LP_FINDINGS")
+        fraud  = _fields("FRAUD_REPORT")
+        ssn    = _fields("SSN_VALIDATION")
+        ofac   = _fields("OFAC_REPORT")
+        voe    = _fields("EMPLOYMENT_VERIFICATION")
+        flood  = _fields("FLOOD_CERT")
+
+        aus_summary = None
+        if aus_du or aus_lp:
+            aus_payload = aus_du or aus_lp
+            aus_summary = {
+                "type":           "DU" if aus_du else "LP",
+                "recommendation": (aus_payload or {}).get("recommendation"),
+                "approved":       VendorAUSAdapter.is_approved(aus_payload or {}),
+                "casefile_id":    (aus_payload or {}).get("casefile_id"),
+            }
+
         return {
-            "aus_findings":        None,
-            "fraud_score":         None,
-            "flood_determination": None,
-            "employment_verified": None,
-            "ssn_valid":           None,
-            "ofac_clear":          None,
+            "aus_findings":          aus_summary,
+            "fraud_score":           (fraud or {}).get("fraud_score"),
+            "fraud_band":            (fraud or {}).get("risk_band"),
+            "fraud_requires_review": (
+                VendorFraudAdapter.requires_review(fraud) if fraud else None
+            ),
+            "flood_determination":   flood,
+            "employment_verified":   (voe or {}).get("employment_verified") if voe else None,
+            "employer_verified":     (voe or {}).get("employer_name") if voe else None,
+            "ssn_valid":             (ssn or {}).get("ssn_valid") if ssn else None,
+            "ofac_clear":            (ofac or {}).get("ofac_clear") if ofac else None,
         }
 
     def _calculate_readiness(
@@ -292,10 +359,21 @@ class ContextAssembler:
         missing: list[str] = []
         flags = ReadinessFlags()
 
-        flags.income_verified     = primary.income_verified
-        flags.credit_pulled       = primary.mid_score > 300
-        flags.identity_verified   = primary.identity_verified
-        flags.employment_verified = primary.employment_verified
+        flags.income_verified = primary.income_verified
+        flags.credit_pulled = primary.mid_score > 300
+        # Vendor-driven flags override the borrower-snapshot defaults when a
+        # real check has landed; absent a vendor return we fall back to the
+        # snapshot value (which is False until a real source verifies it).
+        ssn_valid = vendor_checks.get("ssn_valid")
+        emp_verified = vendor_checks.get("employment_verified")
+        flags.identity_verified = (
+            bool(ssn_valid) if ssn_valid is not None
+            else primary.identity_verified
+        )
+        flags.employment_verified = (
+            bool(emp_verified) if emp_verified is not None
+            else primary.employment_verified
+        )
 
         if not flags.income_verified:
             missing.append("income_verification")
@@ -322,17 +400,26 @@ class ContextAssembler:
 
         flags.dti_calculable = front_dti is not None
         flags.ltv_calculable = ltv is not None
+        aus = vendor_checks.get("aus_findings") or {}
         flags.aus_ready = (
             flags.income_verified
             and flags.credit_pulled
             and flags.appraisal_complete
             and flags.insurance_bound
+            and aus.get("approved", False)
         )
 
         if not flags.dti_calculable:
             missing.append("piti_calculation")
         if not flags.ltv_calculable:
             missing.append("appraised_value")
+
+        # Vendor-driven gating items
+        ofac_clear = vendor_checks.get("ofac_clear")
+        if ofac_clear is False:
+            missing.append("ofac_review_required")
+        if vendor_checks.get("fraud_requires_review"):
+            missing.append("fraud_review_required")
 
         flags.missing_items = missing
         return flags
