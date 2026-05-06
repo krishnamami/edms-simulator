@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: EDMS Simulator - Aurora Serverless v2 (Postgres 15) + RDS Proxy.
+Description: EDMS Simulator - RDS Postgres (single AZ, no proxy) for initial deploy.
 
 Parameters:
   EnvironmentName:
@@ -14,16 +14,16 @@ Parameters:
     Default: edms_admin
   DBSecretArn:
     Type: String
-    Description: ARN of edms/aurora/credentials secret in Secrets Manager
+    Description: ARN of secret in Secrets Manager (must contain a "password" key)
   DBSecurityGroupIngressCidr:
     Type: String
     Default: 10.0.0.0/16
 
 Resources:
-  AuroraSecurityGroup:
+  DBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Aurora Postgres ingress
+      GroupDescription: RDS Postgres ingress
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
@@ -32,98 +32,44 @@ Resources:
           CidrIp: !Ref DBSecurityGroupIngressCidr
       Tags:
         - Key: Name
-          Value: !Sub ${EnvironmentName}-aurora-sg
+          Value: !Sub ${EnvironmentName}-rds-sg
 
-  AuroraSubnetGroup:
+  DBSubnetGroup:
     Type: AWS::RDS::DBSubnetGroup
     Properties:
-      DBSubnetGroupDescription: Aurora subnet group
+      DBSubnetGroupDescription: RDS Postgres subnet group
       SubnetIds: !Ref PrivateSubnetIds
 
-  AuroraCluster:
-    Type: AWS::RDS::DBCluster
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
     DeletionPolicy: Snapshot
     UpdateReplacePolicy: Snapshot
     Properties:
-      Engine: aurora-postgresql
+      Engine: postgres
       EngineVersion: "15.8"
-      EngineMode: provisioned
-      DatabaseName: edms
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: "20"
+      DBName: edms
       MasterUsername: !Ref DBMasterUsername
-      ManageMasterUserPassword: true
-      DBSubnetGroupName: !Ref AuroraSubnetGroup
-      VpcSecurityGroupIds: [!Ref AuroraSecurityGroup]
-      ServerlessV2ScalingConfiguration:
-        MinCapacity: 0.5
-        MaxCapacity: 8
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBSecretArn}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DBSecurityGroup]
+      MultiAZ: false
+      PubliclyAccessible: false
       StorageEncrypted: true
       BackupRetentionPeriod: 7
       DeletionProtection: true
 
-  AuroraInstance:
-    Type: AWS::RDS::DBInstance
-    Properties:
-      Engine: aurora-postgresql
-      DBClusterIdentifier: !Ref AuroraCluster
-      DBInstanceClass: db.serverless
-      PubliclyAccessible: false
-
-  RDSProxy:
-    Type: AWS::RDS::DBProxy
-    Properties:
-      DBProxyName: !Sub ${EnvironmentName}-rds-proxy
-      EngineFamily: POSTGRESQL
-      Auth:
-        - AuthScheme: SECRETS
-          SecretArn: !Ref DBSecretArn
-          IAMAuth: DISABLED
-      RoleArn: !GetAtt RDSProxyRole.Arn
-      VpcSubnetIds: !Ref PrivateSubnetIds
-      VpcSecurityGroupIds: [!Ref AuroraSecurityGroup]
-      RequireTLS: true
-      IdleClientTimeout: 1800
-
-  RDSProxyTargetGroup:
-    Type: AWS::RDS::DBProxyTargetGroup
-    Properties:
-      DBProxyName: !Ref RDSProxy
-      TargetGroupName: default
-      DBClusterIdentifiers: [!Ref AuroraCluster]
-      ConnectionPoolConfigurationInfo:
-        MaxConnectionsPercent: 100
-        MaxIdleConnectionsPercent: 50
-        ConnectionBorrowTimeout: 120
-
-  RDSProxyRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: rds.amazonaws.com }
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: ReadDBSecret
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                  - secretsmanager:DescribeSecret
-                Resource: !Ref DBSecretArn
-
 Outputs:
-  AuroraEndpoint:
-    Value: !GetAtt AuroraCluster.Endpoint.Address
+  DBEndpoint:
+    Value: !GetAtt RDSInstance.Endpoint.Address
     Export:
-      Name: !Sub ${EnvironmentName}-aurora-endpoint
-  RDSProxyEndpoint:
-    Value: !GetAtt RDSProxy.Endpoint
+      Name: !Sub ${EnvironmentName}-db-endpoint
+  DBPort:
+    Value: !GetAtt RDSInstance.Endpoint.Port
     Export:
-      Name: !Sub ${EnvironmentName}-rds-proxy-endpoint
-  AuroraSecurityGroupId:
-    Value: !Ref AuroraSecurityGroup
+      Name: !Sub ${EnvironmentName}-db-port
+  DBSecretArn:
+    Value: !Ref DBSecretArn
     Export:
-      Name: !Sub ${EnvironmentName}-aurora-sg
+      Name: !Sub ${EnvironmentName}-db-secret-arn
