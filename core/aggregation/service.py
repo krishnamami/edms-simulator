@@ -290,6 +290,68 @@ class AggregationService:
         if co_credit:
             self.redis_store.set_credit_profile(co_applicant_id, co_credit)
 
+        # Persist documents into document_index, then reconcile each one
+        # against existing docs for the same applicant. The reconciler writes
+        # typed graph edges (confirms / corroborates / contradicts).
+        await self._persist_and_reconcile_documents(
+            documents=documents,
+            applicant_id=applicant_id,
+            co_applicant_id=co_applicant_id,
+            application_id=application_id,
+        )
+
+    async def _persist_and_reconcile_documents(
+        self,
+        documents: list,
+        applicant_id: str,
+        co_applicant_id: Optional[str],
+        application_id: str,
+    ):
+        if not documents:
+            return
+        from core.graph.reconciler import DocumentReconciler
+
+        reconciler = DocumentReconciler(self.postgres_store)
+        for d in documents:
+            role = d.get("borrower_role", "primary")
+            doc_applicant = (
+                co_applicant_id if (role == "co_borrower" and co_applicant_id) else applicant_id
+            )
+            saved_doc = {
+                "document_id":       d.get("document_id"),
+                "applicant_id":      doc_applicant,
+                "application_id":    application_id,
+                "document_type":     d.get("document_type", "UNKNOWN"),
+                "document_category": d.get("document_category", "income"),
+                "borrower_role":     role,
+                "s3_key":            d.get("s3_key"),
+                "status":            d.get("status", "received"),
+                "is_current":        True,
+                # Treat the incoming doc payload itself as extracted_fields —
+                # it carries box1_wages / employer_name / etc. at top level.
+                "extracted_fields":  d,
+                "confidence_score":  d.get("confidence_score", 0.95),
+            }
+            try:
+                await self.postgres_store.save_document(saved_doc)
+            except Exception as exc:
+                logger.warning("save_document_failed", extra={"error": str(exc)})
+                continue
+            try:
+                new_rels = await reconciler.reconcile(doc_applicant, saved_doc)
+            except Exception as exc:
+                logger.warning("reconciler_failed", extra={"error": str(exc)})
+                continue
+            conflicts = [r for r in new_rels if r.relationship_type.value == "contradicts"]
+            if conflicts:
+                logger.warning(
+                    "document_graph_conflict",
+                    applicant_id=doc_applicant,
+                    conflict_count=len(conflicts),
+                    conflicts=[r.reasoning for r in conflicts],
+                )
+                self.redis_store.invalidate_income_profile(doc_applicant)
+
     def _publish(self, event_data: dict):
         # Convert enum to value for JSON-friendliness in tests/event sinks.
         if isinstance(event_data.get("event_type"), EventType):

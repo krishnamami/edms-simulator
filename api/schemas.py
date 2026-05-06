@@ -39,6 +39,9 @@ class DocumentSchema(BaseModel):
     expenses_annual: Optional[float] = None
     account_type: Optional[str] = None
     balance: Optional[float] = None
+    amount: Optional[float] = None
+    payer_name: Optional[str] = None
+    tax_year: Optional[int] = None
 
 
 class CreateLoanRequest(BaseModel):

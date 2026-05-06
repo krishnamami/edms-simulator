@@ -50,6 +50,7 @@ class RedisStore:
     TTL_CREDIT_PROFILE = 14400   # 4 hours
     TTL_GOLDEN_STATUS = 86400    # 24 hours
     TTL_APP_LOOKUP = 43200       # 12 hours
+    TTL_GRAPH_SUMMARY = 3600     # 1 hour
 
     def __init__(self, client=None):
         self._r = client or get_redis()
@@ -134,3 +135,33 @@ class RedisStore:
             return bool(self._r.ping())
         except Exception:
             return False
+
+    # ---------------- document knowledge graph -----------------
+
+    def invalidate_income_profile(self, applicant_id: str) -> None:
+        """Drop income + graph caches for an applicant — call after a
+        reconciler conflict so the next read recomputes."""
+        try:
+            self._r.delete(f"income:{applicant_id}")
+            self._r.delete(f"graph:{applicant_id}")
+        except Exception as e:
+            logger.warning("redis_invalidate_failed", extra={"error": str(e)})
+
+    def set_graph_summary(self, applicant_id: str, summary: dict) -> bool:
+        try:
+            self._r.setex(
+                f"graph:{applicant_id}",
+                self.TTL_GRAPH_SUMMARY,
+                json.dumps(summary, default=str),
+            )
+            return True
+        except Exception as e:
+            logger.warning("redis_set_graph_failed", extra={"error": str(e)})
+            return False
+
+    def get_graph_summary(self, applicant_id: str) -> Optional[dict]:
+        try:
+            raw = self._r.get(f"graph:{applicant_id}")
+            return json.loads(raw) if raw else None
+        except Exception:
+            return None

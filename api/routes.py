@@ -23,6 +23,8 @@ from core.aggregation.events import (
     DocumentUploadedEvent,
     EventType,
 )
+from core.graph.navigator import DocumentNavigator
+from core.graph.reconciler import DocumentReconciler
 from core.ingestion._claude_client import ClaudeUnavailable
 from core.ingestion.adapters import (
     chat_adapter,
@@ -299,3 +301,86 @@ async def ingest_xml(file: UploadFile = File(...)):
     body = await file.read()
     event = xml_adapter.adapt(body)
     return event.model_dump()
+
+
+# ---------------------------------------------------------------------------
+# Document knowledge graph
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/applicant/{applicant_id}/graph/summary",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_graph_summary(request: Request, applicant_id: str):
+    redis = request.app.state.redis_store
+    cached = redis.get_graph_summary(applicant_id)
+    if cached:
+        return {"source": "cache", "data": cached}
+    pg = request.app.state.postgres_store
+    summary = await pg.get_graph_summary(applicant_id)
+    redis.set_graph_summary(applicant_id, summary)
+    return {"source": "database", "data": summary}
+
+
+@router.get(
+    "/applicant/{applicant_id}/graph",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_knowledge_graph(request: Request, applicant_id: str):
+    pg = request.app.state.postgres_store
+    navigator = DocumentNavigator(pg)
+    graph = await navigator.build_graph(applicant_id)
+    return graph.model_dump()
+
+
+@router.get(
+    "/applicant/{applicant_id}/conflicts",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_conflicts(request: Request, applicant_id: str):
+    pg = request.app.state.postgres_store
+    conflicts = await pg.get_conflicts_for_applicant(applicant_id)
+    return {
+        "applicant_id": applicant_id,
+        "conflict_count": len(conflicts),
+        "conflicts": conflicts,
+    }
+
+
+@router.post(
+    "/applicant/{applicant_id}/navigate",
+    dependencies=[Depends(verify_api_key)],
+)
+async def navigate(request: Request, applicant_id: str, body: dict):
+    question = body.get("question", "")
+    if not question:
+        raise HTTPException(status_code=400, detail="question field required")
+    pg = request.app.state.postgres_store
+    redis = request.app.state.redis_store
+    navigator = DocumentNavigator(pg, redis)
+    answer = await navigator.answer(applicant_id, question)
+    return answer.model_dump()
+
+
+@router.post(
+    "/applicant/{applicant_id}/reconcile",
+    dependencies=[Depends(verify_api_key)],
+)
+async def reconcile_applicant(request: Request, applicant_id: str):
+    pg = request.app.state.postgres_store
+    docs = await pg.get_documents_for_applicant(applicant_id)
+    reconciler = DocumentReconciler(pg)
+    total_rels = 0
+    total_conflicts = 0
+    for doc in docs:
+        rels = await reconciler.reconcile(applicant_id, doc)
+        total_rels += len(rels)
+        total_conflicts += sum(
+            1 for r in rels if r.relationship_type.value == "contradicts"
+        )
+    return {
+        "applicant_id": applicant_id,
+        "relationships_created": total_rels,
+        "conflicts_found": total_conflicts,
+    }

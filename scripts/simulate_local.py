@@ -594,3 +594,118 @@ print(f"""
     annual_income  {len(annual_income_sources)} source(s) compared
     employer       {len(employer_sources)} source(s) compared
 """)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7 — Document graph + agentic navigation
+# ─────────────────────────────────────────────────────────────────────────────
+step(7, "Document graph + agentic navigation (reconciler + navigator)")
+
+
+def _graph_summary(label: str):
+    r = httpx.get(
+        f"{API_URL}/applicant/{applicant_id}/graph/summary",
+        headers=HEADERS_AUTH, timeout=10,
+    )
+    r.raise_for_status()
+    body = r.json()
+    d = body["data"]
+    info(
+        f"{label:<28} docs={d['document_count']}  "
+        f"rels={d['relationship_count']}  "
+        f"confirms={d['confirmation_count']}  "
+        f"conflicts={d['conflict_count']}  "
+        f"requires_review={d['requires_review']}  "
+        f"(source={body['source']})"
+    )
+    return d
+
+
+# 7a/c — graph summary reflecting STEP 4's docs (already saved + reconciled)
+print(f"\n  {CYAN}Graph state from STEP 4 ingest:{RESET}")
+summary_after_step4 = _graph_summary("AFTER STEP 4")
+
+if summary_after_step4["document_count"] >= 2:
+    ok("Reconciler ran during STEP 4 — docs persisted, edges written")
+else:
+    warn("STEP 4 docs may not have persisted as expected")
+
+# 7e — ask the navigator
+print(f"\n  {CYAN}POST /applicant/{applicant_id}/navigate (clean state):{RESET}")
+r = httpx.post(
+    f"{API_URL}/applicant/{applicant_id}/navigate",
+    headers=HEADERS_JSON,
+    json={"question": "What is the qualifying annual income?"},
+    timeout=60,
+)
+r.raise_for_status()
+ans = r.json()
+show_json("Navigator answer (clean)", ans, max_lines=30)
+ok(
+    f"answer.confidence={ans['confidence']:.2f}  "
+    f"citations={len(ans['citations'])}  "
+    f"requires_review={ans['requires_review']}"
+)
+
+# 7f — inject a contradicting 1099 via /loans/document
+print(f"\n  {CYAN}Injecting contradicting 1099 (amount $45,000 vs W2 $92,400):{RESET}")
+conflict_payload = {
+    "applicant_id":   applicant_id,
+    "application_id": application_id,
+    "all_documents": [
+        # Re-include the W2 so it's in scope for the reconciler comparison
+        {
+            "document_id":   "DOC-W2-001",
+            "document_type": "W2_CURRENT",
+            "borrower_role": "primary",
+            "box1_wages":    int(PRIMARY_INCOME),
+            "employer_name": PRIMARY_EMPLOYER,
+        },
+        # New conflicting 1099
+        {
+            "document_id":   "DOC-1099-CONFLICT",
+            "document_type": "1099_NEC",
+            "borrower_role": "primary",
+            "amount":        45000.0,
+            "payer_name":    "Sketchy Consulting LLC",
+        },
+    ],
+}
+r = httpx.post(
+    f"{API_URL}/loans/document",
+    json=conflict_payload, headers=HEADERS_JSON, timeout=30,
+)
+r.raise_for_status()
+time.sleep(1)  # let async writes flush
+
+print(f"\n  {CYAN}GET /applicant/{applicant_id}/conflicts:{RESET}")
+r = httpx.get(
+    f"{API_URL}/applicant/{applicant_id}/conflicts",
+    headers=HEADERS_AUTH, timeout=10,
+)
+r.raise_for_status()
+conflicts_resp = r.json()
+n_conflicts = conflicts_resp["conflict_count"]
+if n_conflicts >= 1:
+    ok(f"Reconciler detected {n_conflicts} CONTRADICTS edge(s)")
+    for c in conflicts_resp["conflicts"][:3]:
+        info(f"  {c.get('field_name')}: {c.get('source_value')} ↔ {c.get('target_value')} (delta {c.get('delta_pct')}%)")
+else:
+    warn("Expected at least 1 contradicts edge — check reconciler config for 1099_NEC pair")
+
+print(f"\n  {CYAN}POST /applicant/{applicant_id}/navigate (with conflict):{RESET}")
+r = httpx.post(
+    f"{API_URL}/applicant/{applicant_id}/navigate",
+    headers=HEADERS_JSON,
+    json={"question": "What is the qualifying annual income?"},
+    timeout=60,
+)
+r.raise_for_status()
+ans2 = r.json()
+if ans2.get("requires_review"):
+    ok(f"Navigator now flags requires_review=True with {len(ans2['conflicts_found'])} conflict(s)")
+else:
+    warn(f"Navigator did not flag the conflict — answer={ans2}")
+
+_graph_summary("AFTER conflict injection")
+

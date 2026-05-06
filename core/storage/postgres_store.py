@@ -34,14 +34,22 @@ def _to_jsonb(value):
 def _row_to_dict(row) -> Optional[dict]:
     if row is None:
         return None
+    import uuid as _uuid
     out = dict(row)
     for k, v in list(out.items()):
+        # asyncpg returns UUID columns as uuid.UUID — coerce to str so
+        # downstream Pydantic models with str fields don't reject them.
+        if isinstance(v, _uuid.UUID):
+            out[k] = str(v)
+            continue
         if isinstance(v, str) and k in (
             "address_current",
             "identity_xrefs",
             "application_ids",
             "profile_data",
             "extracted_fields",
+            "source_value",
+            "target_value",
         ):
             try:
                 out[k] = json.loads(v)
@@ -311,3 +319,65 @@ class PostgresStore:
             applicant_id,
         )
         return [_row_to_dict(r) for r in rows]
+
+    # ---------------- document knowledge graph -----------------
+
+    async def save_relationship(self, rel: dict) -> None:
+        await db.execute(
+            """
+            INSERT INTO document_relationships (
+                relationship_id, applicant_id, source_doc_id, target_doc_id,
+                relationship_type, field_name, source_value, target_value,
+                delta_pct, confidence, reasoning, created_by
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12)
+            ON CONFLICT (relationship_id) DO NOTHING
+            """,
+            rel["relationship_id"],
+            rel["applicant_id"],
+            rel["source_doc_id"],
+            rel["target_doc_id"],
+            rel["relationship_type"],
+            rel.get("field_name"),
+            json.dumps(rel.get("source_value"), default=str),
+            json.dumps(rel.get("target_value"), default=str),
+            rel.get("delta_pct"),
+            rel["confidence"],
+            rel.get("reasoning", ""),
+            rel.get("created_by", "reconciler"),
+        )
+
+    async def get_relationships_for_applicant(self, applicant_id: str) -> list:
+        rows = await db.fetch(
+            """
+            SELECT * FROM document_relationships
+            WHERE applicant_id = $1
+            ORDER BY created_at DESC
+            """,
+            applicant_id,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_conflicts_for_applicant(self, applicant_id: str) -> list:
+        rows = await db.fetch(
+            """
+            SELECT * FROM document_relationships
+            WHERE applicant_id = $1 AND relationship_type = 'contradicts'
+            ORDER BY confidence DESC
+            """,
+            applicant_id,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_graph_summary(self, applicant_id: str) -> dict:
+        docs = await self.get_documents_for_applicant(applicant_id)
+        rels = await self.get_relationships_for_applicant(applicant_id)
+        conflicts = [r for r in rels if r["relationship_type"] == "contradicts"]
+        confirms  = [r for r in rels if r["relationship_type"] == "confirms"]
+        return {
+            "applicant_id":       applicant_id,
+            "document_count":     len(docs),
+            "relationship_count": len(rels),
+            "confirmation_count": len(confirms),
+            "conflict_count":     len(conflicts),
+            "requires_review":    len(conflicts) > 0,
+        }

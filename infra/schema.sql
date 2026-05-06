@@ -90,3 +90,53 @@ CREATE TABLE IF NOT EXISTS document_index (
 );
 CREATE INDEX IF NOT EXISTS idx_doc_applicant ON document_index(applicant_id)
     WHERE is_current=TRUE;
+
+-- Document knowledge graph
+CREATE TABLE IF NOT EXISTS document_relationships (
+    relationship_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    applicant_id      VARCHAR NOT NULL REFERENCES applicants(applicant_id),
+    source_doc_id     VARCHAR NOT NULL REFERENCES document_index(document_id),
+    target_doc_id     VARCHAR NOT NULL REFERENCES document_index(document_id),
+    relationship_type VARCHAR NOT NULL
+                      CHECK (relationship_type IN (
+                        'confirms','contradicts','supersedes',
+                        'references','corroborates'
+                      )),
+    field_name        VARCHAR,
+    source_value      JSONB,
+    target_value      JSONB,
+    delta_pct         FLOAT,
+    confidence        FLOAT NOT NULL,
+    reasoning         TEXT,
+    created_by        VARCHAR NOT NULL DEFAULT 'reconciler',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_rel_applicant
+    ON document_relationships(applicant_id);
+CREATE INDEX IF NOT EXISTS idx_rel_type
+    ON document_relationships(relationship_type, applicant_id);
+CREATE INDEX IF NOT EXISTS idx_rel_source
+    ON document_relationships(source_doc_id);
+CREATE INDEX IF NOT EXISTS idx_rel_target
+    ON document_relationships(target_doc_id);
+
+CREATE OR REPLACE VIEW document_graph AS
+SELECT
+    r.applicant_id,
+    r.relationship_id,
+    r.relationship_type,
+    r.field_name,
+    r.source_value,
+    r.target_value,
+    r.delta_pct,
+    r.confidence,
+    r.reasoning,
+    s.document_type     AS source_type,
+    s.document_category AS source_category,
+    t.document_type     AS target_type,
+    t.document_category AS target_category,
+    r.created_at
+FROM document_relationships r
+JOIN document_index s ON r.source_doc_id = s.document_id
+JOIN document_index t ON r.target_doc_id = t.document_id;

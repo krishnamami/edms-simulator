@@ -29,6 +29,7 @@ class FakePostgresStore:
         self.credit_profiles: dict = {}
         self.documents: list = []
         self.xrefs: list = []
+        self.relationships: list = []
 
     async def save_golden_record(self, gr): pass
     async def find_by_applicant_id(self, applicant_id): return None
@@ -71,6 +72,34 @@ class FakePostgresStore:
 
     async def get_documents_for_applicant(self, applicant_id):
         return [d for d in self.documents if d["applicant_id"] == applicant_id]
+
+    # graph methods
+    async def save_relationship(self, rel):
+        self.relationships.append(rel)
+
+    async def get_relationships_for_applicant(self, applicant_id):
+        return [r for r in self.relationships if r["applicant_id"] == applicant_id]
+
+    async def get_conflicts_for_applicant(self, applicant_id):
+        return [
+            r for r in self.relationships
+            if r["applicant_id"] == applicant_id
+            and r["relationship_type"] == "contradicts"
+        ]
+
+    async def get_graph_summary(self, applicant_id):
+        docs = await self.get_documents_for_applicant(applicant_id)
+        rels = await self.get_relationships_for_applicant(applicant_id)
+        conflicts = [r for r in rels if r["relationship_type"] == "contradicts"]
+        confirms  = [r for r in rels if r["relationship_type"] == "confirms"]
+        return {
+            "applicant_id":       applicant_id,
+            "document_count":     len(docs),
+            "relationship_count": len(rels),
+            "confirmation_count": len(confirms),
+            "conflict_count":     len(conflicts),
+            "requires_review":    len(conflicts) > 0,
+        }
 
 
 @pytest.fixture
