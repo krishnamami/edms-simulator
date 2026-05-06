@@ -29,9 +29,14 @@ SCHEMA_FILE = Path(__file__).resolve().parents[1] / "infra" / "schema.sql"
 
 
 def split_statements(sql: str) -> list[str]:
-    """Naive ;-split — fine for our schema (no PL/pgSQL bodies, no embedded
-    semicolons). Trim whitespace, drop empty fragments."""
-    return [s.strip() for s in sql.split(";") if s.strip()]
+    """Strip ``--`` line comments first (they may legally contain ``;``),
+    then split on ``;``. Still naive about PL/pgSQL bodies, but our
+    schema doesn't have any."""
+    import re
+
+    # Drop line comments. Each `--` runs to end-of-line.
+    cleaned = re.sub(r"--[^\n]*", "", sql)
+    return [s.strip() for s in cleaned.split(";") if s.strip()]
 
 
 async def apply() -> int:

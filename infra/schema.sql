@@ -216,10 +216,10 @@ CREATE TABLE IF NOT EXISTS los_connectors (
 CREATE TABLE IF NOT EXISTS raw_ingestion (
     ingest_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     -- applicant_id / application_id are intentionally NOT foreign keys.
-    -- Phase A's premise is that raw payloads can arrive BEFORE the
-    -- applicant or application exists in the system; the audit row should
-    -- never be blocked by a missing parent. document_id IS a FK because
-    -- it's only set post-extraction, when the row exists.
+    -- Phase A premise is that raw payloads can arrive BEFORE the
+    -- applicant or application exists in the system, so the audit row
+    -- should never be blocked by a missing parent. document_id IS a FK
+    -- because it is only set post-extraction, when the row exists.
     applicant_id      VARCHAR,
     application_id    VARCHAR,
     source_channel    VARCHAR NOT NULL,
