@@ -11,8 +11,16 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Optional
 
+from core.identity.golden_record import GoldenRecord
 from core.ingestion.confidence import SOURCE_CONFIDENCE_RANKING
 from core.ingestion.mismo import MISMOMapper
+
+
+def _hash_or_empty(ssn: str) -> str:
+    """Hash a full SSN if present; empty string otherwise. Empty strings
+    on multiple rows trigger ``idx_applicant_ssn`` UNIQUE violation, so
+    every connector that has the full SSN MUST populate ``ssn_hash``."""
+    return GoldenRecord.hash_ssn(ssn) if ssn else ""
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +180,7 @@ class EncompassConnector(LOSConnector):
             "first_name": b.get("firstName") or b.get("FirstName", ""),
             "last_name":  b.get("lastName") or b.get("LastName", ""),
             "dob":        b.get("birthDate") or b.get("BirthDate", ""),
+            "ssn_hash":   _hash_or_empty(ssn),
             "ssn_last4":  ssn[-4:] if ssn else "",
             "email":      b.get("emailAddressText") or b.get("email", ""),
         }
@@ -185,6 +194,7 @@ class EncompassConnector(LOSConnector):
             "first_name": cb.get("firstName", ""),
             "last_name":  cb.get("lastName", ""),
             "dob":        cb.get("birthDate", ""),
+            "ssn_hash":   _hash_or_empty(ssn),
             "ssn_last4":  ssn[-4:] if ssn else "",
         }
 
@@ -242,6 +252,7 @@ class GenericMISMOConnector(LOSConnector):
             "first_name": n.get("FirstName", ""),
             "last_name":  n.get("LastName", ""),
             "dob":        b.get("BirthDate", ""),
+            "ssn_hash":   _hash_or_empty(ssn),
             "ssn_last4":  ssn[-4:] if ssn else "",
         }
 

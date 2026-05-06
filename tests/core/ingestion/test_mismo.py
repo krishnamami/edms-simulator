@@ -139,5 +139,41 @@ def test_translate_loan_returns_external_ids():
     assert result["external_ids"] == {"encompass": "ENH-2024-98765"}
     assert result["borrower"]["first_name"] == "James"
     assert result["borrower"]["ssn_last4"] == "6789"
+    # ssn_hash MUST be populated whenever the full SSN is present, otherwise
+    # multiple "" hashes collide on idx_applicant_ssn UNIQUE constraint.
+    assert result["borrower"]["ssn_hash"], "ssn_hash must be a non-empty digest"
+    assert len(result["borrower"]["ssn_hash"]) == 64  # sha256 hex
     assert result["loan"]["loan_amount"] == 385000
     assert result["loan"]["interest_rate"] == 7.125
+
+
+def test_translate_loan_distinct_ssns_produce_distinct_hashes():
+    """Two different SSNs must produce different ssn_hash values."""
+    connector = get_connector("encompass")
+    def _payload(ssn):
+        return {
+            "loanNumber": f"L-{ssn[-4:]}",
+            "borrower": {
+                "firstName": "A", "lastName": "B", "birthDate": "1980-01-01",
+                "taxIdentificationIdentifier": ssn,
+            },
+            "loanInformation": {"loanAmount": 1, "loanType": "conventional", "loanPurpose": "purchase"},
+        }
+    a = connector.translate_loan(_payload("111223333"))
+    b = connector.translate_loan(_payload("999887766"))
+    assert a["borrower"]["ssn_hash"] != b["borrower"]["ssn_hash"]
+    assert a["borrower"]["ssn_hash"] and b["borrower"]["ssn_hash"]
+
+
+def test_translate_loan_no_ssn_leaves_hash_empty():
+    """No SSN -> empty hash. (DB unique constraint still bites if
+    multiple such rows arrive, but the behaviour is explicit.)"""
+    connector = get_connector("encompass")
+    payload = {
+        "loanNumber": "L-NOSSN",
+        "borrower": {"firstName": "A", "lastName": "B", "birthDate": "1980-01-01"},
+        "loanInformation": {"loanAmount": 1, "loanType": "conventional", "loanPurpose": "purchase"},
+    }
+    result = connector.translate_loan(payload)
+    assert result["borrower"]["ssn_hash"] == ""
+    assert result["borrower"]["ssn_last4"] == ""
