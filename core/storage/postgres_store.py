@@ -658,8 +658,11 @@ class PostgresStore:
                 $9::date, $10, $11::jsonb, $12
             )
             ON CONFLICT (document_id) DO UPDATE SET
+                applicant_id      = EXCLUDED.applicant_id,
+                application_id    = EXCLUDED.application_id,
                 document_type     = EXCLUDED.document_type,
                 document_category = EXCLUDED.document_category,
+                borrower_role     = EXCLUDED.borrower_role,
                 s3_key            = EXCLUDED.s3_key,
                 status            = EXCLUDED.status,
                 expiry_date       = EXCLUDED.expiry_date,
