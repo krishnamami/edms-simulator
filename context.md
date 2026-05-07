@@ -54,6 +54,16 @@ Redis port is **6380**.
 Latest commits (top of `main`):
 
 ```
+a6370f4  feat(index): comprehensive indexing + 25-pair graph + Encompass field mapping
+91c1964  fix(persist,context): one profile row per applicant; resilient context invalidation
+6b7c148  fix(api): DocumentSchema strips credit/appraisal fields at the boundary
+5fe623f  fix(persist): un-nest extracted_fields on save; indexer no longer clobbers
+db1b6c9  fix(credit): always read CREDIT_REPORT fields from extracted_fields
+d0315f8  fix(credit,graph): credit reads CREDIT_REPORT; reconciler emits cross-borrower edges
+ba35850  fix(credit,context): prefer real CREDIT_REPORT docs + bust context cache
+bf0444c  feat(admin): ship /admin/table-count cache-bypass probe
+7e5efe4  fix(smoke): add FakePG methods that _handle_document_uploaded now requires
+47aa0bf  docs: refresh context.md with doc-upload path fixes
 3c631b7  fix(storage): allow document_index upserts to re-attribute applicant/role
 07a5bd2  fix(aggregation): hydrate co_applicant_id + cumulative docs on doc upload
 736bf97  fix(aggregation): bust graph cache on every doc save + demo cache-bypass probes
@@ -350,6 +360,24 @@ Errors:
 - ✅ **Phase A schema applied to RDS prod**. `raw_ingestion` table + 4 indexes
   live; verified via `scripts/watch_pipeline.py --live`.
 
+### Resolved this session (comprehensive indexing + 25-pair graph + Encompass mapping)
+
+Commit `a6370f4`. Builds a complete attribute index for every meaningful mortgage doc type, expands the document graph to 25+ comparison pairs across income/employment/property/credit/asset/vendor layers, and adds a per-LOS field-ID translation layer.
+
+- ✅ **Schema GIN index + partial indexes** — `idx_doc_extracted_fields_gin` enables `WHERE extracted_fields @> '{"mid_score": 723}'` lookups; partial indexes by doc_type / category / status / received_at; mirror indexes on `document_relationships` (applicant+type, field_name, conflicts, confirms). Wrapped `CREATE INDEX IF NOT EXISTS` so re-applying schema is idempotent.
+- ✅ **MISMO + Encompass dictionaries extended** — `MISMO_TO_INTERNAL` gains 21 entries (TaxReturnPriorYear, RetirementAwardLetter, LeaveAndEarningsStatement, VOE family, StudentLoanStatement, DivorceDecree/ChildSupportOrder, ITINLetter, FORM_1004MC, AVM_REPORT, WindHailInsurance, WDOReport, WellSepticInspection, LoanEstimate, ClosingDisclosure, BankruptcySearch/JudgmentLienSearch/UndisclosedDebtMonitoring, HOIVerification). New `MISMO_ALIASES` dict (RentalAgreement, WorkNumberReport, DivorceDegree, PermanentResidentCard, IdentityVerificationReport, PropertyTaxTranscript) for many-to-one synonyms — keeps `INTERNAL_TO_MISMO` strict 1:1 round-trip while still resolving common variants. `ENCOMPASS_TO_INTERNAL` gains 30+ Encompass labels. `_CATEGORY_MAP` extended for VOE / military / asset-retirement / asset-brokerage / property-1004MC/AVM/well-septic / compliance prefixes.
+- ✅ **`COMPARISON_MAP` rewritten with 25 pairs** — W2↔IRS (mid_score-tight), W2↔paystub (annualised YTD), W2↔1040, W2↔bank, schedule C/E↔1040, cross-borrower W2 (joint applications), VOE↔W2 + paystub, appraisal↔purchase / AVM / property tax (looser), HOI binder↔declarations, flood cert↔insurance, credit↔bank (undisclosed debt), credit supplement↔report, divorce↔credit, gift↔bank, AUS↔W2, fraud↔identity. Same-type same-applicant pairs are explicit empty-list skips.
+- ✅ **`FIELD_CONFLICT_THRESHOLDS`** — per-`(type_a, type_b, field)` overrides for tight (wages/IRS = 5%, agi = 2%, HOI premiums = 5%) and loose (appraisal vs tax assessment = 40%, AVM = 15%) tolerance. `_make_relationship` looks the override up; falls back to `NUMERIC_CONFLICT_THRESHOLD` (10%) when no specific entry.
+- ✅ **`_normalise_value` + `_annualize_ytd` helpers** — handles `"$92,400.00"`, `"92,400"`, `92400`, `"92000-95000"` (midpoint), bool/None safely. `_annualize_ytd(ytd_gross, pay_period_end)` derives annualised wages from a paystub's day-of-year fraction; falls back to 3× when no date. `_extract_compare_value` resolves the `annualized_ytd` logical field — uses caller-supplied value if present, otherwise derives.
+- ✅ **`PostgresStore` attribute-query helpers** — `get_field_value` (highest-priority single field for a doc type), `get_all_field_values` (every occurrence across doc types), `get_documents_by_category`, `find_documents_with_field` (uses GIN containment when value provided), `get_highest_confidence_field` (sorts by `SOURCE_CONFIDENCE_RANKING` × per-row confidence).
+- ✅ **3 new API endpoints** — `GET /applicant/{id}/field/{name}` returns best_value + all_sources + has_conflict + max_delta_pct; `GET /applicant/{id}/documents/{category}`; `GET /application/{id}/graph/full` (primary + co + conflict_summary).
+- ✅ **`core/ingestion/encompass_fields.py` (new)** — full Encompass field-ID map (URLA.*, W2.*, 4868.*, 1004.*, NEWHUD.*, CASASRN, LPKEY, CX.*) → internal field names. `DOC_TYPE_FIELD_IDS` filters to relevant fields per doc type so DTI fields don't end up indexed under a W2. `ENCOMPASS_FIELD_CONFIDENCE` attaches higher confidence (0.95–0.99) to structured Encompass data than the PDF baseline (0.94 W2). Includes BytePro Cloud and OpenClose starter maps.
+- ✅ **`EncompassConnector` uses the new mapper** — `_extract_fields` runs the payload through `EncompassFieldMapper`, auto-detects internal doc type from field IDs when the LOS-supplied label is unrecognised, falls back to the raw payload only when no Encompass IDs match. `_base_confidence` overridden via `ENCOMPASS_FIELD_CONFIDENCE`.
+- ✅ **`scripts/demo_loan.py` field probes** — after each W2/credit/appraisal drop, hits `/applicant/{id}/field/{box1_wages|mid_score|appraised_value}` and prints the indexed value inline.
+- ✅ **29 new tests** — `tests/core/ingestion/test_encompass_fields.py` (13 cases: W2/credit/appraisal translation, irrelevant-fields filtering, numeric coercion, doc-type detection, explicit-label override, empty-value skip, no-doc-type-passes-everything path, confidence sanity); `tests/core/graph/test_reconciler_extended.py` (16 cases: W2/IRS confirms + contradicts under tight 5% threshold, paystub annualisation, currency normalisation, appraisal value-gap detection, IRS/1040 agi 2% threshold, COMPARISON_MAP 25-pair coverage assertion, FIELD_CONFLICT_THRESHOLDS sanity).
+
+Test count: **271 unit (+29 vs prior session's 242) + 3 integration + 8 smoke = 282 green.** No existing test rewritten or relaxed.
+
 ### Resolved this session (doc-upload path)
 
 Three latent bugs in the `POST /loans/document` (alias of `/documents/upload`) path, surfaced by `scripts/demo_loan.py --live` reporting `income_verified=false`, `qualifying_monthly=$0`, and `document_count=0` despite four PDFs in S3.
@@ -466,25 +494,20 @@ The local docker-compose has every phase applied. Production ECS still runs Phas
     T-29min and an event-driven invalidation didn't fire (e.g. a back-end
     process inserted into `document_index` directly), the dashboard shows
     stale numbers until TTL elapses. Hit `POST /refresh-context` to force.
-12. **`/admin/table-count/{table}` returns 500 in prod** — the route at
-    `routes.py:2185` calls `pg.get_table_count(table_name)` but the helper
-    lives uncommitted on the working tree. Commit + push to unblock the
-    cache-bypass probes that `scripts/demo_loan.py` prints after every step.
-    Schema is trivial:
-    ```python
-    async def get_table_count(self, table_name: str) -> int:
-        # Caller must whitelist; SQL identifier interpolated unquoted.
-        val = await db.fetchval(f"SELECT COUNT(*) FROM {table_name}")
-        return int(val or 0)
-    ```
-13. **Document reconciler produces 0 edges across 4 docs.** Two W2s sharing
-    `tax_year=2023`, `borrower_role` semantics, and overlapping fields ought
-    to at least CONFIRM. After the doc-upload path fix, `extracted_fields`
-    are flat at the top level — but `core/graph/reconciler.py` still produces
-    empty `relationships` / `confirmations` / `conflicts` arrays. Most likely
-    the field-pair selection logic in the reconciler doesn't match what's
-    on the row shape today. Verify by reading the reconciler against the
-    current shape of `_persist_and_reconcile_documents`'s `saved_doc`.
+12. ~~`/admin/table-count/{table}` returns 500 in prod~~ — **resolved in
+    `bf0444c`**. The route, the `_ADMIN_ALLOWED_TABLES` whitelist, the
+    `PostgresStore.get_table_count` helper, and the `FakePostgresStore`
+    mirror were all sitting uncommitted from a prior session. Three
+    coordinated hunks shipped together. `scripts/demo_loan.py`'s cache-
+    bypass probes now read real Postgres counts after each step.
+13. ~~Document reconciler produces 0 edges across 4 docs.~~ — **resolved
+    in `d0315f8` + `a6370f4`**. `d0315f8` extended `DocumentReconciler.reconcile`
+    with `also_compare_with` (so cross-applicant docs in joint applications
+    get compared) and added a `(W2_CURRENT, W2_CURRENT)` entry that
+    matches on `tax_year`. `a6370f4` then expanded the map to 25+ pairs
+    covering every entity layer. Deterministic `relationship_id` (sha256 of
+    applicant + source + target + field + type) prevents duplicate row
+    pile-up from re-runs.
 14. **Confidence values clamped uniformly to `0.95`.** Demo sends `0.94`
     (W2), `0.95` (credit), `0.97` (appraisal); `document_index` rows all
     show `0.95`. Something between `_persist_and_reconcile_documents` and
@@ -492,14 +515,22 @@ The local docker-compose has every phase applied. Production ECS still runs Phas
     per-doc-type catalog floor analogous to `routes.py:931-934` for
     property docs. Cosmetic for the demo, but corrupts any downstream
     weighting that relies on the value the caller sent.
-15. **`/application/{id}/context` reports `combined_qualifying_monthly=0`
-    while `/applicant/{id}/income-profile` reports `$12,383`.** The
-    `ContextAssembler` isn't reading the same income source as the
-    income-profile endpoint after the doc-upload path fix. Check
-    `core/context/assembler.py` — it probably reads from a stale field or
-    expects the assembler return shape that doesn't match what
-    `_handle_document_uploaded` now produces. Manifests as all readiness
-    flags showing `✗` even when income and credit are clearly populated.
+15. ~~`/application/{id}/context` reports `combined_qualifying_monthly=0`
+    while `/applicant/{id}/income-profile` reports `$12,383`.~~ —
+    **resolved in `ba35850`** (explicit `invalidate_context` after
+    `_run_assembly` returns) and `91c1964` (`_run_assembly` always uses
+    `get_application_by_applicant` to look up the application_id rather
+    than trusting whatever the caller passed). Verified live: context now
+    reports `combined_qualifying_monthly: 12383` matching the
+    income-profile endpoint, and readiness flags flip to `✓`.
+16. **Production deploy of `feat(index)` schema migration pending.** Commit
+    `a6370f4` adds 12 new indexes (GIN + partial) to `infra/schema.sql`.
+    They're idempotent (`CREATE INDEX IF NOT EXISTS`) so re-running the
+    schema apply against prod is safe and only creates the new ones.
+    Apply via the same `scripts/apply_schema.py` ECS one-off task pattern
+    used for prior schema deltas. The application code (route handlers,
+    PostgresStore helpers) tolerates missing indexes — it'll just be
+    slower until the indexes land.
 
 ---
 
