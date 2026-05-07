@@ -78,16 +78,22 @@ class BatchIndexer:
         await self.watermarks.mark_running(source)
 
         stats: dict = {
-            "found":               0,
-            "processed":           0,
-            "skipped":             0,
-            "applicants_affected": 0,
-            "errors":              0,
-            "error_details":       [],
-            "run_id":              run_id,
-            "watermark_from":      since.isoformat(),
-            "watermark_to":        now.isoformat(),
-            "dry_run":             dry_run,
+            "found":                   0,
+            "processed":               0,
+            # Unknown-LOS skips: scanner saw S3 keys whose los_id has no
+            # matching application row. Distinct from skipped_already_indexed.
+            "skipped":                 0,
+            # Already-indexed skips: the row was fully populated by the
+            # event-driven /documents/upload or /ingest/* path, so the batch
+            # indexer has nothing to add. We don't re-extract or re-assemble.
+            "skipped_already_indexed": 0,
+            "applicants_affected":     0,
+            "errors":                  0,
+            "error_details":           [],
+            "run_id":                  run_id,
+            "watermark_from":          since.isoformat(),
+            "watermark_to":            now.isoformat(),
+            "dry_run":                 dry_run,
         }
 
         try:
@@ -104,15 +110,19 @@ class BatchIndexer:
                 )
                 for los_id, docs in groups.items():
                     try:
-                        affected = await self._process_applicant(
+                        result = await self._process_applicant(
                             los_id=los_id, new_docs=docs, dry_run=dry_run
                         )
-                        if affected:
-                            stats["processed"] += len(docs)
-                            stats["applicants_affected"] += 1
-                        else:
-                            # Unknown LOS — count as skipped, not error
+                        if not result["applicant_known"]:
+                            # Unknown LOS — count as skipped, not error.
                             stats["skipped"] += len(docs)
+                        else:
+                            stats["processed"] += result["processed"]
+                            stats["skipped_already_indexed"] += result[
+                                "skipped_already_indexed"
+                            ]
+                            if result["processed"] > 0:
+                                stats["applicants_affected"] += 1
                     except Exception as exc:
                         stats["errors"] += 1
                         stats["error_details"].append({
@@ -143,14 +153,25 @@ class BatchIndexer:
 
     async def _process_applicant(
         self, los_id: str, new_docs: list[S3Document], dry_run: bool
-    ) -> bool:
+    ) -> dict:
+        """Index ``new_docs`` for one LOS group.
+
+        Returns a counts dict the caller folds into ``stats``::
+
+            {"applicant_known": bool, "processed": int,
+             "skipped_already_indexed": int}
+        """
         app = await self.pg.get_application_by_los_id(los_id)
         if not app:
             logger.warning(
                 "batch_index_unknown_los",
                 extra={"los_id": los_id, "files": len(new_docs)},
             )
-            return False
+            return {
+                "applicant_known":         False,
+                "processed":               0,
+                "skipped_already_indexed": 0,
+            }
 
         applicant_id = app["applicant_id"]
         application_id = app["application_id"]
@@ -169,11 +190,47 @@ class BatchIndexer:
                     "dry_run_would_index",
                     extra={"key": doc.key, "type": doc.doc_type},
                 )
-            return True
+            return {
+                "applicant_known":         True,
+                "processed":               len(new_docs),
+                "skipped_already_indexed": 0,
+            }
 
+        processed_count = 0
+        skipped_already_indexed = 0
         property_touched = False
         income_touched = False
         for s3_doc in new_docs:
+            doc_id = f"DOC-{s3_doc.los_id}-{s3_doc.filename}"
+
+            # Look up the existing row BEFORE downloading bytes. Two reasons
+            # we may need it:
+            #   1. Early-exit: row already fully indexed by the event-driven
+            #      path (/documents/upload or /ingest/*) — skip entirely so
+            #      we don't double-process and race the upload handler.
+            #   2. Anti-clobber: row exists but our extractor returns empty
+            #      (synthetic / minimal PDF that pymupdf can't parse) — keep
+            #      the caller-supplied fields below.
+            existing = await self.pg.get_document(doc_id) if hasattr(
+                self.pg, "get_document"
+            ) else None
+
+            if (
+                existing
+                and existing.get("status") == "indexed"
+                and existing.get("extracted_fields")
+            ):
+                logger.info(
+                    "batch_index_skip_already_indexed",
+                    extra={
+                        "doc_id": doc_id,
+                        "key":    s3_doc.key,
+                        "type":   s3_doc.doc_type,
+                    },
+                )
+                skipped_already_indexed += 1
+                continue
+
             try:
                 pdf_bytes = self.s3.get_raw(s3_doc.key)
             except Exception as exc:
@@ -185,17 +242,6 @@ class BatchIndexer:
 
             extracted = self._extract(pdf_bytes, s3_doc.doc_type)
 
-            doc_id = f"DOC-{s3_doc.los_id}-{s3_doc.filename}"
-
-            # Don't clobber a row that already has good extracted_fields with
-            # an empty extraction from this run — the row likely came from
-            # _handle_document_uploaded with caller-supplied fields, and our
-            # synthetic / minimal PDF can't always be parsed back. If we
-            # extracted something, prefer that; otherwise leave the existing
-            # fields alone.
-            existing = await self.pg.get_document(doc_id) if hasattr(
-                self.pg, "get_document"
-            ) else None
             existing_fields = (existing or {}).get("extracted_fields") or {}
             new_fields = extracted["fields"] or {}
             if not new_fields and existing_fields:
@@ -228,6 +274,7 @@ class BatchIndexer:
                     extra={"key": s3_doc.key, "error": str(exc)[:200]},
                 )
                 continue
+            processed_count += 1
 
             cat = (s3_doc.category or "").lower()
             if cat == "property" or s3_doc.doc_type in _PROPERTY_DOC_TYPES:
@@ -280,9 +327,16 @@ class BatchIndexer:
 
         try:
             self.redis.invalidate_context(application_id)
-        except Exception:
-            pass
-        return True
+        except Exception as exc:
+            logger.warning(
+                "batch_index_invalidate_context_failed",
+                extra={"application_id": application_id, "error": str(exc)[:200]},
+            )
+        return {
+            "applicant_known":         True,
+            "processed":               processed_count,
+            "skipped_already_indexed": skipped_already_indexed,
+        }
 
     # ------------------------------------------------------------------
 
