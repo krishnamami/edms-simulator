@@ -300,22 +300,33 @@ class AggregationService:
             d for d in documents if d.get("borrower_role") == "co_borrower"
         ]
 
-        # Prefer real CREDIT_REPORT docs over synthetic if any are indexed
-        # for the applicant. The assembler will pull a fresh doc list from
-        # postgres if none of the in-memory docs match — this protects
-        # against the in-memory hydration path missing fields.
+        # Persist documents into document_index BEFORE running the credit /
+        # income assemblers. The credit assembler reads CREDIT_REPORT field
+        # values out of the Postgres ``extracted_fields`` jsonb column via
+        # ``pg.get_documents_for_applicant`` — if we save after assembly
+        # the just-arrived CREDIT_REPORT isn't visible to the assembler
+        # and it falls back to a synthetic profile (the bug the live demo
+        # was hitting). Reconciliation also runs here, which is fine: the
+        # reconciler skips comparing a doc to itself by document_id.
+        await self._persist_and_reconcile_documents(
+            documents=documents,
+            applicant_id=applicant_id,
+            co_applicant_id=co_applicant_id,
+            application_id=application_id,
+        )
+
+        # Credit reads from Postgres directly — see core/credit/assembler.py
+        # for the ``extracted_fields``-only read pattern.
         primary_credit = await self.credit_assembler.assemble(
             applicant_id,
             loan_data,
             postgres_store=self.postgres_store,
-            docs=primary_docs,
         )
         co_credit = (
             await self.credit_assembler.assemble(
                 co_applicant_id,
                 loan_data,
                 postgres_store=self.postgres_store,
-                docs=co_docs,
             )
             if co_applicant_id
             else None
@@ -365,6 +376,8 @@ class AggregationService:
 
         # The borrower layer just changed — drop the cached context so the
         # next GET /application/{id}/context re-assembles with fresh data.
+        # (Document persistence + reconciliation already ran at the top of
+        # this method so the credit assembler could read the new docs.)
         if application_id:
             self.redis_store.invalidate_context(application_id)
         else:
@@ -376,16 +389,6 @@ class AggregationService:
                     self.redis_store.invalidate_context(app["application_id"])
             except Exception as exc:
                 logger.warning("invalidate_context_failed", extra={"error": str(exc)})
-
-        # Persist documents into document_index, then reconcile each one
-        # against existing docs for the same applicant. The reconciler writes
-        # typed graph edges (confirms / corroborates / contradicts).
-        await self._persist_and_reconcile_documents(
-            documents=documents,
-            applicant_id=applicant_id,
-            co_applicant_id=co_applicant_id,
-            application_id=application_id,
-        )
 
     async def _merge_request_with_indexed_docs(
         self,

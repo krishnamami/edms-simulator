@@ -3,11 +3,18 @@
 Prefers a real ``CREDIT_REPORT`` document when one is in ``document_index``
 for the applicant; falls back to a synthetic profile so downstream income +
 context assembly never blocks on a missing bureau pull.
+
+Read pattern: every credit field is pulled from ``doc["extracted_fields"]``
+(the Postgres jsonb column). Only the columnar metadata —
+``document_type`` — is read from the top level of the row dict.
 """
 import json
+import logging
 import random
 from datetime import date, timedelta
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class CreditAssembler:
@@ -23,34 +30,65 @@ class CreditAssembler:
         postgres_store=None,
         docs: Optional[list] = None,
     ) -> dict:
-        """Build a CreditProfile from the highest-confidence CREDIT_REPORT
-        for ``applicant_id`` if one is indexed, otherwise generate a
-        synthetic profile.
+        """Build a CreditProfile from a real ``CREDIT_REPORT`` indexed for
+        ``applicant_id`` if one is present, otherwise return a synthetic
+        profile.
 
-        Lookup order for docs:
-          1. ``docs`` arg (caller already hydrated)
-          2. ``postgres_store`` arg's ``get_documents_for_applicant``
-          3. ``self.postgres_store`` if set on the instance
-          4. fall back to synthetic
+        Doc lookup order:
+          1. ``postgres_store`` arg's ``get_documents_for_applicant``
+             (preferred — gives us the canonical pg-row shape with
+             ``extracted_fields`` nested as jsonb)
+          2. ``self.postgres_store`` if set on the instance
+          3. ``docs`` arg as a last-resort fallback for callers without a
+             store (smoke tests). These docs must already carry
+             ``extracted_fields`` nested.
         """
-        if not docs:
-            pg = postgres_store or self.postgres_store
-            if pg is not None:
-                try:
-                    docs = await pg.get_documents_for_applicant(applicant_id)
-                except Exception:
-                    docs = []
-        credit_doc = self._pick_credit_doc(docs or [])
-        if credit_doc:
-            return self._from_document(applicant_id, credit_doc, loan_data)
-        return self.generate_synthetic(applicant_id, loan_data)
+        pg = postgres_store or self.postgres_store
+        if pg is not None:
+            try:
+                docs = await pg.get_documents_for_applicant(applicant_id)
+            except Exception as exc:
+                logger.warning(
+                    "credit_doc_fetch_failed",
+                    extra={"applicant_id": applicant_id, "error": str(exc)},
+                )
+                docs = docs or []
+
+        credit_doc = next(
+            (
+                d for d in (docs or [])
+                if d.get("document_type") == "CREDIT_REPORT"
+            ),
+            None,
+        )
+        if not credit_doc:
+            return self.generate_synthetic(applicant_id, loan_data)
+
+        fields = self._read_extracted_fields(credit_doc)
+        mid_score = fields.get("mid_score")
+
+        logger.info(
+            "credit_doc_fields_read",
+            extra={
+                "mid_score_found": mid_score,
+                "source": "extracted_fields",
+            },
+        )
+
+        if mid_score is None:
+            # Doc exists but has no usable score — fall back rather than
+            # ship a profile with mid_score=None that downstream readers
+            # would crash on.
+            return self.generate_synthetic(applicant_id, loan_data)
+
+        return self._from_extracted_fields(applicant_id, fields, loan_data)
 
     @staticmethod
-    def _effective_fields(doc: dict) -> dict:
-        """Postgres rows store the full incoming doc inside ``extracted_fields``
-        (jsonb). In-memory hydrated docs lift those fields back to the top
-        level. Read both sources so the same code works on either shape.
-        """
+    def _read_extracted_fields(doc: dict) -> dict:
+        """Return the ``extracted_fields`` jsonb dict, decoding if asyncpg
+        handed it back as a JSON string. Never reads top-level — the
+        top-level on a pg row only carries columnar metadata
+        (document_type, applicant_id, ...), not the extracted data."""
         fields = doc.get("extracted_fields") or {}
         if isinstance(fields, str):
             try:
@@ -59,34 +97,7 @@ class CreditAssembler:
                 fields = {}
         if not isinstance(fields, dict):
             fields = {}
-        # Top-level wins on collision so live request payloads override
-        # whatever's currently in the column.
-        return {**fields, **{k: v for k, v in doc.items() if k != "extracted_fields"}}
-
-    @classmethod
-    def _pick_credit_doc(cls, docs: list) -> Optional[dict]:
-        """Return the highest-confidence CREDIT_REPORT with mid_score set,
-        or ``None``. Tiebreak on most recent ``report_date``. The dict
-        returned has ``extracted_fields`` already flattened via
-        ``_effective_fields``."""
-        candidates: list[dict] = []
-        for d in docs or []:
-            if d.get("document_type") != "CREDIT_REPORT":
-                continue
-            fields = cls._effective_fields(d)
-            if fields.get("mid_score") is None:
-                continue
-            candidates.append(fields)
-        if not candidates:
-            return None
-        candidates.sort(
-            key=lambda f: (
-                float(f.get("confidence_score") or 0.0),
-                str(f.get("report_date") or ""),
-            ),
-            reverse=True,
-        )
-        return candidates[0]
+        return fields
 
     @staticmethod
     def _normalize_obligations(raw) -> list:
@@ -106,10 +117,10 @@ class CreditAssembler:
             })
         return out
 
-    def _from_document(
+    def _from_extracted_fields(
         self, applicant_id: str, fields: dict, loan_data: dict
     ) -> dict:
-        # The doc may carry obligations under either key.
+        # Obligations may live under either key in the jsonb.
         detail = fields.get("monthly_obligations_detail")
         raw_total = fields.get("monthly_obligations")
 
