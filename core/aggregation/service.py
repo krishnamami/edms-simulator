@@ -275,6 +275,20 @@ class AggregationService:
             else None
         )
 
+        # Diagnostic: log what the assembler is about to see and what it returns.
+        # If qualifying_monthly is $0, the doc shapes here are usually the cause
+        # (e.g. box1_wages missing or buried under extracted_fields).
+        logger.info(
+            "income_assembly_inputs",
+            applicant_id=applicant_id,
+            application_id=application_id,
+            primary_doc_count=len(primary_docs),
+            co_doc_count=len(co_docs),
+            primary_doc_types=[d.get("document_type") for d in primary_docs],
+            primary_top_level_keys=[
+                sorted(d.keys()) for d in primary_docs
+            ],
+        )
         profile = self.income_assembler.assemble(
             primary_docs=primary_docs,
             co_borrower_docs=co_docs,
@@ -283,6 +297,16 @@ class AggregationService:
             application_id=application_id,
             applicant_id=applicant_id,
             co_applicant_id=co_applicant_id,
+        )
+        logger.info(
+            "income_assembly_result",
+            applicant_id=applicant_id,
+            primary_qualifying_monthly=profile.primary_borrower.get("qualifying_monthly"),
+            co_qualifying_monthly=(profile.co_borrower or {}).get("qualifying_monthly") if profile.co_borrower else None,
+            combined_qualifying_monthly=profile.combined_qualifying_monthly,
+            primary_source_types=[
+                s.get("source_type") for s in profile.primary_borrower.get("sources", [])
+            ],
         )
         await self.postgres_store.save_income_profile(profile.model_dump())
         await self.postgres_store.save_credit_profile(primary_credit)
@@ -368,6 +392,13 @@ class AggregationService:
                     conflicts=[r.reasoning for r in conflicts],
                 )
                 self.redis_store.invalidate_income_profile(doc_applicant)
+
+        # Always bust the graph + income caches after persisting docs — even
+        # without conflicts. Otherwise /graph/summary keeps returning a stale
+        # document_count from before the inserts.
+        self.redis_store.invalidate_income_profile(applicant_id)
+        if co_applicant_id:
+            self.redis_store.invalidate_income_profile(co_applicant_id)
 
     async def _handle_property_document_uploaded(self, event) -> dict:
         """Re-assemble a PropertyProfile after a new property doc lands.
