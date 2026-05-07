@@ -247,6 +247,14 @@ class AggregationService:
             loan_data=loan_data,
         )
 
+        # Belt-and-suspenders: _run_assembly already invalidates the context
+        # cache when application_id is set, but if a caller skipped it, force
+        # a re-assemble on the next GET /application/{id}/context. The income
+        # / credit profiles we just wrote are otherwise hidden behind the
+        # 30-min context TTL.
+        if application_id:
+            self.redis_store.invalidate_context(application_id)
+
         gr.status = StatusMachine.transition(
             GoldenRecordStatus.STALE, GoldenRecordStatus.ACTIVE
         )
@@ -292,12 +300,14 @@ class AggregationService:
             d for d in documents if d.get("borrower_role") == "co_borrower"
         ]
 
-        primary_credit = self.credit_assembler.generate_synthetic(
-            applicant_id, loan_data
+        # Prefer real CREDIT_REPORT docs over synthetic if any are indexed
+        # for the applicant; falls back internally when none exist.
+        primary_credit = self.credit_assembler.assemble(
+            applicant_id, loan_data, docs=primary_docs
         )
         co_credit = (
-            self.credit_assembler.generate_synthetic(
-                co_applicant_id, loan_data
+            self.credit_assembler.assemble(
+                co_applicant_id, loan_data, docs=co_docs
             )
             if co_applicant_id
             else None
