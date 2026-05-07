@@ -54,6 +54,10 @@ Redis port is **6380**.
 Latest commits (top of `main`):
 
 ```
+3c631b7  fix(storage): allow document_index upserts to re-attribute applicant/role
+07a5bd2  fix(aggregation): hydrate co_applicant_id + cumulative docs on doc upload
+736bf97  fix(aggregation): bust graph cache on every doc save + demo cache-bypass probes
+8bb789e  docs: refresh context.md with Phases B → incremental indexer
 15b5c46  feat(indexing): incremental batch indexer with watermark
 5ba24a6  feat(observability): Phase F — dashboard, pipeline-state, timeline, watch_pipeline
 fc03352  feat(context): Phase E — persona slices, webhooks, context versioning
@@ -346,6 +350,22 @@ Errors:
 - ✅ **Phase A schema applied to RDS prod**. `raw_ingestion` table + 4 indexes
   live; verified via `scripts/watch_pipeline.py --live`.
 
+### Resolved this session (doc-upload path)
+
+Three latent bugs in the `POST /loans/document` (alias of `/documents/upload`) path, surfaced by `scripts/demo_loan.py --live` reporting `income_verified=false`, `qualifying_monthly=$0`, and `document_count=0` despite four PDFs in S3.
+
+- ✅ **`extracted_fields` nesting in caller payloads** — `IncomeAssembler` reads W2 fields (`box1_wages`, `tax_year`, etc.) directly off the doc dict (`core/income/rules.py:30`), so the demo's `{"extracted_fields": {...}}` envelope buried the values out of reach. Fixed in `scripts/demo_loan.py` by spreading `doc["data"]` at the top level of the `all_documents` payload.
+
+- ✅ **Stale `graph:{applicant_id}` cache** (`736bf97`) — `_persist_and_reconcile_documents` only invalidated on conflict edges, so the very first doc upload left `/graph/summary` serving the pre-insert `document_count`. Added `RedisStore.invalidate_graph_summary` (graph-only — `invalidate_income_profile` would clobber the income/credit caches `_run_assembly` had just warmed) and call it unconditionally after the persist loop. Also added `income_assembly_inputs` / `income_assembly_result` structured logs around the assembler call so `$0` qualifying is debuggable from the field shapes the assembler actually saw.
+
+- ✅ **`_handle_document_uploaded` ignored co-borrower context** (`07a5bd2`) — passed `co_applicant_id=None` and `documents=p.get("all_documents", [])` (request-only) to `_run_assembly`. Two cascading symptoms: (a) co-borrower W2s filed under the primary's `applicant_id` because `_persist_and_reconcile_documents`'s role-routing branch never fired, and (b) every non-W2 upload re-assembled income from a single doc, dropping primary qualifying back to `$0` after STEP 2. Now hydrates `co_applicant_id` + `loan_data` from `get_application` (or `get_application_by_applicant` fallback) and merges the cumulative current doc set from Postgres for both borrowers via the new `_merge_request_with_indexed_docs` helper. The helper lifts `extracted_fields` back to the top level on the way out so the assembler keeps seeing `box1_wages` where it expects it. New docs in the request override existing rows by `document_id` so re-uploads with corrected fields win.
+
+- ✅ **`document_index` upserts couldn't re-attribute** (`3c631b7`) — `save_document`'s `ON CONFLICT (document_id) DO UPDATE SET` excluded `applicant_id` / `application_id` / `borrower_role`. Once a row was inserted with the wrong attribution, no upsert could correct it. Added all three to the SET list. The next `--live` run after deploy migrated `DOC-LOS-DEMO-001-W2_CURRENT-co_borrower` from `APL-00003-P` (3 docs, all `role=primary`) to `APL-00004-C` (1 doc, `role=co_borrower`, `box1_wages=56200`).
+
+Verified end-to-end against prod: `income:APL-00003-P qualifying_monthly: $12,383` (= (92,400 + 56,200) / 12), stable across all 4 doc uploads, served from cache. Per-borrower attribution and graph counts match the data.
+
+`scripts/demo_loan.py` also gained cache-bypass probes (`GET /admin/table-count/{document_index, income_profiles, credit_profiles}` after each step) so future runs can confirm rows are landing even when `/graph/summary` is mid-cache. The endpoint depends on `PostgresStore.get_table_count` (uncommitted as of this session — see follow-up below).
+
 ### Resolved this session (Phases B → indexer)
 
 - ✅ **Property layer** — schema (`properties`, `property_profiles`) applied locally; PITI math live; PropertyAssembler + 5 generators + extractors + 4 endpoints + 23 tests.
@@ -446,6 +466,40 @@ The local docker-compose has every phase applied. Production ECS still runs Phas
     T-29min and an event-driven invalidation didn't fire (e.g. a back-end
     process inserted into `document_index` directly), the dashboard shows
     stale numbers until TTL elapses. Hit `POST /refresh-context` to force.
+12. **`/admin/table-count/{table}` returns 500 in prod** — the route at
+    `routes.py:2185` calls `pg.get_table_count(table_name)` but the helper
+    lives uncommitted on the working tree. Commit + push to unblock the
+    cache-bypass probes that `scripts/demo_loan.py` prints after every step.
+    Schema is trivial:
+    ```python
+    async def get_table_count(self, table_name: str) -> int:
+        # Caller must whitelist; SQL identifier interpolated unquoted.
+        val = await db.fetchval(f"SELECT COUNT(*) FROM {table_name}")
+        return int(val or 0)
+    ```
+13. **Document reconciler produces 0 edges across 4 docs.** Two W2s sharing
+    `tax_year=2023`, `borrower_role` semantics, and overlapping fields ought
+    to at least CONFIRM. After the doc-upload path fix, `extracted_fields`
+    are flat at the top level — but `core/graph/reconciler.py` still produces
+    empty `relationships` / `confirmations` / `conflicts` arrays. Most likely
+    the field-pair selection logic in the reconciler doesn't match what's
+    on the row shape today. Verify by reading the reconciler against the
+    current shape of `_persist_and_reconcile_documents`'s `saved_doc`.
+14. **Confidence values clamped uniformly to `0.95`.** Demo sends `0.94`
+    (W2), `0.95` (credit), `0.97` (appraisal); `document_index` rows all
+    show `0.95`. Something between `_persist_and_reconcile_documents` and
+    `save_document` overrides the caller-supplied confidence — likely a
+    per-doc-type catalog floor analogous to `routes.py:931-934` for
+    property docs. Cosmetic for the demo, but corrupts any downstream
+    weighting that relies on the value the caller sent.
+15. **`/application/{id}/context` reports `combined_qualifying_monthly=0`
+    while `/applicant/{id}/income-profile` reports `$12,383`.** The
+    `ContextAssembler` isn't reading the same income source as the
+    income-profile endpoint after the doc-upload path fix. Check
+    `core/context/assembler.py` — it probably reads from a stale field or
+    expects the assembler return shape that doesn't match what
+    `_handle_document_uploaded` now produces. Manifests as all readiness
+    flags showing `✗` even when income and credit are clearly populated.
 
 ---
 
