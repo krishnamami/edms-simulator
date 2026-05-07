@@ -598,6 +598,27 @@ def run(base_url: str, api_key: str, live: bool,
                      if r_count.status_code == 200 else "?")
             print(f"  {table:<22} {str(count):>5} rows")
 
+        # Attribute-index probes — confirm the field landed in the
+        # document_index.extracted_fields jsonb where the assemblers
+        # and /applicant/{id}/field/{name} can find it.
+        probe_fields = {
+            "W2_CURRENT":      "box1_wages",
+            "CREDIT_REPORT":   "mid_score",
+            "APPRAISAL_URAR":  "appraised_value",
+        }
+        probe_field = probe_fields.get(doc["type"])
+        if probe_field:
+            r_field = api("GET",
+                          f"/applicant/{applicant_id}/field/{probe_field}",
+                          base_url, api_key)
+            if r_field.status_code == 200:
+                body = r_field.json()
+                best = body.get("best_value") or {}
+                value = best.get("value")
+                ok(f"  Indexed field: {probe_field} = {value}")
+            else:
+                warn(f"  /field/{probe_field}: {r_field.status_code}")
+
         # Show Redis state after this document
         blank()
         show_redis_state(

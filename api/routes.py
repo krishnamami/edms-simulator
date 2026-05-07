@@ -566,6 +566,108 @@ async def reconcile_applicant(request: Request, applicant_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Attribute index — query single fields across an applicant's documents
+# (Build: comprehensive indexing)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/applicant/{applicant_id}/field/{field_name}",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_field_across_documents(
+    request: Request, applicant_id: str, field_name: str,
+):
+    """Highest-confidence value for a field across every indexed document
+    for the applicant, plus the full source list and a max_delta_pct so
+    callers can see at a glance whether sources agree."""
+    pg = request.app.state.postgres_store
+    sources = await pg.get_all_field_values(applicant_id, field_name)
+    if not sources:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no document for {applicant_id} has field {field_name!r}",
+        )
+    best = await pg.get_highest_confidence_field(applicant_id, field_name)
+
+    numeric_values: list[float] = []
+    for s in sources:
+        try:
+            numeric_values.append(float(s.get("field_value")))
+        except (TypeError, ValueError):
+            continue
+    max_delta_pct: Optional[float] = None
+    has_conflict = False
+    if len(numeric_values) >= 2:
+        peak = max(abs(v) for v in numeric_values)
+        if peak > 0:
+            spread = max(numeric_values) - min(numeric_values)
+            max_delta_pct = round(spread / peak * 100, 2)
+            has_conflict = max_delta_pct > 10.0
+
+    return {
+        "field_name":     field_name,
+        "applicant_id":   applicant_id,
+        "best_value":     best,
+        "all_sources":    sources,
+        "has_conflict":   has_conflict,
+        "max_delta_pct":  max_delta_pct,
+    }
+
+
+@router.get(
+    "/applicant/{applicant_id}/documents/{category}",
+    dependencies=[Depends(verify_api_key)],
+)
+async def list_documents_by_category(
+    request: Request, applicant_id: str, category: str,
+):
+    """All indexed documents for an applicant in a given category
+    (income | credit | asset | property | identity | compliance)."""
+    pg = request.app.state.postgres_store
+    docs = await pg.get_documents_by_category(applicant_id, category)
+    return {
+        "applicant_id":   applicant_id,
+        "category":       category,
+        "document_count": len(docs),
+        "documents":      docs,
+    }
+
+
+@router.get(
+    "/application/{application_id}/graph/full",
+    dependencies=[Depends(verify_api_key)],
+)
+async def get_full_graph(request: Request, application_id: str):
+    """Complete knowledge graph for an application — primary + co
+    applicant nodes, every edge, plus a confidence + conflict summary."""
+    pg = request.app.state.postgres_store
+    app = await pg.get_application(application_id)
+    if not app:
+        raise HTTPException(status_code=404, detail="application not found")
+
+    navigator = DocumentNavigator(pg)
+    primary_graph = await navigator.build_graph(app["applicant_id"])
+    payload: dict = {
+        "application_id": application_id,
+        "primary":        primary_graph.model_dump(),
+        "co_borrower":    None,
+    }
+    co_id = app.get("co_applicant_id")
+    if co_id:
+        co_graph = await navigator.build_graph(co_id)
+        payload["co_borrower"] = co_graph.model_dump()
+    payload["conflict_summary"] = {
+        "primary_conflicts": len(primary_graph.conflicts),
+        "co_conflicts": (
+            len(payload["co_borrower"]["conflicts"])
+            if payload["co_borrower"] else 0
+        ),
+    }
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Phase 0: MISMO compatibility — universal LOS endpoints
 # ---------------------------------------------------------------------------
 

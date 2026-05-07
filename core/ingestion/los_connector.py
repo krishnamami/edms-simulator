@@ -166,12 +166,44 @@ class EncompassConnector(LOSConnector):
         )
 
     def _extract_fields(self, payload: dict) -> dict:
-        return (
+        """Translate Encompass field IDs (URLA.X1, 4868.X1, ...) to
+        internal field names. Falls back to the raw payload for callers
+        that already shipped internal-shaped data."""
+        from core.ingestion.encompass_fields import EncompassFieldMapper
+
+        raw = (
             payload.get("fields")
             or payload.get("extractedData")
+            or payload.get("loanData")
             or payload.get("data")
             or {}
         )
+        if not isinstance(raw, dict):
+            return {}
+
+        mapper = EncompassFieldMapper()
+        external_doc_type = self._extract_doc_type(payload)
+        internal_type = mapper.detect_doc_type(raw, external_doc_type)
+        translated = mapper.translate(
+            raw, doc_type=internal_type if internal_type != "UNKNOWN" else None,
+        )
+        # If the field IDs didn't match anything we recognise, surface
+        # the original dict so downstream extractors / Claude can take
+        # a pass instead of seeing an empty payload.
+        if not translated and raw:
+            return raw
+        return translated
+
+    def _base_confidence(self, internal_type: str) -> float:
+        """Encompass-supplied structured fields are higher confidence than
+        the PDF-extraction baseline. Fall back to the LOSConnector default
+        when we don't have a per-type override."""
+        from core.ingestion.encompass_fields import (
+            ENCOMPASS_FIELD_CONFIDENCE,
+        )
+        if internal_type in ENCOMPASS_FIELD_CONFIDENCE:
+            return ENCOMPASS_FIELD_CONFIDENCE[internal_type]
+        return super()._base_confidence(internal_type)
 
     def _extract_borrower(self, payload: dict) -> dict:
         b = payload.get("borrower") or payload.get("Borrower") or {}

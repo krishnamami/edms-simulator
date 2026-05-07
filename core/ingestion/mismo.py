@@ -86,6 +86,59 @@ MISMO_TO_INTERNAL: dict[str, str] = {
     "FraudReport":                       "FRAUD_REPORT",
     "SSAVerificationReport":             "SSN_VALIDATION",
     "OFACReport":                        "OFAC_REPORT",
+
+    # ── Income additions (full mortgage lifecycle) ──────────────────────
+    "TaxReturnPriorYear":                "TAX_RETURN_1040_PRIOR",
+    "RetirementAwardLetter":             "PENSION_LETTER",
+    "LeaveAndEarningsStatement":         "MILITARY_LES",
+
+    # ── Employment / VOE additions ──────────────────────────────────────
+    "EmploymentVerificationTWN":         "VOE_TWN",
+    "EquifaxWorkforceVerification":      "VOE_EQUIFAX",
+
+    # ── Asset additions ─────────────────────────────────────────────────
+    "InvestmentAccountStatement":        "ASSET_BROKERAGE",
+
+    # ── Liability additions ─────────────────────────────────────────────
+    "StudentLoanStatement":              "STUDENT_LOAN_STATEMENT",
+    "DivorceDecree":                     "DIVORCE_DECREE",
+    "ChildSupportOrder":                 "CHILD_SUPPORT_ORDER",
+
+    # ── Identity additions ──────────────────────────────────────────────
+    "ITINLetter":                        "IDENTITY_ITIN",
+
+    # ── Property additions ──────────────────────────────────────────────
+    "MarketConditionsAddendum":          "FORM_1004MC",
+    "AutomatedValuationModel":           "AVM_REPORT",
+    "WindHailInsurance":                 "WIND_HAIL_INSURANCE",
+    "WDOReport":                         "PEST_WDO_INSPECTION",
+    "WellSepticInspection":              "WELL_SEPTIC_INSPECTION",
+
+    # ── Loan application additions ──────────────────────────────────────
+    "LoanEstimate":                      "LOAN_ESTIMATE",
+    "ClosingDisclosure":                 "CLOSING_DISCLOSURE",
+
+    # ── Vendor return additions ─────────────────────────────────────────
+    "BankruptcySearch":                  "BANKRUPTCY_SEARCH",
+    "JudgmentLienSearch":                "JUDGMENT_LIEN_SEARCH",
+    "UndisclosedDebtMonitoring":         "UNDISCLOSED_DEBT",
+    "HOIVerification":                   "HOI_VERIFICATION",
+}
+
+
+# ── MISMO aliases — many-to-one external→internal forward routes ────────
+# Each key here resolves to an internal type that already has a canonical
+# entry in MISMO_TO_INTERNAL. The alias dict gives ``to_internal_type`` a
+# second lookup table so common synonyms / typos / vendor variants still
+# resolve, without polluting the strict 1:1 reverse map.
+MISMO_ALIASES: dict[str, str] = {
+    "RentalAgreement":            "LEASE_AGREEMENT",
+    "WorkNumberReport":           "VOE_TWN",
+    "DownPaymentGiftLetter":      "GIFT_LETTER",
+    "DivorceDegree":              "DIVORCE_DECREE",
+    "PermanentResidentCard":      "IDENTITY_GREEN_CARD",
+    "IdentityVerificationReport": "FRAUD_REPORT",
+    "PropertyTaxTranscript":      "PROPERTY_TAX_TRANSCRIPT",
 }
 
 
@@ -118,6 +171,34 @@ ENCOMPASS_TO_INTERNAL: dict[str, str] = {
     "4506-C":                       "IRS_TRANSCRIPT",
     "DU Findings":                  "AUS_DU_FINDINGS",
     "LP Findings":                  "AUS_LP_FINDINGS",
+
+    # ── Encompass-specific additions ────────────────────────────────────
+    "Schedule C":                   "SCHEDULE_C",
+    "Schedule E":                   "SCHEDULE_E",
+    "K-1":                          "K1_PARTNERSHIP",
+    "Pension Award Letter":         "PENSION_AWARD_LETTER",
+    "Lease Agreement":              "LEASE_AGREEMENT",
+    "Military LES":                 "MILITARY_LES",
+    "401k Statement":               "ASSET_STATEMENT_RETIREMENT",
+    "IRA Statement":                "ASSET_STATEMENT_RETIREMENT",
+    "Brokerage Statement":          "ASSET_STATEMENT_BROKERAGE",
+    "Divorce Decree":               "DIVORCE_DECREE",
+    "Child Support Order":          "CHILD_SUPPORT_ORDER",
+    "Green Card":                   "IDENTITY_GREEN_CARD",
+    "Appraisal Update":             "APPRAISAL_UPDATE",
+    "1004MC":                       "FORM_1004MC",
+    "AVM":                          "AVM_REPORT",
+    "Title Insurance":              "TITLE_INSURANCE",
+    "HOI Declarations":             "HOI_DECLARATIONS",
+    "Flood Insurance":              "FLOOD_INSURANCE_BINDER",
+    "Property Tax Bill":            "PROPERTY_TAX_BILL",
+    "Pest Inspection":              "PEST_WDO_INSPECTION",
+    "HOA Cert":                     "HOA_CERT",
+    "Condo Questionnaire":          "CONDO_QUESTIONNAIRE",
+    "Purchase Agreement":           "PURCHASE_AGREEMENT",
+    "Rate Lock":                    "RATE_LOCK",
+    "Fraud Report":                 "FRAUD_REPORT",
+    "Undisclosed Debt":             "UNDISCLOSED_DEBT",
 }
 
 
@@ -167,15 +248,28 @@ _CATEGORY_MAP: dict[str, list[str]] = {
         "W2_", "PAYSTUB_", "TAX_RETURN", "IRS_TRANSCRIPT",
         "SSA_", "PENSION_", "LES", "1099_", "SCHEDULE_",
         "K1_", "OFFER_LETTER", "EMPLOYMENT_",
+        # Build: comprehensive indexing
+        "MILITARY_", "VOE_",
+        "STUDENT_LOAN_", "DIVORCE_", "CHILD_SUPPORT_", "LEASE_",
     ],
     "credit":     ["CREDIT_", "OFAC_", "SSN_"],
-    "asset":      ["BANK_STATEMENT", "ASSET_STATEMENT", "GIFT_LETTER"],
+    "asset":      ["BANK_STATEMENT", "ASSET_STATEMENT", "ASSET_RETIREMENT",
+                   "ASSET_BROKERAGE", "GIFT_LETTER"],
     "property":   [
         "APPRAISAL_", "TITLE_", "HOI_", "FLOOD_",
         "PROPERTY_TAX", "SURVEY", "PEST_", "HOA_", "CONDO_",
+        # Build: comprehensive indexing
+        "FORM_1004MC", "AVM_", "WELL_SEPTIC_", "HOA_CERT",
+        "WIND_HAIL_", "PROPERTY_TAX_TRANSCRIPT",
+        "EARNEST_",
     ],
     "loan":       ["URLA_", "FORM_1008", "RATE_LOCK", "PURCHASE_", "EARNEST_"],
-    "compliance": ["FRAUD_", "AUS_", "HMDA_"],
+    "compliance": [
+        "FRAUD_", "AUS_", "HMDA_",
+        # Build: comprehensive indexing
+        "BANKRUPTCY_", "JUDGMENT_", "UNDISCLOSED_", "HOI_VERIF",
+        "LOAN_ESTIMATE", "CLOSING_DISCLOSURE",
+    ],
     "identity":   ["IDENTITY_"],
 }
 
@@ -212,12 +306,17 @@ class MISMOMapper:
     ) -> Optional[str]:
         """Convert a real LOS document type to the internal canonical type.
 
+        Looks in MISMO_TO_INTERNAL first, then MISMO_ALIASES (synonyms /
+        typos / vendor variants that share a canonical internal type).
         Returns ``None`` if the label is unknown — caller can fall back to
         :func:`detect_type_from_content`.
         """
         if source_system == "encompass":
             return ENCOMPASS_TO_INTERNAL.get(external_type)
-        return MISMO_TO_INTERNAL.get(external_type)
+        return (
+            MISMO_TO_INTERNAL.get(external_type)
+            or MISMO_ALIASES.get(external_type)
+        )
 
     @staticmethod
     def to_mismo_type(internal_type: str) -> Optional[str]:

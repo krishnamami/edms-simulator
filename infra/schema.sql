@@ -407,3 +407,66 @@ INSERT INTO indexing_watermarks (source, last_indexed_at, status)
 VALUES ('s3', '1970-01-01', 'idle')
 ON CONFLICT (source) DO NOTHING;
 
+-- =====================================================================
+-- Comprehensive document indexing — performance + GIN on extracted_fields
+-- =====================================================================
+
+CREATE INDEX IF NOT EXISTS idx_doc_applicant_type
+    ON document_index(applicant_id, document_type);
+
+CREATE INDEX IF NOT EXISTS idx_doc_application_category
+    ON document_index(application_id, document_category);
+
+CREATE INDEX IF NOT EXISTS idx_doc_type_status
+    ON document_index(document_type, status);
+
+CREATE INDEX IF NOT EXISTS idx_doc_received
+    ON document_index(received_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_doc_confidence
+    ON document_index(confidence_score DESC)
+    WHERE confidence_score IS NOT NULL;
+
+-- GIN index on extracted_fields JSONB for field-level queries.
+-- Enables: WHERE extracted_fields @> '{"mid_score": 723}'
+CREATE INDEX IF NOT EXISTS idx_doc_extracted_fields_gin
+    ON document_index USING gin(extracted_fields)
+    WHERE extracted_fields IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_doc_w2_current
+    ON document_index(applicant_id, received_at DESC)
+    WHERE document_type = 'W2_CURRENT';
+
+CREATE INDEX IF NOT EXISTS idx_doc_credit_report
+    ON document_index(applicant_id, received_at DESC)
+    WHERE document_type = 'CREDIT_REPORT';
+
+CREATE INDEX IF NOT EXISTS idx_doc_appraisal
+    ON document_index(application_id, received_at DESC)
+    WHERE document_type IN ('APPRAISAL_URAR','APPRAISAL_UPDATE',
+                             'APPRAISAL_DESK','APPRAISAL_FIELD');
+
+CREATE INDEX IF NOT EXISTS idx_doc_property_category
+    ON document_index(application_id, received_at DESC)
+    WHERE document_category = 'property';
+
+CREATE INDEX IF NOT EXISTS idx_doc_income_category
+    ON document_index(applicant_id, received_at DESC)
+    WHERE document_category = 'income';
+
+-- Indexes on document_relationships for graph traversal
+CREATE INDEX IF NOT EXISTS idx_rel_applicant_type
+    ON document_relationships(applicant_id, relationship_type);
+
+CREATE INDEX IF NOT EXISTS idx_rel_field
+    ON document_relationships(applicant_id, field_name)
+    WHERE field_name IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_rel_conflicts
+    ON document_relationships(applicant_id, created_at DESC)
+    WHERE relationship_type = 'contradicts';
+
+CREATE INDEX IF NOT EXISTS idx_rel_confirms
+    ON document_relationships(applicant_id, confidence DESC)
+    WHERE relationship_type = 'confirms';
+

@@ -712,6 +712,141 @@ class PostgresStore:
         )
         return [_row_to_dict(r) for r in rows]
 
+    # --- Attribute query helpers (Build: comprehensive indexing) -----
+
+    async def get_field_value(
+        self, applicant_id: str, doc_type: str, field_name: str
+    ) -> Optional[dict]:
+        """Highest-priority value for ``field_name`` from the most recent
+        ``doc_type`` document for ``applicant_id``. Uses the GIN index on
+        ``extracted_fields`` and the (applicant_id, document_type)
+        composite index for the lookup."""
+        row = await db.fetchrow(
+            """
+            SELECT extracted_fields -> $3 AS field_value,
+                   confidence_score,
+                   received_at,
+                   document_id
+            FROM document_index
+            WHERE applicant_id = $1
+              AND document_type = $2
+              AND extracted_fields IS NOT NULL
+              AND extracted_fields ? $3
+            ORDER BY received_at DESC
+            LIMIT 1
+            """,
+            applicant_id, doc_type, field_name,
+        )
+        if not row:
+            return None
+        return {
+            "value":       row["field_value"],
+            "confidence":  row["confidence_score"],
+            "received_at": row["received_at"],
+            "document_id": row["document_id"],
+        }
+
+    async def get_all_field_values(
+        self, applicant_id: str, field_name: str
+    ) -> list:
+        """All occurrences of ``field_name`` across every doc type for
+        the applicant. Used by the navigator + ``/applicant/{id}/field``
+        endpoint to compare a value across sources."""
+        rows = await db.fetch(
+            """
+            SELECT document_type,
+                   document_id,
+                   extracted_fields -> $2 AS field_value,
+                   confidence_score,
+                   received_at
+            FROM document_index
+            WHERE applicant_id = $1
+              AND extracted_fields IS NOT NULL
+              AND extracted_fields ? $2
+            ORDER BY confidence_score DESC NULLS LAST, received_at DESC
+            """,
+            applicant_id, field_name,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_documents_by_category(
+        self, applicant_id: str, category: str
+    ) -> list:
+        """Indexed (status='indexed') documents for an applicant scoped
+        to a single ``document_category``."""
+        rows = await db.fetch(
+            """
+            SELECT * FROM document_index
+            WHERE applicant_id = $1
+              AND document_category = $2
+              AND status = 'indexed'
+            ORDER BY received_at DESC
+            """,
+            applicant_id, category,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def find_documents_with_field(
+        self,
+        applicant_id: str,
+        field_name: str,
+        field_value=None,
+    ) -> list:
+        """Documents for ``applicant_id`` that have ``field_name`` set,
+        optionally to a specific value. Uses the GIN index when a value
+        is provided so it's an indexed lookup, not a sequential scan."""
+        if field_value is not None:
+            rows = await db.fetch(
+                """
+                SELECT document_id, document_type,
+                       extracted_fields -> $3 AS value,
+                       confidence_score
+                FROM document_index
+                WHERE applicant_id = $1
+                  AND extracted_fields @> $2::jsonb
+                """,
+                applicant_id,
+                json.dumps({field_name: field_value}, default=str),
+                field_name,
+            )
+        else:
+            rows = await db.fetch(
+                """
+                SELECT document_id, document_type,
+                       extracted_fields -> $2 AS value,
+                       confidence_score
+                FROM document_index
+                WHERE applicant_id = $1
+                  AND extracted_fields ? $2
+                """,
+                applicant_id, field_name,
+            )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_highest_confidence_field(
+        self, applicant_id: str, field_name: str
+    ) -> Optional[dict]:
+        """Pick the highest-confidence ``field_name`` reading across
+        every indexed document for ``applicant_id``. Source ranking from
+        SOURCE_CONFIDENCE_RANKING is the primary key; per-row
+        ``confidence_score`` is the tiebreaker."""
+        from core.ingestion.confidence import SOURCE_CONFIDENCE_RANKING
+
+        docs = await self.get_all_field_values(applicant_id, field_name)
+        if not docs:
+            return None
+
+        def sort_key(d):
+            doc_type = (d.get("document_type") or "")
+            type_key = SOURCE_CONFIDENCE_RANKING.get(
+                doc_type.replace("_CURRENT", "_PDF").replace("_PRIOR", "_PDF"),
+                0.5,
+            )
+            conf = float(d.get("confidence_score") or 0)
+            return (type_key, conf)
+
+        return sorted(docs, key=sort_key, reverse=True)[0]
+
     async def get_documents_for_application(self, application_id: str) -> list:
         rows = await db.fetch(
             """
