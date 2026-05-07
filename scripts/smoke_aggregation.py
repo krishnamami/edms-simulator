@@ -53,6 +53,7 @@ class FakePG:
         self.income: dict = {}
         self.credit: dict = {}
         self.applicants: dict = {}
+        self.documents: dict = {}
 
     async def save_golden_record(self, gr):
         self.applicants[gr["applicant_id"]] = gr
@@ -63,9 +64,18 @@ class FakePG:
     async def save_application(self, app):
         self.applications[app["application_id"]] = app
 
+    async def get_application(self, application_id):
+        return self.applications.get(application_id)
+
     async def get_application_by_los_id(self, los_id):
         for app in self.applications.values():
             if app["los_id"] == los_id:
+                return app
+        return None
+
+    async def get_application_by_applicant(self, applicant_id):
+        for app in self.applications.values():
+            if app.get("applicant_id") == applicant_id or app.get("co_applicant_id") == applicant_id:
                 return app
         return None
 
@@ -83,6 +93,16 @@ class FakePG:
 
     async def get_credit_profile(self, aid):
         return self.credit.get(aid)
+
+    async def save_document(self, doc):
+        # Mirror prod's ON CONFLICT DO UPDATE on document_id.
+        self.documents[doc["document_id"]] = {**doc, "is_current": doc.get("is_current", True)}
+
+    async def get_documents_for_applicant(self, applicant_id):
+        return [
+            d for d in self.documents.values()
+            if d.get("applicant_id") == applicant_id and d.get("is_current", True)
+        ]
 
 
 def _payload(los_id: str, ssn: str) -> dict:
