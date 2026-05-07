@@ -1,10 +1,14 @@
 """Request/response schemas for the EDMS Simulator API."""
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class BorrowerSchema(BaseModel):
+    # Allow extra fields (e.g. address) so payloads aren't silently
+    # truncated at the API boundary.
+    model_config = ConfigDict(extra="allow")
+
     first_name: str
     last_name: str
     dob: str
@@ -15,16 +19,40 @@ class BorrowerSchema(BaseModel):
 
 
 class LoanSchema(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     loan_amount: Optional[float] = None
     purpose: Optional[str] = None
     credit_band: Optional[str] = "near-prime"
 
 
 class DocumentSchema(BaseModel):
+    """A document carrier on /loans/document and inside /loans payloads.
+
+    Two ways to ship extracted content:
+      1. Nest the data under ``extracted_fields`` (recommended for new
+         callers — clean, schema-agnostic, supports any doc type).
+      2. Spread the fields at the top level (backward-compatible — the
+         demo and existing income/asset adapters do this).
+
+    The Pydantic config sets ``extra="allow"`` so non-income document
+    types — CREDIT_REPORT, APPRAISAL_URAR, etc. — don't get silently
+    truncated when callers spread credit/appraisal/property fields at
+    the top level. Without this, mid_score / experian_score /
+    appraised_value etc. were dropped at the API boundary before the
+    persistence layer ever saw them, and downstream assemblers fell
+    back to synthetic data.
+    """
+    model_config = ConfigDict(extra="allow")
+
     document_id: str
     document_type: str
     document_category: str = "income"
     borrower_role: str = "primary"
+    extracted_fields: dict = {}
+    # Income / asset fields kept as named for IDE completion + light
+    # validation on the legacy callers. Anything else flows through via
+    # ``extra="allow"``.
     box1_wages: Optional[float] = None
     employer_name: Optional[str] = None
     monthly_benefit: Optional[float] = None
