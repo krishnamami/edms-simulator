@@ -109,6 +109,12 @@ class FakePostgresStore:
                 return
         self.documents.append(doc)
 
+    async def get_document(self, document_id):
+        for d in self.documents:
+            if d.get("document_id") == document_id:
+                return d
+        return None
+
     async def get_documents_for_applicant(self, applicant_id):
         return [d for d in self.documents if d["applicant_id"] == applicant_id]
 

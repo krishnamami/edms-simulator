@@ -691,6 +691,16 @@ class PostgresStore:
             doc.get("confidence_score"),
         )
 
+    async def get_document(self, document_id: str) -> Optional[dict]:
+        """Fetch a single document_index row by document_id, or None.
+        Used by the batch indexer to avoid clobbering caller-supplied
+        extracted_fields with an empty extractor result."""
+        row = await db.fetchrow(
+            "SELECT * FROM document_index WHERE document_id = $1",
+            document_id,
+        )
+        return _row_to_dict(row)
+
     async def get_documents_for_applicant(self, applicant_id: str) -> list:
         rows = await db.fetch(
             """

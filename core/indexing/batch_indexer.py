@@ -186,6 +186,27 @@ class BatchIndexer:
             extracted = self._extract(pdf_bytes, s3_doc.doc_type)
 
             doc_id = f"DOC-{s3_doc.los_id}-{s3_doc.filename}"
+
+            # Don't clobber a row that already has good extracted_fields with
+            # an empty extraction from this run — the row likely came from
+            # _handle_document_uploaded with caller-supplied fields, and our
+            # synthetic / minimal PDF can't always be parsed back. If we
+            # extracted something, prefer that; otherwise leave the existing
+            # fields alone.
+            existing = await self.pg.get_document(doc_id) if hasattr(
+                self.pg, "get_document"
+            ) else None
+            existing_fields = (existing or {}).get("extracted_fields") or {}
+            new_fields = extracted["fields"] or {}
+            if not new_fields and existing_fields:
+                logger.info(
+                    "batch_index_skip_clobber",
+                    extra={"doc_id": doc_id, "reason": "extractor_returned_empty"},
+                )
+                merged_fields = existing_fields
+            else:
+                merged_fields = {**existing_fields, **new_fields}
+
             doc_record = {
                 "document_id":      doc_id,
                 "applicant_id":     applicant_id,
@@ -194,9 +215,9 @@ class BatchIndexer:
                 "document_category": s3_doc.category,
                 "borrower_role":    "primary",
                 "s3_key":           s3_doc.key,
-                "status":           "indexed",
+                "status":           "indexed" if merged_fields else "received",
                 "is_current":       True,
-                "extracted_fields": extracted["fields"],
+                "extracted_fields": merged_fields,
                 "confidence_score": extracted["confidence"],
             }
             try:

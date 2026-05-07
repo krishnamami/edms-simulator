@@ -481,11 +481,49 @@ class AggregationService:
             except Exception as exc:
                 logger.warning("hydrate_primary_docs_failed", extra={"error": str(exc)})
 
+        # Columns on the document_index row — anything else on the incoming
+        # doc dict is content that belongs in the extracted_fields jsonb.
+        _METADATA_KEYS = {
+            "document_id", "applicant_id", "application_id",
+            "document_type", "document_category", "borrower_role",
+            "s3_key", "status", "expiry_date", "is_current",
+            "extracted_fields", "confidence_score",
+        }
+
         for d in documents:
             role = d.get("borrower_role", "primary")
             doc_applicant = (
                 co_applicant_id if (role == "co_borrower" and co_applicant_id) else applicant_id
             )
+
+            # Resolve extracted_fields:
+            #   1. If caller nested them under "extracted_fields", use that
+            #      directly (and don't double-nest by storing the whole d).
+            #   2. Otherwise treat top-level non-metadata keys as the
+            #      extracted content (the demo / typical caller spread
+            #      fields at the top level).
+            nested = d.get("extracted_fields")
+            if isinstance(nested, dict) and nested:
+                extracted_fields = nested
+            elif isinstance(nested, str) and nested:
+                extracted_fields = nested  # asyncpg will store the JSON string
+            else:
+                extracted_fields = {
+                    k: v for k, v in d.items() if k not in _METADATA_KEYS
+                }
+
+            # Status: "indexed" when we actually have extracted content;
+            # "received" when the row is just a placeholder waiting on
+            # extraction. Caller can override either way.
+            has_fields = bool(
+                extracted_fields if isinstance(extracted_fields, dict)
+                else extracted_fields  # truthy string passes
+            )
+            status = d.get(
+                "status",
+                "indexed" if has_fields else "received",
+            )
+
             saved_doc = {
                 "document_id":       d.get("document_id"),
                 "applicant_id":      doc_applicant,
@@ -494,11 +532,9 @@ class AggregationService:
                 "document_category": d.get("document_category", "income"),
                 "borrower_role":     role,
                 "s3_key":            d.get("s3_key"),
-                "status":            d.get("status", "received"),
+                "status":            status,
                 "is_current":        True,
-                # Treat the incoming doc payload itself as extracted_fields —
-                # it carries box1_wages / employer_name / etc. at top level.
-                "extracted_fields":  d,
+                "extracted_fields":  extracted_fields,
                 "confidence_score":  d.get("confidence_score", 0.95),
             }
             try:
@@ -506,6 +542,15 @@ class AggregationService:
             except Exception as exc:
                 logger.warning("save_document_failed", extra={"error": str(exc)})
                 continue
+            logger.info(
+                "document_persisted",
+                document_id=saved_doc["document_id"],
+                document_type=saved_doc["document_type"],
+                status=saved_doc["status"],
+                extracted_field_count=(
+                    len(extracted_fields) if isinstance(extracted_fields, dict) else 0
+                ),
+            )
             also_compare_with = (
                 other_docs_for_co if doc_applicant == co_applicant_id
                 else other_docs_for_primary
