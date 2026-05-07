@@ -211,12 +211,40 @@ class AggregationService:
             self.golden_record_store.save(gr)
             self.redis_store.set_status(applicant_id, "stale")
 
+        # Hydrate the application context so single-doc uploads still see the
+        # full borrower picture. Without this:
+        #   - co_applicant_id stayed None → co-borrower W2s were filed under
+        #     the primary's applicant_id, and co-side income never assembled
+        #   - documents was just this request's payload → assembling on a
+        #     CREDIT_REPORT alone wiped primary qualifying back to $0
+        application_id = p.get("application_id", "")
+        co_applicant_id: Optional[str] = None
+        loan_data: dict = {}
+        if application_id:
+            app = await self.postgres_store.get_application(application_id)
+        else:
+            app = await self.postgres_store.get_application_by_applicant(applicant_id)
+        if app:
+            application_id = application_id or app.get("application_id", "")
+            co_applicant_id = app.get("co_applicant_id")
+            loan_data = {
+                "loan_amount":      app.get("loan_amount"),
+                "interest_rate":    app.get("interest_rate"),
+                "loan_term_months": app.get("loan_term_months"),
+            }
+
+        documents = await self._merge_request_with_indexed_docs(
+            applicant_id=applicant_id,
+            co_applicant_id=co_applicant_id,
+            new_docs=p.get("all_documents", []),
+        )
+
         await self._run_assembly(
             applicant_id=applicant_id,
-            application_id=p.get("application_id", ""),
-            co_applicant_id=None,
-            documents=p.get("all_documents", []),
-            loan_data={},
+            application_id=application_id,
+            co_applicant_id=co_applicant_id,
+            documents=documents,
+            loan_data=loan_data,
         )
 
         gr.status = StatusMachine.transition(
@@ -341,6 +369,64 @@ class AggregationService:
             application_id=application_id,
         )
 
+    async def _merge_request_with_indexed_docs(
+        self,
+        applicant_id: str,
+        co_applicant_id: Optional[str],
+        new_docs: list,
+    ) -> list:
+        """Build the cumulative doc list the assembler needs.
+
+        save_document stores the original incoming doc inside the
+        ``extracted_fields`` jsonb column, so we lift those fields back to
+        the top level on the way out — calculate_w2_salaried etc. read
+        ``box1_wages`` directly off the doc dict.
+
+        New docs in the request override existing rows on document_id so a
+        re-upload with corrected fields wins over the stale indexed copy.
+        """
+        merged: dict = {}
+
+        async def _load(aid: Optional[str]):
+            if not aid:
+                return
+            try:
+                rows = await self.postgres_store.get_documents_for_applicant(aid)
+            except Exception as exc:
+                logger.warning("hydrate_docs_failed", applicant_id=aid, error=str(exc))
+                return
+            for row in rows:
+                fields = row.get("extracted_fields") or {}
+                if isinstance(fields, str):
+                    import json as _json
+                    try:
+                        fields = _json.loads(fields)
+                    except Exception:
+                        fields = {}
+                doc_id = row.get("document_id")
+                if not doc_id:
+                    continue
+                merged[doc_id] = {
+                    **fields,
+                    "document_id":       doc_id,
+                    "document_type":     row.get("document_type"),
+                    "document_category": row.get("document_category"),
+                    "borrower_role":     row.get("borrower_role"),
+                    "s3_key":            row.get("s3_key"),
+                    "confidence_score":  row.get("confidence_score"),
+                    "status":            row.get("status"),
+                }
+
+        await _load(applicant_id)
+        await _load(co_applicant_id)
+
+        for d in new_docs or []:
+            doc_id = d.get("document_id")
+            if doc_id:
+                merged[doc_id] = d
+
+        return list(merged.values())
+
     async def _persist_and_reconcile_documents(
         self,
         documents: list,
@@ -393,12 +479,14 @@ class AggregationService:
                 )
                 self.redis_store.invalidate_income_profile(doc_applicant)
 
-        # Always bust the graph + income caches after persisting docs — even
-        # without conflicts. Otherwise /graph/summary keeps returning a stale
-        # document_count from before the inserts.
-        self.redis_store.invalidate_income_profile(applicant_id)
+        # Always bust the graph cache after persisting docs — even without
+        # conflicts. Otherwise /graph/summary keeps returning a stale
+        # document_count from before the inserts. Use a graph-only invalidate
+        # so we don't blow away the income/credit caches _run_assembly just
+        # warmed (invalidate_income_profile would clobber them).
+        self.redis_store.invalidate_graph_summary(applicant_id)
         if co_applicant_id:
-            self.redis_store.invalidate_income_profile(co_applicant_id)
+            self.redis_store.invalidate_graph_summary(co_applicant_id)
 
     async def _handle_property_document_uploaded(self, event) -> dict:
         """Re-assemble a PropertyProfile after a new property doc lands.

@@ -173,6 +173,12 @@ class RedisStore:
         except Exception as e:
             logger.warning("redis_invalidate_failed", extra={"error": str(e)})
 
+    def invalidate_graph_summary(self, applicant_id: str) -> None:
+        try:
+            self._r.delete(f"graph:{applicant_id}")
+        except Exception as e:
+            logger.warning("redis_invalidate_graph_failed", extra={"error": str(e)})
+
     def set_graph_summary(self, applicant_id: str, summary: dict) -> bool:
         try:
             self._r.setex(
