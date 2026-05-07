@@ -376,19 +376,21 @@ class AggregationService:
 
         # The borrower layer just changed — drop the cached context so the
         # next GET /application/{id}/context re-assembles with fresh data.
-        # (Document persistence + reconciliation already ran at the top of
-        # this method so the credit assembler could read the new docs.)
-        if application_id:
-            self.redis_store.invalidate_context(application_id)
-        else:
-            try:
-                app = await self.postgres_store.get_application_by_applicant(
-                    applicant_id
-                )
-                if app:
-                    self.redis_store.invalidate_context(app["application_id"])
-            except Exception as exc:
-                logger.warning("invalidate_context_failed", extra={"error": str(exc)})
+        # Always look up via applicant_id rather than trusting the caller's
+        # application_id arg: the BatchIndexer path in particular passes
+        # application_id directly, but other callers (e.g. webhook-driven
+        # ingestion) may not have it. get_application_by_applicant covers
+        # both primary and co-applicant matches.
+        try:
+            app = await self.postgres_store.get_application_by_applicant(
+                applicant_id
+            )
+            if app:
+                self.redis_store.invalidate_context(app["application_id"])
+            elif application_id:
+                self.redis_store.invalidate_context(application_id)
+        except Exception as exc:
+            logger.warning("invalidate_context_failed", extra={"error": str(exc)})
 
     async def _merge_request_with_indexed_docs(
         self,

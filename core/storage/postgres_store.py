@@ -558,24 +558,24 @@ class PostgresStore:
     # ---------------- income profiles (versioned) -----------------
 
     async def save_income_profile(self, profile: dict) -> str:
-        """Insert a new income profile version, marking the prior current version superseded."""
+        """Upsert a single current income profile per applicant. Old rows
+        are removed rather than versioned via superseded_by — one row per
+        applicant, not a growing history. Functionally equivalent to
+        INSERT ... ON CONFLICT (applicant_id) DO UPDATE, implemented as
+        DELETE + INSERT because the schema doesn't carry a unique
+        constraint on applicant_id and we want to avoid a prod-side
+        migration to add one."""
         applicant_id = profile["applicant_id"]
-        current = await db.fetchrow(
-            """
-            SELECT profile_id, version
-            FROM income_profiles
-            WHERE applicant_id = $1 AND superseded_by IS NULL
-            """,
+        await db.execute(
+            "DELETE FROM income_profiles WHERE applicant_id = $1",
             applicant_id,
         )
-        version = (current["version"] + 1) if current else 1
-
         new_id = await db.fetchval(
             """
             INSERT INTO income_profiles (
                 applicant_id, application_id, assembled_at, profile_data,
                 lineage_hash, version
-            ) VALUES ($1, $2, $3::timestamptz, $4::jsonb, $5, $6)
+            ) VALUES ($1, $2, $3::timestamptz, $4::jsonb, $5, 1)
             RETURNING profile_id
             """,
             applicant_id,
@@ -583,14 +583,7 @@ class PostgresStore:
             _to_ts(profile["assembled_at"]),
             _to_jsonb(profile),
             profile.get("lineage_hash", ""),
-            version,
         )
-        if current:
-            await db.execute(
-                "UPDATE income_profiles SET superseded_by = $1 WHERE profile_id = $2",
-                new_id,
-                current["profile_id"],
-            )
         return str(new_id)
 
     async def get_income_profile(self, applicant_id: str) -> Optional[dict]:
@@ -614,9 +607,16 @@ class PostgresStore:
     # ---------------- credit profiles -----------------
 
     async def save_credit_profile(self, profile: dict) -> None:
+        """Upsert a single current credit profile per applicant. Old rows
+        (including any historical is_current=FALSE rows from the prior
+        versioned implementation) are removed so the table stays at one
+        row per applicant. Functionally equivalent to INSERT ... ON
+        CONFLICT (applicant_id) DO UPDATE; uses DELETE + INSERT to avoid
+        a prod-side schema migration to promote the partial unique index
+        idx_credit_current to a full unique constraint."""
         applicant_id = profile["applicant_id"]
         await db.execute(
-            "UPDATE credit_profiles SET is_current = FALSE WHERE applicant_id = $1 AND is_current = TRUE",
+            "DELETE FROM credit_profiles WHERE applicant_id = $1",
             applicant_id,
         )
         await db.execute(
