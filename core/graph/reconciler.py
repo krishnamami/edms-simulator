@@ -7,6 +7,7 @@ so within-event and across-document conflict rules stay aligned.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Optional
@@ -15,6 +16,22 @@ from core.graph.models import DocumentRelationship, RelationshipType
 from core.ingestion.confidence import NUMERIC_CONFLICT_THRESHOLD
 
 logger = logging.getLogger(__name__)
+
+
+def _deterministic_relationship_id(
+    applicant_id: str,
+    source_doc_id: str,
+    target_doc_id: str,
+    field_label: str,
+    rel_type: str,
+) -> str:
+    """Stable id so re-running reconciliation upserts a row instead of
+    piling N copies of the same logical edge into document_relationships
+    every time _persist_and_reconcile_documents runs."""
+    key = "|".join([
+        applicant_id, source_doc_id, target_doc_id, field_label, rel_type,
+    ])
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
 
 # Which field pairs to compare for each document type combination.
@@ -42,7 +59,22 @@ COMPARISON_MAP: dict[tuple, list[tuple]] = {
         ("employer_name",  "employer_name", 0.9),
         ("gross_pay",      "gross_pay",     0.6),
     ],
-    ("W2_CURRENT", "W2_CURRENT"):         [],  # same doc type — skip
+    # Cross-borrower W2 pairs (joint applications): only ``tax_year`` is
+    # legitimately comparable — different borrowers should have different
+    # employers and wages, so don't compare those. tax_year matching is
+    # what proves both borrowers filed for the same loan-application year.
+    ("W2_CURRENT", "W2_CURRENT"): [
+        ("tax_year", "tax_year", 0.5),
+    ],
+    # Credit ↔ income cross-checks. CREDIT_REPORT carries ``ssn_last4``
+    # in some pulls; W2 carries it too. Confirms the report belongs to
+    # the same person.
+    ("W2_CURRENT", "CREDIT_REPORT"): [
+        ("ssn_last4", "ssn_last4", 0.6),
+    ],
+    ("PAYSTUB_CURRENT", "CREDIT_REPORT"): [
+        ("ssn_last4", "ssn_last4", 0.6),
+    ],
 }
 
 
@@ -51,13 +83,29 @@ class DocumentReconciler:
         self.postgres_store = postgres_store
 
     async def reconcile(
-        self, applicant_id: str, new_doc: dict
+        self,
+        applicant_id: str,
+        new_doc: dict,
+        also_compare_with: Optional[list] = None,
     ) -> list[DocumentRelationship]:
+        """Compare ``new_doc`` against every other current doc for
+        ``applicant_id`` plus any extra docs in ``also_compare_with``
+        (typically the co-applicant's docs, so cross-borrower edges get
+        emitted within a joint application)."""
         existing = await self.postgres_store.get_documents_for_applicant(applicant_id)
-        relationships: list[DocumentRelationship] = []
-        for existing_doc in existing:
-            if existing_doc["document_id"] == new_doc["document_id"]:
+        candidates = list(existing) + list(also_compare_with or [])
+        # De-dupe by document_id; new_doc itself never matches.
+        seen: set = set()
+        unique: list[dict] = []
+        for d in candidates:
+            doc_id = d.get("document_id")
+            if not doc_id or doc_id == new_doc.get("document_id") or doc_id in seen:
                 continue
+            seen.add(doc_id)
+            unique.append(d)
+
+        relationships: list[DocumentRelationship] = []
+        for existing_doc in unique:
             relationships.extend(self._compare_pair(applicant_id, new_doc, existing_doc))
         for rel in relationships:
             await self.postgres_store.save_relationship(rel.model_dump())
@@ -146,6 +194,10 @@ class DocumentReconciler:
                     f"{NUMERIC_CONFLICT_THRESHOLD*100:.0f}% — CONFLICT"
                 )
             return DocumentRelationship(
+                relationship_id=_deterministic_relationship_id(
+                    applicant_id, source_doc_id, target_doc_id,
+                    field_label, rel_type.value,
+                ),
                 applicant_id=applicant_id,
                 source_doc_id=source_doc_id,
                 target_doc_id=target_doc_id,
@@ -172,6 +224,10 @@ class DocumentReconciler:
                 rel_type = RelationshipType.CONTRADICTS
                 conf = (1 - score) * weight
             return DocumentRelationship(
+                relationship_id=_deterministic_relationship_id(
+                    applicant_id, source_doc_id, target_doc_id,
+                    field_label, rel_type.value,
+                ),
                 applicant_id=applicant_id,
                 source_doc_id=source_doc_id,
                 target_doc_id=target_doc_id,

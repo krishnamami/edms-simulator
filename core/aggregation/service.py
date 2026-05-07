@@ -301,13 +301,21 @@ class AggregationService:
         ]
 
         # Prefer real CREDIT_REPORT docs over synthetic if any are indexed
-        # for the applicant; falls back internally when none exist.
-        primary_credit = self.credit_assembler.assemble(
-            applicant_id, loan_data, docs=primary_docs
+        # for the applicant. The assembler will pull a fresh doc list from
+        # postgres if none of the in-memory docs match — this protects
+        # against the in-memory hydration path missing fields.
+        primary_credit = await self.credit_assembler.assemble(
+            applicant_id,
+            loan_data,
+            postgres_store=self.postgres_store,
+            docs=primary_docs,
         )
         co_credit = (
-            self.credit_assembler.assemble(
-                co_applicant_id, loan_data, docs=co_docs
+            await self.credit_assembler.assemble(
+                co_applicant_id,
+                loan_data,
+                postgres_store=self.postgres_store,
+                docs=co_docs,
             )
             if co_applicant_id
             else None
@@ -449,6 +457,27 @@ class AggregationService:
         from core.graph.reconciler import DocumentReconciler
 
         reconciler = DocumentReconciler(self.postgres_store)
+
+        # Pre-fetch the other-borrower's current docs so the reconciler can
+        # emit cross-applicant edges (joint applications). Without this the
+        # primary's W2 and the co-borrower's W2 — under different applicant
+        # ids since the 3c631b7 attribution fix — never get compared.
+        other_docs_for_primary: list = []
+        other_docs_for_co: list = []
+        if co_applicant_id:
+            try:
+                other_docs_for_primary = await self.postgres_store.get_documents_for_applicant(
+                    co_applicant_id
+                )
+            except Exception as exc:
+                logger.warning("hydrate_co_docs_failed", extra={"error": str(exc)})
+            try:
+                other_docs_for_co = await self.postgres_store.get_documents_for_applicant(
+                    applicant_id
+                )
+            except Exception as exc:
+                logger.warning("hydrate_primary_docs_failed", extra={"error": str(exc)})
+
         for d in documents:
             role = d.get("borrower_role", "primary")
             doc_applicant = (
@@ -474,8 +503,15 @@ class AggregationService:
             except Exception as exc:
                 logger.warning("save_document_failed", extra={"error": str(exc)})
                 continue
+            also_compare_with = (
+                other_docs_for_co if doc_applicant == co_applicant_id
+                else other_docs_for_primary
+            )
             try:
-                new_rels = await reconciler.reconcile(doc_applicant, saved_doc)
+                new_rels = await reconciler.reconcile(
+                    doc_applicant, saved_doc,
+                    also_compare_with=also_compare_with,
+                )
             except Exception as exc:
                 logger.warning("reconciler_failed", extra={"error": str(exc)})
                 continue
