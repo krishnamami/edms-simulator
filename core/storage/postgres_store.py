@@ -524,6 +524,13 @@ class PostgresStore:
         )
         return _row_to_dict(row)
 
+    async def get_table_count(self, table_name: str) -> int:
+        """Used by the admin /admin/table-count endpoint. Caller must
+        whitelist ``table_name`` — this method does NOT validate, since
+        it interpolates the identifier into the SQL string."""
+        val = await db.fetchval(f"SELECT COUNT(*) FROM {table_name}")
+        return int(val or 0)
+
     async def get_context_at(
         self, application_id: str, timestamp: str
     ) -> Optional[dict]:

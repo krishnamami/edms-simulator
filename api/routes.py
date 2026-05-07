@@ -2167,6 +2167,35 @@ async def indexing_run_detail(request: Request, run_id: str):
     return row
 
 
+_ADMIN_ALLOWED_TABLES = {
+    "applicants", "applicant_identity_xref", "applications",
+    "income_profiles", "credit_profiles",
+    "document_index", "document_relationships",
+    "properties", "property_profiles",
+    "raw_ingestion", "context_versions",
+    "indexing_watermarks", "indexing_runs",
+    "webhooks", "webhook_deliveries",
+    "mismo_doc_type_registry", "los_connectors",
+}
+
+
+@router.get(
+    "/admin/table-count/{table_name}", dependencies=[Depends(verify_api_key)]
+)
+async def admin_table_count(request: Request, table_name: str):
+    if table_name not in _ADMIN_ALLOWED_TABLES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"table {table_name!r} not in allowed list",
+        )
+    pg = request.app.state.postgres_store
+    try:
+        count = await pg.get_table_count(table_name)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"table": table_name, "count": count}
+
+
 @router.put("/indexing/watermark", dependencies=[Depends(verify_api_key)])
 async def indexing_set_watermark(request: Request, body: dict):
     """Manually move the watermark. ⚠ resets which files get re-indexed

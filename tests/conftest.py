@@ -373,6 +373,27 @@ class FakePostgresStore:
     async def get_indexing_run(self, run_id):
         return self.indexing_runs.get(str(run_id))
 
+    async def get_table_count(self, table_name):
+        # Best-effort fake — map table_name to the in-memory store length.
+        mapping = {
+            "applicants":              len(self.applicants),
+            "applicant_identity_xref": len(self.xrefs),
+            "applications":            len(self.applications),
+            "income_profiles":         len(self.income_profiles),
+            "credit_profiles":         len(self.credit_profiles),
+            "document_index":          len(self.documents),
+            "document_relationships":  len(self.relationships),
+            "properties":              len(self.properties),
+            "property_profiles":       len(self.property_profiles),
+            "raw_ingestion":           0,
+            "context_versions":        len(self.context_versions),
+            "indexing_watermarks":     len(self.watermarks),
+            "indexing_runs":           len(self.indexing_runs),
+            "webhooks":                len(self.webhooks),
+            "webhook_deliveries":      len(self.webhook_deliveries),
+        }
+        return mapping.get(table_name, 0)
+
 
 @pytest.fixture
 def xref_store():
