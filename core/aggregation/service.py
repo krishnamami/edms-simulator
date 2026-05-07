@@ -369,18 +369,15 @@ class AggregationService:
         await self.postgres_store.save_credit_profile(primary_credit)
         if co_credit:
             await self.postgres_store.save_credit_profile(co_credit)
-        self.redis_store.set_income_profile(applicant_id, profile.model_dump())
-        self.redis_store.set_credit_profile(applicant_id, primary_credit)
-        if co_credit:
-            self.redis_store.set_credit_profile(co_applicant_id, co_credit)
 
-        # The borrower layer just changed — drop the cached context so the
-        # next GET /application/{id}/context re-assembles with fresh data.
-        # Always look up via applicant_id rather than trusting the caller's
-        # application_id arg: the BatchIndexer path in particular passes
-        # application_id directly, but other callers (e.g. webhook-driven
-        # ingestion) may not have it. get_application_by_applicant covers
-        # both primary and co-applicant matches.
+        # Invalidate the context cache BEFORE warming income / credit so the
+        # worst case is "no cache" (next GET /application/{id}/context reads
+        # through to PG) rather than "fresh income+credit sitting beside a
+        # stale context blob still embedding the old income". Always look up
+        # via applicant_id rather than trusting the caller's application_id
+        # arg: BatchIndexer passes application_id directly, but other callers
+        # (e.g. webhook-driven ingestion) may not have it.
+        # get_application_by_applicant covers both primary and co-applicant.
         try:
             app = await self.postgres_store.get_application_by_applicant(
                 applicant_id
@@ -390,7 +387,12 @@ class AggregationService:
             elif application_id:
                 self.redis_store.invalidate_context(application_id)
         except Exception as exc:
-            logger.warning("invalidate_context_failed", extra={"error": str(exc)})
+            logger.warning("invalidate_context_failed", error=str(exc))
+
+        self.redis_store.set_income_profile(applicant_id, profile.model_dump())
+        self.redis_store.set_credit_profile(applicant_id, primary_credit)
+        if co_credit:
+            self.redis_store.set_credit_profile(co_applicant_id, co_credit)
 
     async def _merge_request_with_indexed_docs(
         self,
