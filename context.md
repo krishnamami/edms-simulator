@@ -38,7 +38,10 @@ Redis port is **6380**.
 
 - Branch: `main`, all committed and pushed to origin (`https://github.com/krishnamami/edms-simulator`). Last 5 commits = production-grade indexing coverage + 15 new field extractors + Tier-2 cross-doc graph & nested context + Claude Vision AI fallback.
 - Tests: **329 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`). +3 integration + 8 smoke = 340 green.
-- `simulate_local.py` STEPS 1-5 still PASS; STEP 6 has a known pre-existing failure in the identity resolver (returns `match_method='probabilistic'` where the script asserts `'deterministic'` for an SSN-hash match — applicant_id resolution itself is correct). `simulate_s3_edms.py` has a known pre-existing `TypeError` (`generate_paystub() got an unexpected keyword argument 'employee_address'`) — script-side signature drift. `watch_pipeline.py --full` runs to completion through all 10 steps. `scripts/stress_test_indexing.py` runs 23 checks across 7 tests — concurrency, indexer/upload race, cache invalidation, doc-type matrix, cross-applicant throughput, watermark rewind, webhook fan-out — all green. **`scripts/feed_synthetic_loan.py` (new this session) drives a 43-document mortgage file end-to-end through the API in 4 timed waves and validates every layer; current live result = 16/16 PASS.**
+- `simulate_local.py` STEPS 1-5 still PASS; STEP 6 has a known pre-existing failure in the identity resolver (returns `match_method='probabilistic'` where the script asserts `'deterministic'` for an SSN-hash match — applicant_id resolution itself is correct). `simulate_s3_edms.py` has a known pre-existing `TypeError` (`generate_paystub() got an unexpected keyword argument 'employee_address'`) — script-side signature drift. `watch_pipeline.py --full` runs to completion through all 10 steps. `scripts/stress_test_indexing.py` runs 23 checks across 7 tests — concurrency, indexer/upload race, cache invalidation, doc-type matrix, cross-applicant throughput, watermark rewind, webhook fan-out — all green. **`scripts/feed_synthetic_loan.py` drives a 43-document mortgage file end-to-end through the API in 4 timed waves and validates every layer; current live result = OVERALL PASS, 16/16 checks, 18/19 readiness flags true** (only `no_critical_conflicts` remains false because 5 same-applicant cross-doc comparisons exceed thresholds — those are real signals, not noise).
+- **`extraction_method` per-doc provenance.** Every `document_index` row carries one of `deterministic` / `caller_supplied` / `ai_vision` / `none`. `save_document` enforces the priority `deterministic > caller_supplied > ai_vision > none` on the upsert via SQL `CASE` so a doc upserted by the indexer with `deterministic` correctly upgrades from a prior `caller_supplied`, and a later AI-Vision pass doesn't downgrade. `/applicant/{id}/field/{name}` surfaces the method on every response; `/applicant/{id}/graph/summary` exposes an `extraction_breakdown: {bucket: count}` for ops visibility.
+- **LTV / PITI / DTI now compute when loan terms are present.** `_handle_application_submitted` writes `loan_amount` / `interest_rate` / `loan_term_months` to the `applications` row from the `/loans` payload (was being silently dropped — root cause of `dti_calculable` / `ltv_calculable` being permanently false). `ContextAssembler` falls back through `loan_terms` (URLA / RATE_LOCK) → `app` for the effective values; LTV uses `loan_amount / min(appraised, purchase_price) × 100`; PITI computed inline via amortization when `PropertyAssembler.piti_total` is null. New `title_clear` logic: true when both `TITLE_COMMITMENT` AND `TITLE_INSURANCE` are received.
+- **Reconciler cross-applicant allow-list.** New `_CROSS_APPLICANT_PAIRS` frozenset in `core/graph/reconciler.py` — only same-type W2 / paystub pairs (whose only field tuple is `tax_year`) are allowed to compare across borrowers; everything else silently skips. Killed 6 false-positive contradicts edges (primary's IRS wages vs co-borrower's W2 wages). Synthetic-load contradicts dropped 13 → 5; all remaining edges are same-applicant (verified by direct PG query).
 - **Every doc type a real loan file carries is now indexed, cached, and tracked.** `MISMO_TO_INTERNAL` + new `DOC_TYPE_ALIASES` canonicalize caller-supplied names (`DRIVERS_LICENSE` → `IDENTITY_DL`, `FORM_1040` → `TAX_RETURN_1040_CURRENT`); `_CATEGORY_MAP` renamed `compliance` → `vendor` and `loan` → `loan_terms` to align with the missing-documents catalog. Two new entity Redis caches: `asset:{applicant_id}` (4h TTL — total_liquid_assets / total_retirement / gift_funds / asset_doc_count) and `identity:{applicant_id}` (24h TTL — dl_verified / ssn_verified / ofac_clear / identity_complete). Both are write-through from `_run_assembly`. The missing-documents catalog now carries 15 required slots (with `alternates` for W2_CURRENT∥W2_PRIOR / AUS_DU∥LP / HOI_BINDER∥HOI_DECLARATIONS) + 9 conditional slots (each with the `reason` clause that triggers it) + `total_expected` / `total_received` / `completeness_pct`.
 - **23 doc-type extractors in the indexer dispatch.** 8 original (W2 / paystub / bank / credit / appraisal / HOI / flood / tax) + 15 new (`income_extractors.py`: IRS / 1040 / Schedule C / Schedule E / 1099 / K-1; `asset_extractors.py`: retirement / brokerage / gift_letter; extended `property/extractors.py`: AVM / 1004MC / purchase_agreement; `loan_extractors.py`: URLA_1003 / rate_lock / offer_letter). All share `_utils.py` helpers (`safe_text`, `money_to_float`, `find_labeled` / `find_money` / `find_int`, `fraction_populated`). Every extractor honours the contract: `({}, 0.5)` on any failure, `base_conf × fraction_populated` on success. 38 dispatch entries cover canonical + alias names. Confidence ceilings: IRS=0.99, URLA=0.95, 1099=0.93, K-1/Schedule C/E/1040/property tax=0.90, retirement/brokerage=0.92, AVM=0.87, gift_letter=0.88, offer_letter=0.82.
 - **Tier-2 cross-doc graph.** `COMPARISON_MAP` extended with new field tuples on existing entries (`box1_wages↔wages_salaries`, `wages_line1`, `avm_value`, `ending_balance`, `schedule_c_income / e_income`, `nonemployee_compensation↔other_income`) and 7 entirely new pairs (URLA↔W2, URLA↔purchase, RATE_LOCK↔URLA, OFFER↔W2/paystub/VOE, K1↔1040, 1004MC↔appraisal, retirement self-pair). New logical field `monthly_income_stated_annual` annualizes URLA monthly stated income before W2 comparison. Per-pair `FIELD_CONFLICT_THRESHOLDS` for the new pairs (URLA stated income 10%, OFFER 15%, RATE_LOCK 5%, 1004MC 20%).
@@ -62,6 +65,11 @@ Redis port is **6380**.
 Latest commits (top of `main`):
 
 ```
+67ed00f  fix(context): wire LTV, PITI/DTI computation + title_clear so 3 readiness flags fire
+7b7681f  feat(extraction): track extraction_method per document — deterministic / caller_supplied / ai_vision / none
+074b772  fix(reconciler): cross-applicant comparison allow-list — kill primary↔co-borrower false contradicts
+217d0e3  feat(verification): scripts/feed_synthetic_loan.py end-to-end load + None-tolerance fix + docs
+1094b0d  docs: refresh context.md + PRD with session 8's Tier-1/2/3 indexing pipeline
 1bde27a  feat(extractors): Claude Vision AI fallback for the indexer + pdf_adapter
 73d8d6e  feat(graph,context): Tier-2 cross-doc graph + nested borrower context + 7 readiness flags
 2f97bd4  feat(extractors): structured-text extractors for the 15 income/asset/property/loan-terms doc types
@@ -377,6 +385,110 @@ Errors:
   past the highest stored id; SSN + source-id indexes rebuilt.
 - ✅ **Phase A schema applied to RDS prod**. `raw_ingestion` table + 4 indexes
   live; verified via `scripts/watch_pipeline.py --live`.
+
+### Resolved this session (Tier-2 polish — false contradicts, extraction tracking, LTV/DTI/title)
+
+Three commits, all on `main`, pushed to origin. Theme: turn the
+synthetic-load report card from "OVERALL PASS but with caveats"
+(13 contradicts, dti/ltv/title flags stuck false, no
+extraction_method observability) into a clean "OVERALL PASS, 18/19
+readiness flags true, all per-doc extraction provenance tracked".
+
+- ✅ **Reconciler cross-applicant allow-list** (`074b772`). The
+  reconciler's joint-application logic (added in `d0315f8` to catch
+  cross-W2 tax_year mismatches) was emitting comparisons across
+  borrowers for *every* COMPARISON_MAP pair, including the new
+  Tier-2 per-borrower pairs (OFFER↔W2, IRS↔W2, FORM_1040↔W2,
+  URLA↔W2, K1↔1040). Result: primary's $125k IRS wages compared
+  against co-borrower's $85k W2 box1 wages = false contradicts edge
+  for two different people. Synthetic-load run produced ~10 such
+  edges. New `_CROSS_APPLICANT_PAIRS` allow-list in
+  `core/graph/reconciler.py` lists the doc-type pairs whose
+  comparisons legitimately fire across borrowers (currently
+  `W2_CURRENT↔W2_CURRENT`, `W2_PRIOR↔W2_PRIOR`,
+  `PAYSTUB_CURRENT↔PAYSTUB_CURRENT` — same-type pairs whose only
+  field tuple is `tax_year`). `reconcile()` now skips any
+  cross-applicant pair not in the allow-list. Live result: 13 → 7
+  contradicts, all 7 same-applicant (verified by direct PG query
+  showing every contradicts row has `src.applicant_id ==
+  tgt.applicant_id`). Reverted the earlier category-based filter in
+  `_persist_and_reconcile_documents` (too coarse — VOE_TWN and
+  AUS_DU_FINDINGS are stored as `vendor` category but contain
+  per-borrower data, leaked through).
+
+- ✅ **`extraction_method` per-doc provenance tracking** (`7b7681f`).
+  New `extraction_method VARCHAR DEFAULT 'none'` column on
+  `document_index` so ops + Decision OS consumers can see HOW each
+  document's fields were populated. Four buckets:
+  `deterministic` (pymupdf / income / asset / loan / property
+  extractor), `caller_supplied` (LOS or API caller's structured
+  fields — bulk of production traffic), `ai_vision` (Claude Vision
+  fallback), `none` (placeholder row). Priority on upsert via SQL
+  `CASE`: `deterministic > caller_supplied > ai_vision > none` so a
+  doc upserted by the indexer with `deterministic` correctly
+  upgrades from `caller_supplied`, but a later AI-Vision pass
+  doesn't downgrade an existing `caller_supplied` value.
+  - `core/storage/postgres_store.py` — `save_document` writes the
+    new column, `get_all_field_values` SELECTs it,
+    `get_graph_summary` computes `extraction_breakdown =
+    {bucket: count}`.
+  - `core/indexing/batch_indexer.py` — `_extract` tags the dispatch
+    result with the bucket; `_process_applicant` propagates it.
+  - `core/aggregation/service.py` —
+    `_persist_and_reconcile_documents` defaults to
+    `caller_supplied` for the event-driven path; auto-downgrades to
+    `none` when `extracted_fields` is empty.
+  - `api/routes.py` — `/applicant/{id}/field/{name}` surfaces
+    `extraction_method` at the response top level.
+  - Schema migration: `ALTER TABLE … ADD COLUMN IF NOT EXISTS` is
+    idempotent — applying `infra/schema.sql` against prod safely
+    adds the column with all existing rows defaulting to `'none'`.
+  - Live result: `/graph/summary` returns
+    `extraction_breakdown: {deterministic: 0, caller_supplied: 36,
+    ai_vision: 0, none: 5}` matching `document_count: 41`.
+
+- ✅ **LTV / PITI / DTI / title_clear wired** (`67ed00f`). Three
+  readiness flags (`dti_calculable`, `ltv_calculable`,
+  `title_clear`) were stuck at `false` even on fully-populated joint
+  applications.
+  - **Root cause for DTI/LTV**: loan_amount / interest_rate /
+    loan_term_months from the `/loans` payload were never written
+    to the `applications` row. `_handle_application_submitted`
+    built the application dict without those fields. The downstream
+    LTV/DTI math in ContextAssembler depends on them — so it always
+    found NULL and bailed.
+  - Fix in `core/aggregation/service.py`: call
+    `update_application_loan_data` after `save_application` to
+    persist loan_amount / interest_rate / loan_term_months /
+    loan_purpose from `p["loan"]`.
+  - Fix in `core/context/assembler.py`: hoisted `_build_loan_terms`
+    to run early. Effective `loan_amount` =
+    `loan_terms.loan_amount → rate_lock.loan_amount → app.loan_amount`
+    (priority order). Same fallback pattern for `interest_rate` and
+    `loan_term_months`. **LTV math**: `loan_amount / min(appraised,
+    purchase_price) × 100` per underwriting convention. **PITI
+    math**: prefers PropertyAssembler's `piti_total` when present,
+    otherwise computes inline from amortization
+    (`P × r(1+r)^n / ((1+r)^n − 1)`) + `annual_taxes/12` +
+    `hoi_monthly` + `hoa_monthly`. Critical because PropertyAssembler
+    often runs before the application's loan_data is set, leaving
+    its `piti_total = None`. **DTI math**: `front = PITI / income`,
+    `back = (PITI + obligations) / income`. New `_compute_piti_inline`
+    staticmethod handles overflow / divide-by-zero / missing-input.
+    New `_f()` module helper for safe float coercion.
+  - **`title_clear` flag**: true when both `TITLE_COMMITMENT` AND
+    `TITLE_INSURANCE` are received (insurance binder issued = title
+    insurable = clear for lending purposes).
+  - Live result: `ltv: 80.0%` (matches $360k / $450k = 80% exactly),
+    `front_end_dti: 16.67%`, `back_end_dti: 17.55%`, `title_clear:
+    true`. Readiness 15/19 → **18/19**. Only remaining false flag
+    is `no_critical_conflicts` (5 same-applicant contradicts edges
+    are real comparisons exceeding thresholds — separate scope).
+
+`scripts/feed_synthetic_loan.py --no-waves` now reports OVERALL PASS
+with 16 checks PASS, 0 FAIL, 0 WARN, 18/19 readiness flags true.
+
+Test count unchanged at **329 unit + 3 integration + 8 smoke = 340 green.**
 
 ### Resolved this session (production-grade end-to-end verification)
 
@@ -880,22 +992,17 @@ The local docker-compose has every phase applied. Production ECS still runs Phas
     used for prior schema deltas. The application code (route handlers,
     PostgresStore helpers) tolerates missing indexes — it'll just be
     slower until the indexes land.
-17. **Cross-applicant comparisons fire on the new Tier-2 pairs.** The
-    reconciler's joint-application cross-borrower logic
-    (`_persist_and_reconcile_documents` in `core/aggregation/service.py`,
-    added in `d0315f8`) currently emits comparisons for *every* pair in
-    `COMPARISON_MAP`. The new Tier-2 pairs that are semantically
-    per-borrower (`OFFER_LETTER↔W2_CURRENT`, `IRS_TRANSCRIPT↔W2_CURRENT`,
-    `FORM_1040↔W2_CURRENT`, `URLA_1003↔W2_CURRENT`,
-    `K1_PARTNERSHIP↔TAX_RETURN_1040_CURRENT`) get fired across borrowers
-    and produce false-positive contradicts edges (primary's $125k IRS
-    wages vs co-borrower's $85k W2 box1 wages = "20% delta — CONFLICT").
-    Synthetic-loan run produces ~13 such edges. Fix: add a
-    `_CROSS_APPLICANT_PAIRS` allow-list to the reconciler so only the
-    pairs whose semantics are joint (cross-W2 `tax_year` only,
-    `BANK_STATEMENT_M1↔W2_CURRENT` for joint deposit reconciliation,
-    etc.) fire across borrowers; everything else is per-borrower-only.
-    Surfaced by `scripts/feed_synthetic_loan.py`.
+17. ~~**Cross-applicant comparisons fire on the new Tier-2 pairs.**~~ —
+    **resolved in `074b772`**. New `_CROSS_APPLICANT_PAIRS` frozenset
+    in `core/graph/reconciler.py` lists the pairs whose comparisons
+    are allowed across borrowers (currently `W2_CURRENT↔W2_CURRENT`,
+    `W2_PRIOR↔W2_PRIOR`, `PAYSTUB_CURRENT↔PAYSTUB_CURRENT` — same-type
+    pairs whose only field tuple is `tax_year`). `reconcile()` skips
+    any cross-applicant pair not in the allow-list. Synthetic-load
+    contradicts dropped from 13 to 5; all remaining edges confirmed
+    same-applicant via direct PG query. Earlier category-based filter
+    in `_persist_and_reconcile_documents` (too coarse — VOE / AUS leaked
+    through) was reverted.
 18. **`scripts/generate_loan_file.py` not yet built.** The companion
     generator that would render all 43 doc types as reportlab PDFs +
     write a `manifest.json` with cross-doc consistency. Right now
