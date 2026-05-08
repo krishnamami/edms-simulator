@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+# Reusable response-code documentation for every report endpoint.
+# FastAPI merges these with the default 200 entry derived from
+# response_model. Adding them here once means /docs renders the full
+# error matrix without copy-paste on every decorator.
+_COMMON_RESPONSES: dict = {
+    401: {"description": "Missing or invalid `X-API-Key`."},
+    422: {"description": "Validation error (bad date, page size > 200, or date range > 90 days)."},
+}
+
 # 5-minute TTL on every report response. Reports aggregate across many
 # rows and accept a moderate staleness window — far longer than the
 # context cache (30 min) would mask freshness, far shorter than the
@@ -211,16 +221,57 @@ def _readiness_true_count(ctx: Any) -> int:
 @router.get(
     "/pipeline",
     dependencies=[Depends(verify_api_key)],
+    summary="Per-loan pipeline summary",
+    responses={
+        **_COMMON_RESPONSES,
+        200: {
+            "description": "Paginated list of loans with per-loan metrics.",
+            "content": {"application/json": {"example": {
+                "applications": [{
+                    "application_id":          "APP-LOS-12345",
+                    "los_id":                  "LOS-12345",
+                    "status":                  "active",
+                    "borrower_name":           "Alex Martinez",
+                    "co_borrower_name":        "Pat Martinez",
+                    "loan_amount":             360000.0,
+                    "interest_rate":           6.25,
+                    "documents_received":      15,
+                    "documents_expected":      15,
+                    "completeness_pct":        100.0,
+                    "documents_total":         43,
+                    "readiness_flags_true":    18,
+                    "readiness_flags_total":   19,
+                    "conflict_count":          7,
+                    "critical_conflict_count": 5,
+                    "qualifying_monthly_income": 19900.0,
+                    "mid_credit_score":        752,
+                    "ltv":                     80.0,
+                    "front_end_dti":           16.67,
+                    "back_end_dti":            21.15,
+                    "created_at":              "2026-05-08T15:15:42+00:00",
+                    "last_doc_received_at":    "2026-05-08T15:15:44+00:00",
+                }],
+                "total": 156, "page": 1, "page_size": 50, "has_next": True,
+                "filters": {"status": None,
+                            "date_from": "2026-04-08T00:00:00+00:00",
+                            "date_to":   "2026-05-08T00:00:00+00:00"},
+            }}},
+        },
+    },
 )
 async def report_pipeline(
     request: Request,
-    status: Optional[str] = Query(None),
-    date_from: Optional[str] = Query(None),
-    date_to: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(_DEFAULT_PAGE_SIZE, ge=1, le=_MAX_PAGE_SIZE),
+    status: Optional[str] = Query(None, description="Filter by application status (e.g. `active`, `closed`)"),
+    date_from: Optional[str] = Query(None, description="Filter from date (ISO 8601). Defaults to 30 days ago."),
+    date_to: Optional[str] = Query(None, description="Filter to date (ISO 8601). Defaults to now."),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)."),
+    page_size: int = Query(_DEFAULT_PAGE_SIZE, ge=1, le=_MAX_PAGE_SIZE, description="Results per page (max 200)."),
 ):
-    """Per-loan summary across the active pipeline."""
+    """Per-loan summary across the active pipeline.
+
+    Joins applications + applicants + income/credit profiles with
+    subqueries for doc counts, conflict counts, and the latest context
+    snapshot's readiness/DTI/LTV. 5-min Redis cache."""
     page = _validate_page(page)
     page_size = _validate_page_size(page_size)
     start, end = _resolve_date_range(date_from, date_to)
@@ -347,15 +398,22 @@ def _is_critical_edge(edge: dict) -> bool:
 @router.get(
     "/conflicts",
     dependencies=[Depends(verify_api_key)],
+    summary="Cross-document contradicts edges",
+    responses=_COMMON_RESPONSES,
 )
 async def report_conflicts(
     request: Request,
-    severity: str = Query("all", pattern="^(all|critical)$"),
-    date_from: Optional[str] = Query(None),
-    date_to: Optional[str] = Query(None),
-    min_delta_pct: Optional[float] = Query(None, ge=0, le=100),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(_DEFAULT_PAGE_SIZE, ge=1, le=_MAX_PAGE_SIZE),
+    severity: str = Query("all", pattern="^(all|critical)$",
+                          description="`all` returns every contradicts edge; "
+                                      "`critical` returns only those whose "
+                                      "delta exceeds the per-pair threshold "
+                                      "in `FIELD_CONFLICT_THRESHOLDS`."),
+    date_from: Optional[str] = Query(None, description="Filter from date (ISO 8601). Defaults to 30 days ago."),
+    date_to: Optional[str] = Query(None, description="Filter to date (ISO 8601). Defaults to now."),
+    min_delta_pct: Optional[float] = Query(None, ge=0, le=100,
+                                            description="Minimum percent divergence to surface (0-100)."),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)."),
+    page_size: int = Query(_DEFAULT_PAGE_SIZE, ge=1, le=_MAX_PAGE_SIZE, description="Results per page (max 200)."),
 ):
     page = _validate_page(page)
     page_size = _validate_page_size(page_size)
@@ -436,14 +494,17 @@ async def report_conflicts(
 @router.get(
     "/completeness",
     dependencies=[Depends(verify_api_key)],
+    summary="Loans below the completeness threshold",
+    responses=_COMMON_RESPONSES,
 )
 async def report_completeness(
     request: Request,
-    threshold: float = Query(80.0, ge=0, le=100),
-    date_from: Optional[str] = Query(None),
-    date_to: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(_DEFAULT_PAGE_SIZE, ge=1, le=_MAX_PAGE_SIZE),
+    threshold: float = Query(80.0, ge=0, le=100,
+                              description="Surface loans whose required-slot completeness is < this percentage."),
+    date_from: Optional[str] = Query(None, description="Filter from date (ISO 8601). Defaults to 30 days ago."),
+    date_to: Optional[str] = Query(None, description="Filter to date (ISO 8601). Defaults to now."),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)."),
+    page_size: int = Query(_DEFAULT_PAGE_SIZE, ge=1, le=_MAX_PAGE_SIZE, description="Results per page (max 200)."),
 ):
     """Applications below the completeness threshold (default 80%) with
     the missing-required + missing-conditional doc lists. The threshold
@@ -520,11 +581,13 @@ async def report_completeness(
 @router.get(
     "/extraction-quality",
     dependencies=[Depends(verify_api_key)],
+    summary="Per-doc-type extraction-method breakdown",
+    responses=_COMMON_RESPONSES,
 )
 async def report_extraction_quality(
     request: Request,
-    date_from: Optional[str] = Query(None),
-    date_to: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None, description="Filter from date (ISO 8601). Defaults to 30 days ago."),
+    date_to: Optional[str] = Query(None, description="Filter to date (ISO 8601). Defaults to now."),
 ):
     start, end = _resolve_date_range(date_from, date_to)
 
@@ -587,14 +650,17 @@ async def report_extraction_quality(
 @router.get(
     "/income-verification",
     dependencies=[Depends(verify_api_key)],
+    summary="Stated (URLA) vs documented (W2) income discrepancies",
+    responses=_COMMON_RESPONSES,
 )
 async def report_income_verification(
     request: Request,
-    min_delta: float = Query(10.0, ge=0, le=100),
-    date_from: Optional[str] = Query(None),
-    date_to: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(_DEFAULT_PAGE_SIZE, ge=1, le=_MAX_PAGE_SIZE),
+    min_delta: float = Query(10.0, ge=0, le=100,
+                              description="Surface loans where stated and documented annual income diverge by ≥ this percentage."),
+    date_from: Optional[str] = Query(None, description="Filter from date (ISO 8601). Defaults to 30 days ago."),
+    date_to: Optional[str] = Query(None, description="Filter to date (ISO 8601). Defaults to now."),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)."),
+    page_size: int = Query(_DEFAULT_PAGE_SIZE, ge=1, le=_MAX_PAGE_SIZE, description="Results per page (max 200)."),
 ):
     """Stated (URLA section 1c) vs documented (W2 box1) income mismatch.
 

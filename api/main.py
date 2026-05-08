@@ -127,7 +127,96 @@ async def lifespan(app: FastAPI):
         pass
 
 
-app = FastAPI(title="EDMS Simulator", version="0.1.0", lifespan=lifespan)
+# OpenAPI tag groups. Order here drives the section order in /docs and
+# /redoc; the descriptions appear under each group heading. Keep these
+# in sync with the per-route tags= values — Swagger UI silently puts
+# any unknown tag at the bottom under its raw name.
+OPENAPI_TAGS = [
+    {
+        "name": "Application",
+        "description": (
+            "**Interface 1 — real-time per-entity context.** Single-entity "
+            "reads + writes used by Decision OS to ingest one borrower or one "
+            "document and read the assembled context, readiness flags, and "
+            "knowledge-graph view. Backed by Redis (4h income/credit, 30m "
+            "context) with Postgres as the source of truth."
+        ),
+    },
+    {
+        "name": "Reports",
+        "description": (
+            "**Interface 2 — aggregated cross-loan analytics.** Paginated, "
+            "filtered queries for ops, compliance, and dashboards. Pipeline "
+            "summary, conflicts, completeness, extraction quality, "
+            "stated-vs-documented income. 5-minute Redis cache on every "
+            "response."
+        ),
+    },
+    {
+        "name": "Export",
+        "description": (
+            "**Interface 3 — bulk JSONL/CSV streams for data warehouses.** "
+            "Server-side cursor streaming so a Snowflake/Redshift/BigQuery "
+            "consumer can pull tens of thousands of rows without buffering. "
+            "Full snapshots and `?since=<ts>` incremental dumps. Per-consumer "
+            "watermarks let pipelines resume from their last successful pull. "
+            "Rate-limited to 10 requests / hour / API key."
+        ),
+    },
+    {
+        "name": "System",
+        "description": (
+            "Operational endpoints: liveness, readiness, indexing run "
+            "control, watermark admin, webhook subscription management, and "
+            "the public dashboard."
+        ),
+    },
+]
+
+API_DESCRIPTION = """\
+Document indexing, entity aggregation, and knowledge-graph service for
+mortgage lending. Three consumption interfaces sit on top of the same
+underlying borrower / property / vendor data layer:
+
+- **Application API** — real-time, per-entity context for decision systems
+- **Report API**      — aggregated analytics for ops + compliance dashboards
+- **Bulk Export API** — streaming JSONL/CSV exports for data warehouses
+
+## Authentication
+
+Every endpoint except `/health`, `/ready`, `/dashboard`, `/docs`,
+`/redoc`, and `/openapi.json` requires an `X-API-Key` header. The local
+development key is `edms_dev_key` (override via the `EDMS_API_KEY` /
+`API_KEY` env var).
+
+## Common error codes
+
+| Code | Meaning |
+|------|---------|
+| 401  | Missing / invalid `X-API-Key` |
+| 404  | Application / applicant / document not found |
+| 422  | Request validation failed (bad ISO timestamp, page size out of range, …) |
+| 429  | Rate limit exceeded (Bulk Export only — 10 req/hr/key) |
+| 502  | Upstream Anthropic API error during chat / image / email ingestion |
+| 503  | `ANTHROPIC_API_KEY` not configured for a Claude-only path |
+"""
+
+
+app = FastAPI(
+    title="EDMS Knowledge Graph API",
+    description=API_DESCRIPTION,
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    openapi_tags=OPENAPI_TAGS,
+    contact={
+        "name": "EDMS Platform Team",
+        "url": "https://github.com/krishnamami/edms-simulator",
+    },
+    license_info={"name": "Proprietary"},
+    lifespan=lifespan,
+)
 
 from api.exports import router as exports_router  # noqa: E402
 from api.health import health_router  # noqa: E402
@@ -138,5 +227,84 @@ from api.routes import router  # noqa: E402
 app.add_middleware(RequestMiddleware)
 app.include_router(router)
 app.include_router(health_router)
-app.include_router(reports_router, prefix="/reports", tags=["reports"])
-app.include_router(exports_router, prefix="/export", tags=["exports"])
+app.include_router(reports_router, prefix="/reports", tags=["Reports"])
+app.include_router(exports_router, prefix="/export", tags=["Export"])
+
+
+# OpenAPI tag classifier — centralized so we don't hand-edit tags on
+# all 60+ routes in api/routes.py. Path-pattern → tag mapping. The
+# "Reports" / "Export" entries are redundant (those routers already
+# have tags from include_router), but listing them keeps the rules
+# self-documenting if someone adds a new path under those prefixes.
+_TAG_RULES: list[tuple[str, str]] = [
+    ("/reports/",            "Reports"),
+    ("/export/",             "Export"),
+    # System: ops + observability + indexing + webhooks
+    ("/health",              "System"),
+    ("/ready",               "System"),
+    ("/dashboard",           "System"),
+    ("/admin/",              "System"),
+    ("/indexing/",           "System"),
+    ("/webhooks",            "System"),
+    ("/pipeline/failed",     "System"),
+    ("/mismo/",              "System"),
+    # Everything else is the per-entity Application API
+]
+
+
+def _classify_path(path: str) -> str:
+    for prefix, tag in _TAG_RULES:
+        if path.startswith(prefix) or path == prefix.rstrip("/"):
+            return tag
+    return "Application"
+
+
+def custom_openapi():
+    """Override the default OpenAPI generator so each operation lands
+    in the right Swagger UI / Redoc section regardless of how its
+    decorator was written. Runs once and caches; clear
+    ``app.openapi_schema = None`` if you need to regenerate."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=OPENAPI_TAGS,
+        contact=app.contact,
+        license_info=app.license_info,
+    )
+    # Document the X-API-Key security scheme once at the top level so
+    # Swagger UI's "Authorize" button picks it up. Then mark every
+    # operation as requiring it — except the public /health, /ready,
+    # /dashboard, and the docs endpoints themselves.
+    components = schema.setdefault("components", {})
+    schemes = components.setdefault("securitySchemes", {})
+    schemes["ApiKeyAuth"] = {
+        "type": "apiKey",
+        "in":   "header",
+        "name": "X-API-Key",
+        "description": (
+            "Static per-environment API key. The local-dev key is "
+            "`edms_dev_key`; production reads `edms/api/keys` from "
+            "AWS Secrets Manager. Send on every request as the "
+            "`X-API-Key` header."
+        ),
+    }
+    public_paths = {"/health", "/ready", "/dashboard",
+                    "/docs", "/redoc", "/openapi.json"}
+    for path, methods in schema.get("paths", {}).items():
+        for method, op in methods.items():
+            if not isinstance(op, dict):
+                continue
+            tag = _classify_path(path)
+            op["tags"] = [tag]
+            if path not in public_paths:
+                op.setdefault("security", [{"ApiKeyAuth": []}])
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi

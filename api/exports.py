@@ -24,7 +24,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -32,6 +32,17 @@ from api.routes import verify_api_key
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# Reusable response-code documentation. The streaming endpoints don't
+# carry a JSON response_model, so the 200 description here doubles as
+# the OpenAPI documentation for the streamed body — that's why every
+# 200 entry below mentions the media type explicitly.
+_EXPORT_RESPONSES: dict = {
+    401: {"description": "Missing or invalid `X-API-Key`."},
+    422: {"description": "Validation error (bad format, ISO timestamp, or relationship_type / profile_type / include token)."},
+    429: {"description": "Rate limit exceeded — 10 export requests per hour per API key. Returns `Retry-After` in seconds."},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -504,14 +515,55 @@ def _streaming_response(
     )
 
 
-@router.get("/entities", dependencies=[Depends(verify_api_key)])
+@router.get(
+    "/entities",
+    dependencies=[Depends(verify_api_key)],
+    summary="Streaming export of applicant entities",
+    description=(
+        "One row per applicant joined with the latest income + credit + "
+        "asset + identity aggregates. Returns a streaming response — JSONL "
+        "(`application/x-ndjson`, one JSON object per newline) or CSV "
+        "(`text/csv`). Supply `since` for an incremental export keyed on "
+        "`applicants.updated_at`; omit it for a full snapshot. Use "
+        "`include` to select a subset of the four sub-buckets."
+    ),
+    responses={
+        **_EXPORT_RESPONSES,
+        200: {
+            "description": "Streaming JSONL or CSV body; one record per line.",
+            "content": {
+                "application/x-ndjson": {"example":
+                    '{"applicant_id":"APL-00316-P","application_id":"APP-LOS-12345",'
+                    '"role":"primary","name":"Alex Martinez","document_count":41,'
+                    '"conflict_count":7,"updated_at":"2026-05-08T15:18:52+00:00",'
+                    '"income":{"qualifying_monthly":10416.67,"sources":["RENTAL","W2_SALARIED"]},'
+                    '"credit":{"mid_score":752,"credit_band":"prime","monthly_payments":0},'
+                    '"assets":{"total_liquid":176500.0,"total_retirement":165000.0,"gift_funds":20000.0},'
+                    '"identity":{"dl_verified":true,"ssn_verified":true,"ofac_clear":true,"complete":true}}\n'
+                },
+                "text/csv": {"example":
+                    "applicant_id,application_id,role,name,qualifying_monthly,mid_score,"
+                    "monthly_payments,total_liquid,total_retirement,gift_funds,"
+                    "dl_verified,ssn_verified,ofac_clear,identity_complete,"
+                    "document_count,conflict_count,updated_at\n"
+                    "APL-00316-P,APP-LOS-12345,primary,Alex Martinez,10416.67,752,0,"
+                    "176500.0,165000.0,20000.0,true,true,true,true,41,7,"
+                    "2026-05-08T15:18:52+00:00\n"
+                },
+            },
+        },
+    },
+)
 async def export_entities(
     request: Request,
-    format: str = Query(_DEFAULT_FORMAT),
-    since: Optional[str] = Query(None),
-    include: str = Query("income,credit,assets,identity"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    format: str = Query(_DEFAULT_FORMAT, description="`jsonl` or `csv`."),
+    since: Optional[str] = Query(None, description="Incremental cutoff (ISO 8601). Omit for a full snapshot."),
+    include: str = Query(
+        "income,credit,assets,identity",
+        description="Comma-separated subset of `income,credit,assets,identity`. JSONL only — CSV always emits all columns.",
+    ),
 ):
+    x_api_key = request.headers.get("X-API-Key") or "anon"
     fmt = _validate_format(format)
     since_ts = _parse_iso(since, "since")
 
@@ -556,15 +608,20 @@ async def export_entities(
     return _streaming_response(body, fmt, headers)
 
 
-@router.get("/documents", dependencies=[Depends(verify_api_key)])
+@router.get(
+    "/documents",
+    dependencies=[Depends(verify_api_key)],
+    summary="Streaming export of document_index rows",
+    responses=_EXPORT_RESPONSES,
+)
 async def export_documents(
     request: Request,
-    format: str = Query(_DEFAULT_FORMAT),
-    since: Optional[str] = Query(None),
-    doc_type: Optional[str] = Query(None),
-    category: Optional[str] = Query(None),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    format: str = Query(_DEFAULT_FORMAT, description="`jsonl` or `csv`."),
+    since: Optional[str] = Query(None, description="Incremental cutoff (ISO 8601)."),
+    doc_type: Optional[str] = Query(None, description="Filter by canonical document_type (e.g. `W2_CURRENT`)."),
+    category: Optional[str] = Query(None, description="Filter by document_category (`income`, `credit`, `property`, `vendor`, …)."),
 ):
+    x_api_key = request.headers.get("X-API-Key") or "anon"
     fmt = _validate_format(format)
     since_ts = _parse_iso(since, "since")
 
@@ -585,14 +642,22 @@ async def export_documents(
     return _streaming_response(body, fmt, headers)
 
 
-@router.get("/graph", dependencies=[Depends(verify_api_key)])
+@router.get(
+    "/graph",
+    dependencies=[Depends(verify_api_key)],
+    summary="Streaming export of document_relationships edges",
+    responses=_EXPORT_RESPONSES,
+)
 async def export_graph(
     request: Request,
-    format: str = Query(_DEFAULT_FORMAT),
-    since: Optional[str] = Query(None),
-    relationship_type: Optional[str] = Query(None),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    format: str = Query(_DEFAULT_FORMAT, description="`jsonl` or `csv`."),
+    since: Optional[str] = Query(None, description="Incremental cutoff (ISO 8601)."),
+    relationship_type: Optional[str] = Query(
+        None,
+        description="Filter to one of `confirms`, `contradicts`, `corroborates`, `supersedes`, `references`.",
+    ),
 ):
+    x_api_key = request.headers.get("X-API-Key") or "anon"
     fmt = _validate_format(format)
     since_ts = _parse_iso(since, "since")
     if relationship_type and relationship_type not in _VALID_REL_TYPES:
@@ -618,14 +683,19 @@ async def export_graph(
     return _streaming_response(body, fmt, headers)
 
 
-@router.get("/profiles", dependencies=[Depends(verify_api_key)])
+@router.get(
+    "/profiles",
+    dependencies=[Depends(verify_api_key)],
+    summary="Streaming export of income + credit profiles",
+    responses=_EXPORT_RESPONSES,
+)
 async def export_profiles(
     request: Request,
-    format: str = Query(_DEFAULT_FORMAT),
-    since: Optional[str] = Query(None),
-    profile_type: str = Query("all"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    format: str = Query(_DEFAULT_FORMAT, description="`jsonl` or `csv`."),
+    since: Optional[str] = Query(None, description="Incremental cutoff (ISO 8601)."),
+    profile_type: str = Query("all", description="`income`, `credit`, or `all` (default — emits both, each row keyed by `profile_kind`)."),
 ):
+    x_api_key = request.headers.get("X-API-Key") or "anon"
     fmt = _validate_format(format)
     since_ts = _parse_iso(since, "since")
     if profile_type not in _VALID_PROFILE_TYPES:
@@ -674,13 +744,18 @@ async def export_profiles(
     return _streaming_response(body, fmt, headers)
 
 
-@router.get("/applications", dependencies=[Depends(verify_api_key)])
+@router.get(
+    "/applications",
+    dependencies=[Depends(verify_api_key)],
+    summary="Streaming export of application-level summaries",
+    responses=_EXPORT_RESPONSES,
+)
 async def export_applications(
     request: Request,
-    format: str = Query(_DEFAULT_FORMAT),
-    since: Optional[str] = Query(None),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    format: str = Query(_DEFAULT_FORMAT, description="`jsonl` or `csv`."),
+    since: Optional[str] = Query(None, description="Incremental cutoff (ISO 8601). Filters on `COALESCE(updated_at, created_at)`."),
 ):
+    x_api_key = request.headers.get("X-API-Key") or "anon"
     fmt = _validate_format(format)
     since_ts = _parse_iso(since, "since")
 
@@ -723,6 +798,11 @@ class WatermarkResponse(BaseModel):
     "/watermark",
     response_model=WatermarkResponse,
     dependencies=[Depends(verify_api_key)],
+    summary="Set a DWH consumer's last-pull watermark",
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        422: {"description": "Validation error (missing fields or unparseable timestamp)."},
+    },
 )
 async def set_watermark(request: Request, body: WatermarkRequest):
     """Persist a DWH consumer's last-successful-pull watermark."""
@@ -747,11 +827,19 @@ async def set_watermark(request: Request, body: WatermarkRequest):
     )
 
 
-@router.get("/watermark", dependencies=[Depends(verify_api_key)])
+@router.get(
+    "/watermark",
+    dependencies=[Depends(verify_api_key)],
+    summary="Get a single watermark for a consumer + table",
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        404: {"description": "No watermark recorded for this consumer/table pair."},
+    },
+)
 async def get_watermark(
     request: Request,
-    consumer: str = Query(..., min_length=1),
-    table: str = Query(..., min_length=1),
+    consumer: str = Query(..., min_length=1, description="DWH consumer name (e.g. `snowflake_etl`)."),
+    table: str = Query(..., min_length=1, description="Logical table name (`entities`, `documents`, `graph`, `profiles`, `applications`)."),
 ):
     pg = request.app.state.postgres_store
     row = await pg.get_export_watermark(consumer, table)
@@ -770,10 +858,15 @@ async def get_watermark(
     }
 
 
-@router.get("/watermarks", dependencies=[Depends(verify_api_key)])
+@router.get(
+    "/watermarks",
+    dependencies=[Depends(verify_api_key)],
+    summary="List every recorded watermark",
+    responses={401: {"description": "Missing or invalid `X-API-Key`."}},
+)
 async def list_watermarks(
     request: Request,
-    consumer: Optional[str] = Query(None),
+    consumer: Optional[str] = Query(None, description="Optional consumer-name filter."),
 ):
     pg = request.app.state.postgres_store
     rows = await pg.list_export_watermarks(consumer=consumer)

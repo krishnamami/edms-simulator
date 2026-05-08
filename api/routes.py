@@ -102,6 +102,17 @@ def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
     "/loans",
     response_model=CreateLoanResponse,
     dependencies=[Depends(verify_api_key)],
+    summary="Create a loan application",
+    description=(
+        "Resolves identity for the primary borrower (and optional co-borrower) "
+        "and creates the application + golden record. Subsequent document "
+        "uploads attach via `POST /documents/upload` or any of the seven "
+        "`/ingest/*` channels using the returned `applicant_id`."
+    ),
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        422: {"description": "Validation error in the borrower / loan payload."},
+    },
 )
 async def create_loan(request: Request, body: CreateLoanRequest):
     service = request.app.state.aggregation_service
@@ -155,6 +166,11 @@ async def get_applicant_id(request: Request, los_id: str):
     "/applicant/{applicant_id}/income-profile",
     response_model=IncomeProfileResponse,
     dependencies=[Depends(verify_api_key)],
+    summary="Assembled income profile (Redis → Postgres fallback)",
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        404: {"description": "No income profile found for this applicant."},
+    },
 )
 async def get_income_profile(request: Request, applicant_id: str):
     redis_store = request.app.state.redis_store
@@ -181,6 +197,11 @@ async def get_income_profile(request: Request, applicant_id: str):
     "/applicant/{applicant_id}/credit-profile",
     response_model=CreditProfileResponse,
     dependencies=[Depends(verify_api_key)],
+    summary="Assembled credit profile (Redis → Postgres fallback)",
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        404: {"description": "No credit profile found for this applicant."},
+    },
 )
 async def get_credit_profile(request: Request, applicant_id: str):
     redis_store = request.app.state.redis_store
@@ -215,6 +236,17 @@ async def _upload_documents_impl(request: Request, body: DocumentUploadRequest):
 @router.post(
     "/documents/upload",
     dependencies=[Depends(verify_api_key)],
+    summary="Upload one or more documents for an applicant",
+    description=(
+        "Persists each document to S3 + `document_index`, runs the indexer "
+        "(structured-text / Claude-Vision fallback), reconciles against the "
+        "existing graph, and re-assembles the affected income / credit / "
+        "asset / property / context layers. Idempotent on `document_id`."
+    ),
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        422: {"description": "Validation error in the documents payload."},
+    },
 )
 async def upload_documents(request: Request, body: DocumentUploadRequest):
     return await _upload_documents_impl(request, body)
@@ -223,6 +255,11 @@ async def upload_documents(request: Request, body: DocumentUploadRequest):
 @router.post(
     "/loans/document",
     dependencies=[Depends(verify_api_key)],
+    summary="Alias for /documents/upload (legacy callers)",
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        422: {"description": "Validation error in the documents payload."},
+    },
 )
 async def upload_documents_loans_alias(request: Request, body: DocumentUploadRequest):
     return await _upload_documents_impl(request, body)
@@ -1135,6 +1172,54 @@ def _context_assembler(request: Request) -> ContextAssembler:
 @router.get(
     "/application/{application_id}/context",
     dependencies=[Depends(verify_api_key)],
+    summary="Single-call ApplicationContext for Decision OS",
+    description=(
+        "The unified read shape Decision OS consumes per application. "
+        "Folds borrower (income + credit + assets + identity), property "
+        "(PITI + LTV), vendor checks, and readiness flags into one envelope. "
+        "Cached at `context:{application_id}` for 30 minutes; layer changes "
+        "invalidate the cache so the next read recomputes."
+    ),
+    responses={
+        200: {
+            "description": "Cached or freshly-assembled application context.",
+            "content": {"application/json": {"example": {
+                "source": "cache",
+                "data": {
+                    "application_id":   "APP-LOS-12345",
+                    "los_id":            "LOS-12345",
+                    "loan_amount":       360000,
+                    "primary": {
+                        "applicant_id":       "APL-00316-P",
+                        "full_name":          "Alex Martinez",
+                        "role":                "primary",
+                        "qualifying_monthly": 10416.67,
+                        "mid_score":           752,
+                    },
+                    "co_borrower": {
+                        "applicant_id":       "APL-00317-C",
+                        "full_name":          "Pat Martinez",
+                        "role":                "co_borrower",
+                        "qualifying_monthly": 9483.33,
+                    },
+                    "combined_qualifying_monthly": 19900.0,
+                    "front_end_dti":               16.67,
+                    "back_end_dti":                21.15,
+                    "ltv":                          80.0,
+                    "readiness": {
+                        "income_verified": True, "credit_pulled": True,
+                        "appraisal_complete": True, "ltv_calculable": True,
+                        "dti_calculable": True, "aus_ready": True,
+                        "no_critical_conflicts": False,
+                    },
+                    "graph_summary": {"document_count": 41, "conflict_count": 7},
+                    "requires_review": True,
+                },
+            }}},
+        },
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        404: {"description": "Application not found."},
+    },
 )
 async def get_application_context(request: Request, application_id: str):
     """The single endpoint Decision OS calls — folded borrower + property
@@ -1155,6 +1240,12 @@ async def get_application_context(request: Request, application_id: str):
 @router.get(
     "/application/{application_id}/readiness",
     dependencies=[Depends(verify_api_key)],
+    summary="Readiness flags only",
+    description="Lightweight 19-flag readiness view for AUS-ready polling.",
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        404: {"description": "Application not found."},
+    },
 )
 async def get_application_readiness(request: Request, application_id: str):
     """Lightweight readiness flags for "are we ready for AUS?" polling."""
