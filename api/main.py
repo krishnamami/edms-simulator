@@ -64,6 +64,36 @@ async def lifespan(app: FastAPI):
         postgres_store=app.state.postgres_store,
     )
 
+    # Webhook delivery worker — async outbox drain. Default ON so the
+    # publisher's outbox writes get delivered without operator action;
+    # set ENABLE_WEBHOOK_WORKER=false to disable in unit-test contexts
+    # that don't want a background task running.
+    app.state.webhook_worker_task = None
+    app.state.webhook_worker_stop = None
+    if os.getenv("ENABLE_WEBHOOK_WORKER", "true").lower() == "true":
+        try:
+            import asyncio as _asyncio
+
+            from core.webhooks.delivery_worker import run_delivery_loop
+
+            stop_event = _asyncio.Event()
+            interval = int(os.getenv("WEBHOOK_WORKER_INTERVAL_SECONDS", "5"))
+            app.state.webhook_worker_stop = stop_event
+            app.state.webhook_worker_task = _asyncio.create_task(
+                run_delivery_loop(
+                    pg=app.state.postgres_store,
+                    interval_seconds=interval,
+                    stop_event=stop_event,
+                ),
+                name="webhook_delivery_worker",
+            )
+            logging.info(
+                "webhook_worker_started",
+                extra={"interval_seconds": interval},
+            )
+        except Exception as exc:
+            logging.warning("webhook_worker_start_failed: %s", exc)
+
     # Incremental indexer background scheduler. Off by default; flip on
     # in production via ENABLE_SCHEDULER=true. Avoids spurious S3 calls
     # in local development and keeps tests deterministic.
@@ -116,6 +146,17 @@ async def lifespan(app: FastAPI):
             logging.warning("scheduler_start_failed: %s", exc)
 
     yield
+    # Signal the webhook worker to drain its current tick and exit
+    # cleanly so we don't leave half-delivered batches on shutdown.
+    try:
+        stop_event = getattr(app.state, "webhook_worker_stop", None)
+        worker_task = getattr(app.state, "webhook_worker_task", None)
+        if stop_event is not None:
+            stop_event.set()
+        if worker_task is not None:
+            worker_task.cancel()
+    except Exception:
+        pass
     try:
         if getattr(app.state, "scheduler", None):
             app.state.scheduler.shutdown(wait=False)

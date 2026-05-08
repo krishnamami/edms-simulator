@@ -1903,13 +1903,61 @@ async def deactivate_webhook(request: Request, webhook_id: str):
 @router.get(
     "/webhooks/{webhook_id}/deliveries",
     dependencies=[Depends(verify_api_key)],
+    summary="Outbox + audit deliveries for a webhook",
+    description=(
+        "Surfaces the async-outbox view first (every enqueued delivery "
+        "with its `pending` / `delivered` / `failed` state, attempt "
+        "count, last error, and timestamps). Use `?status=pending` / "
+        "`failed` / `delivered` to filter. The legacy `webhook_deliveries` "
+        "audit history is preserved under `audit_history` so older "
+        "consumers don't break."
+    ),
 )
 async def list_webhook_deliveries(
-    request: Request, webhook_id: str, limit: int = 50
+    request: Request,
+    webhook_id: str,
+    status: Optional[str] = None,
+    page_size: int = 20,
+    audit_limit: int = 50,
 ):
+    if status and status not in {"pending", "delivered", "failed"}:
+        raise HTTPException(
+            status_code=422,
+            detail="status must be one of pending|delivered|failed",
+        )
     pg = request.app.state.postgres_store
-    rows = await pg.get_webhook_deliveries(webhook_id, limit=limit)
-    return {"webhook_id": webhook_id, "count": len(rows), "deliveries": rows}
+    outbox = await pg.get_outbox_for_webhook(
+        webhook_id, status=status, limit=page_size,
+    )
+    audit  = await pg.get_webhook_deliveries(webhook_id, limit=audit_limit)
+    return {
+        "webhook_id":     webhook_id,
+        "count":          len(outbox),
+        "deliveries":     outbox,
+        "audit_history":  audit,
+        "filters":        {"status": status, "page_size": page_size},
+    }
+
+
+@router.post(
+    "/webhooks/{webhook_id}/retry-failed",
+    dependencies=[Depends(verify_api_key)],
+    summary="Reset every failed outbox row for this webhook to pending",
+    description=(
+        "Operator-driven recovery hook: when a subscriber comes back "
+        "online after an outage, this resets all of its `failed` outbox "
+        "rows back to `pending` with `attempts=0` and "
+        "`next_retry_at=NOW()`. The delivery worker picks them up on "
+        "the next tick. Returns the count of rows reset."
+    ),
+)
+async def retry_failed_deliveries(request: Request, webhook_id: str):
+    pg = request.app.state.postgres_store
+    reset_count = await pg.reset_failed_outbox(webhook_id)
+    return {
+        "webhook_id":  webhook_id,
+        "reset_count": reset_count,
+    }
 
 
 # ---- context versioning ----------------------------------------------------

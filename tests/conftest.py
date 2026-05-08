@@ -431,6 +431,121 @@ class FakePostgresStore:
         }
         return mapping.get(table_name, 0)
 
+    # Webhook outbox stubs — async fan-out path. Tests that exercise
+    # the publisher assert against ``self.outbox`` directly; the worker
+    # is exercised by integration tests with real Postgres.
+
+    async def insert_outbox(self, webhook_id, event_type, payload,
+                             application_id=None, tenant_id="default",
+                             max_attempts=3):
+        if not hasattr(self, "outbox"):
+            self.outbox = []
+        import uuid as _uuid
+        from datetime import datetime, timezone
+        row = {
+            "id":             str(_uuid.uuid4()),
+            "tenant_id":      tenant_id,
+            "webhook_id":     str(webhook_id),
+            "event_type":     event_type,
+            "application_id": application_id,
+            "payload":        payload,
+            "status":         "pending",
+            "attempts":       0,
+            "max_attempts":   max_attempts,
+            "next_retry_at":  datetime.now(timezone.utc),
+            "last_error":     None,
+            "created_at":     datetime.now(timezone.utc),
+            "delivered_at":   None,
+        }
+        self.outbox.append(row)
+        return row["id"]
+
+    async def get_pending_outbox(self, limit=50):
+        from datetime import datetime, timezone
+        rows = [
+            r for r in getattr(self, "outbox", [])
+            if r["status"] == "pending"
+            and r["next_retry_at"] <= datetime.now(timezone.utc)
+        ]
+        rows.sort(key=lambda r: r["created_at"])
+        return rows[:limit]
+
+    async def mark_outbox_delivered(self, outbox_id):
+        from datetime import datetime, timezone
+        for r in getattr(self, "outbox", []):
+            if r["id"] == str(outbox_id):
+                r["status"] = "delivered"
+                r["delivered_at"] = datetime.now(timezone.utc)
+                r["last_error"] = None
+                return
+
+    async def mark_outbox_retry(self, outbox_id, error, backoff_seconds=30):
+        from datetime import datetime, timedelta, timezone
+        for r in getattr(self, "outbox", []):
+            if r["id"] == str(outbox_id):
+                r["attempts"] = (r.get("attempts") or 0) + 1
+                r["last_error"] = (error or "")[:1000]
+                r["next_retry_at"] = (
+                    datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
+                )
+                if r["attempts"] >= r.get("max_attempts", 3):
+                    r["status"] = "failed"
+                return r
+        return {}
+
+    async def mark_outbox_failed(self, outbox_id, error):
+        for r in getattr(self, "outbox", []):
+            if r["id"] == str(outbox_id):
+                r["status"] = "failed"
+                r["attempts"] = (r.get("attempts") or 0) + 1
+                r["last_error"] = (error or "")[:1000]
+                return
+
+    async def get_outbox_for_webhook(self, webhook_id, status=None, limit=20):
+        rows = [
+            r for r in getattr(self, "outbox", [])
+            if str(r["webhook_id"]) == str(webhook_id)
+        ]
+        if status:
+            rows = [r for r in rows if r["status"] == status]
+        rows.sort(key=lambda r: r["created_at"], reverse=True)
+        return rows[:limit]
+
+    async def reset_failed_outbox(self, webhook_id):
+        from datetime import datetime, timezone
+        n = 0
+        for r in getattr(self, "outbox", []):
+            if str(r["webhook_id"]) == str(webhook_id) and r["status"] == "failed":
+                r["status"] = "pending"
+                r["attempts"] = 0
+                r["next_retry_at"] = datetime.now(timezone.utc)
+                r["last_error"] = None
+                n += 1
+        return n
+
+    async def get_outbox_stats(self):
+        from datetime import datetime, timedelta, timezone
+        rows = getattr(self, "outbox", [])
+        now = datetime.now(timezone.utc)
+        pending  = [r for r in rows if r["status"] == "pending"]
+        failed   = [r for r in rows if r["status"] == "failed"]
+        delivered_recent = [
+            r for r in rows
+            if r["status"] == "delivered"
+            and r.get("delivered_at")
+            and r["delivered_at"] >= now - timedelta(hours=1)
+        ]
+        oldest_age = 0
+        if pending:
+            oldest = min(r["created_at"] for r in pending)
+            oldest_age = int((now - oldest).total_seconds())
+        return {
+            "pending":                   len(pending),
+            "failed":                    len(failed),
+            "delivered_last_hour":       len(delivered_recent),
+            "oldest_pending_age_seconds": oldest_age,
+        }
+
     # Multi-tenancy stubs — tests don't exercise the api_keys path
     # (auth uses the legacy env-var fallback when API_KEY is set), but
     # AggregationService route paths may pass tenant_id through.

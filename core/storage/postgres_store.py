@@ -1984,6 +1984,218 @@ class PostgresStore:
         )
         return [_row_to_dict(r) for r in rows]
 
+    # ---------------- webhook outbox (async fan-out) -----------------
+    #
+    # The publisher writes one row per (event, subscriber) — fast path,
+    # one INSERT per subscriber, no HTTP. The delivery worker drains
+    # ``status='pending' AND next_retry_at <= NOW()``, POSTs, and flips
+    # rows to ``delivered`` / ``failed`` (or bumps ``attempts`` +
+    # ``next_retry_at`` for the next pass).
+
+    async def insert_outbox(
+        self,
+        webhook_id: str,
+        event_type: str,
+        payload: dict,
+        application_id: Optional[str] = None,
+        tenant_id: str = "default",
+        max_attempts: int = 3,
+    ) -> str:
+        new_id = await db.fetchval(
+            """
+            INSERT INTO webhook_outbox (
+                tenant_id, webhook_id, event_type, application_id,
+                payload, max_attempts
+            ) VALUES (
+                $1, $2::uuid, $3, $4, $5::jsonb, $6
+            )
+            RETURNING id
+            """,
+            tenant_id, str(webhook_id), event_type, application_id,
+            _to_jsonb(payload), int(max_attempts),
+        )
+        return str(new_id)
+
+    async def get_pending_outbox(self, limit: int = 50) -> list:
+        """The worker hot path — returns oldest-first within the
+        eligibility window. We claim each row by atomically flipping
+        ``next_retry_at`` ~5s into the future (worker's polling
+        interval) so a second worker replica scanning at the same
+        instant won't see the same row. This idempotently double-
+        increments backoff if the worker dies mid-delivery; the row
+        will be re-eligible after the next tick.
+
+        Avoids ``SELECT ... FOR UPDATE SKIP LOCKED`` because asyncpg's
+        per-query autocommit releases the lock the moment the SELECT
+        returns, and pre-claiming via UPDATE...RETURNING gives the
+        same isolation guarantee with simpler semantics."""
+        rows = await db.fetch(
+            """
+            UPDATE webhook_outbox
+               SET next_retry_at = NOW() + INTERVAL '10 seconds'
+             WHERE id IN (
+               SELECT id FROM webhook_outbox
+                WHERE status = 'pending'
+                  AND next_retry_at <= NOW()
+                ORDER BY created_at ASC
+                LIMIT $1
+             )
+         RETURNING id, tenant_id, webhook_id, event_type, application_id,
+                   payload, attempts, max_attempts, next_retry_at,
+                   last_error, created_at
+            """,
+            int(limit),
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def mark_outbox_delivered(self, outbox_id: str) -> None:
+        await db.execute(
+            """
+            UPDATE webhook_outbox
+               SET status       = 'delivered',
+                   delivered_at = NOW(),
+                   last_error   = NULL
+             WHERE id = $1::uuid
+            """,
+            str(outbox_id),
+        )
+
+    async def mark_outbox_retry(
+        self,
+        outbox_id: str,
+        error: str,
+        backoff_seconds: int,
+    ) -> dict:
+        """Bump attempts + push next_retry_at out by ``backoff_seconds``;
+        if attempts now meets max_attempts, flip to status='failed'.
+        Returns the post-update row so the caller can log the next state.
+
+        ``backoff_seconds`` is multiplied by '1 second'::interval rather
+        than ``$3 || ' seconds'`` because the latter requires casting
+        the int parameter to text first — we'd rather lean on
+        Postgres' interval arithmetic than string concatenation."""
+        row = await db.fetchrow(
+            """
+            UPDATE webhook_outbox SET
+                attempts      = attempts + 1,
+                last_error    = $2,
+                next_retry_at = NOW() + ($3::int * INTERVAL '1 second'),
+                status = CASE
+                    WHEN attempts + 1 >= max_attempts THEN 'failed'
+                    ELSE 'pending'
+                END
+             WHERE id = $1::uuid
+         RETURNING id, status, attempts, max_attempts, next_retry_at, last_error
+            """,
+            str(outbox_id), (error or "")[:1000], int(backoff_seconds),
+        )
+        return _row_to_dict(row) or {}
+
+    async def mark_outbox_failed(self, outbox_id: str, error: str) -> None:
+        await db.execute(
+            """
+            UPDATE webhook_outbox SET
+                status        = 'failed',
+                attempts      = attempts + 1,
+                last_error    = $2
+             WHERE id = $1::uuid
+            """,
+            str(outbox_id), (error or "")[:1000],
+        )
+
+    async def get_outbox_for_webhook(
+        self,
+        webhook_id: str,
+        status: Optional[str] = None,
+        limit: int = 20,
+    ) -> list:
+        if status:
+            rows = await db.fetch(
+                """
+                SELECT id, tenant_id, webhook_id, event_type, application_id,
+                       status, attempts, max_attempts, next_retry_at,
+                       last_error, created_at, delivered_at
+                  FROM webhook_outbox
+                 WHERE webhook_id = $1::uuid
+                   AND status = $2
+                 ORDER BY created_at DESC
+                 LIMIT $3
+                """,
+                str(webhook_id), status, int(limit),
+            )
+        else:
+            rows = await db.fetch(
+                """
+                SELECT id, tenant_id, webhook_id, event_type, application_id,
+                       status, attempts, max_attempts, next_retry_at,
+                       last_error, created_at, delivered_at
+                  FROM webhook_outbox
+                 WHERE webhook_id = $1::uuid
+                 ORDER BY created_at DESC
+                 LIMIT $2
+                """,
+                str(webhook_id), int(limit),
+            )
+        return [_row_to_dict(r) for r in rows]
+
+    async def reset_failed_outbox(self, webhook_id: str) -> int:
+        """Flip every ``failed`` row for this webhook back to ``pending``
+        with attempts=0 so the worker picks them up on the next tick.
+        Returns the count of rows reset — useful when an operator
+        re-enables a subscriber that came back online."""
+        val = await db.fetchval(
+            """
+            WITH updated AS (
+                UPDATE webhook_outbox SET
+                    status        = 'pending',
+                    attempts      = 0,
+                    next_retry_at = NOW(),
+                    last_error    = NULL
+                 WHERE webhook_id = $1::uuid
+                   AND status     = 'failed'
+                RETURNING id
+            )
+            SELECT COUNT(*) FROM updated
+            """,
+            str(webhook_id),
+        )
+        return int(val or 0)
+
+    async def get_outbox_stats(self) -> dict:
+        """Single-row aggregate for /health. ``oldest_pending_age_seconds``
+        is the queue-lag indicator — if it climbs above the worker's
+        polling interval × max_attempts, the worker is falling behind.
+
+        Note: ``FILTER`` binds to a single aggregate expression in
+        Postgres, so the oldest-pending calculation isolates the MIN
+        aggregate then subtracts from NOW() outside the filter."""
+        row = await db.fetchrow(
+            """
+            SELECT
+              COUNT(*) FILTER (WHERE status = 'pending')   AS pending,
+              COUNT(*) FILTER (WHERE status = 'failed')    AS failed,
+              COUNT(*) FILTER (
+                WHERE status = 'delivered'
+                  AND delivered_at >= NOW() - INTERVAL '1 hour'
+              ) AS delivered_last_hour,
+              COALESCE(
+                EXTRACT(
+                  EPOCH FROM
+                    NOW() - MIN(created_at) FILTER (WHERE status = 'pending')
+                )::int,
+                0
+              ) AS oldest_pending_age_seconds
+            FROM webhook_outbox
+            """
+        )
+        out = _row_to_dict(row) or {}
+        return {
+            "pending":                   int(out.get("pending") or 0),
+            "failed":                    int(out.get("failed")  or 0),
+            "delivered_last_hour":       int(out.get("delivered_last_hour") or 0),
+            "oldest_pending_age_seconds": int(out.get("oldest_pending_age_seconds") or 0),
+        }
+
     async def list_export_watermarks(
         self, consumer: Optional[str] = None
     ) -> list:

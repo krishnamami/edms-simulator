@@ -596,3 +596,38 @@ INSERT INTO api_keys (api_key, tenant_id, name, scopes)
 VALUES ('edms_dev_key', 'default', 'Development Key', 'read,write,admin')
 ON CONFLICT (api_key) DO NOTHING;
 
+-- =====================================================================
+-- Webhook outbox — async delivery decouples upload latency from
+-- subscriber availability. Every assembly fan-out writes a row here;
+-- a background worker (core/webhooks/delivery_worker.py) polls
+-- ``status='pending' AND next_retry_at <= NOW()`` and POSTs.
+-- Backoff: 2^attempts * 30s; cap at max_attempts then status='failed'.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS webhook_outbox (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       VARCHAR(50) NOT NULL DEFAULT 'default',
+    webhook_id      UUID NOT NULL REFERENCES webhooks(webhook_id) ON DELETE CASCADE,
+    event_type      VARCHAR(50) NOT NULL,
+    application_id  VARCHAR,
+    payload         JSONB NOT NULL,
+    status          VARCHAR(20) NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','delivered','failed')),
+    attempts        INT NOT NULL DEFAULT 0,
+    max_attempts    INT NOT NULL DEFAULT 3,
+    next_retry_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_error      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    delivered_at    TIMESTAMPTZ
+);
+
+-- Worker query — pending rows whose next_retry_at has elapsed,
+-- ordered by created_at to drain FIFO. Partial index keeps it tiny:
+-- delivered rows fall out of the index immediately.
+CREATE INDEX IF NOT EXISTS idx_outbox_pending
+    ON webhook_outbox(next_retry_at, created_at)
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_outbox_tenant
+    ON webhook_outbox(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_outbox_webhook
+    ON webhook_outbox(webhook_id, status, created_at DESC);
+
