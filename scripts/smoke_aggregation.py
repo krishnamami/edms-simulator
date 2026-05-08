@@ -48,6 +48,13 @@ def check(label: str, ok: bool, detail: str = ""):
 
 
 class FakePG:
+    """Minimal in-memory PostgresStore stand-in for the smoke script.
+    Mirrors the real store's tenant_id kwarg on every method (default
+    "default") so AggregationService — which now passes
+    ``tenant_id=current_tenant_id()`` everywhere — doesn't trip a
+    TypeError. Tenant is recorded but isolation isn't enforced; the
+    smoke run is single-tenant by construction."""
+
     def __init__(self):
         self.applications: dict = {}
         self.income: dict = {}
@@ -55,50 +62,53 @@ class FakePG:
         self.applicants: dict = {}
         self.documents: dict = {}
 
-    async def save_golden_record(self, gr):
-        self.applicants[gr["applicant_id"]] = gr
+    async def save_golden_record(self, gr, tenant_id="default"):
+        self.applicants[gr["applicant_id"]] = {**gr, "tenant_id": tenant_id}
 
     async def save_xref(self, xref):
         pass
 
-    async def save_application(self, app):
-        self.applications[app["application_id"]] = app
+    async def save_application(self, app, tenant_id="default"):
+        self.applications[app["application_id"]] = {**app, "tenant_id": tenant_id}
 
-    async def get_application(self, application_id):
+    async def get_application(self, application_id, tenant_id="default"):
         return self.applications.get(application_id)
 
-    async def get_application_by_los_id(self, los_id):
+    async def get_application_by_los_id(self, los_id, tenant_id="default"):
         for app in self.applications.values():
             if app["los_id"] == los_id:
                 return app
         return None
 
-    async def get_application_by_applicant(self, applicant_id):
+    async def get_application_by_applicant(self, applicant_id, tenant_id="default"):
         for app in self.applications.values():
             if app.get("applicant_id") == applicant_id or app.get("co_applicant_id") == applicant_id:
                 return app
         return None
 
-    async def save_income_profile(self, p):
+    async def save_income_profile(self, p, tenant_id="default"):
         prev = self.income.get(p["applicant_id"])
         v = (prev.get("_version", 0) + 1) if prev else 1
-        self.income[p["applicant_id"]] = {**p, "_version": v}
+        self.income[p["applicant_id"]] = {**p, "_version": v, "tenant_id": tenant_id}
         return f"id-{v}"
 
-    async def get_income_profile(self, aid):
+    async def get_income_profile(self, aid, tenant_id="default"):
         return self.income.get(aid)
 
-    async def save_credit_profile(self, p):
-        self.credit[p["applicant_id"]] = p
+    async def save_credit_profile(self, p, tenant_id="default"):
+        self.credit[p["applicant_id"]] = {**p, "tenant_id": tenant_id}
 
-    async def get_credit_profile(self, aid):
+    async def get_credit_profile(self, aid, tenant_id="default"):
         return self.credit.get(aid)
 
-    async def save_document(self, doc):
+    async def save_document(self, doc, tenant_id="default"):
         # Mirror prod's ON CONFLICT DO UPDATE on document_id.
-        self.documents[doc["document_id"]] = {**doc, "is_current": doc.get("is_current", True)}
+        self.documents[doc["document_id"]] = {
+            **doc, "is_current": doc.get("is_current", True),
+            "tenant_id": tenant_id,
+        }
 
-    async def get_documents_for_applicant(self, applicant_id):
+    async def get_documents_for_applicant(self, applicant_id, tenant_id="default"):
         return [
             d for d in self.documents.values()
             if d.get("applicant_id") == applicant_id and d.get("is_current", True)
