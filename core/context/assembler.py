@@ -21,6 +21,16 @@ from core.context.webhook_publisher import WebhookPublisher
 logger = logging.getLogger(__name__)
 
 
+def _f(value) -> Optional[float]:
+    """Best-effort float coercion. Returns None on None / unparseable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class ContextAssembler:
     def __init__(
         self,
@@ -83,31 +93,85 @@ class ContextAssembler:
             co_borrower.monthly_obligations if co_borrower else 0
         )
 
-        front_dti: Optional[float] = None
-        back_dti: Optional[float] = None
-        if property_snapshot and property_snapshot.piti_total and combined_monthly > 0:
-            front_dti = round(
-                property_snapshot.piti_total / combined_monthly * 100, 2
-            )
-            back_dti = round(
-                (property_snapshot.piti_total + total_obligations)
-                / combined_monthly * 100,
-                2,
+        # Build the loan-terms view early so LTV / PITI / DTI can use it.
+        # _build_loan_terms folds the application row's loan_amount /
+        # interest_rate / loan_purpose with the most-recent URLA,
+        # RATE_LOCK, and PURCHASE_AGREEMENT extracted_fields.
+        loan_terms = await self._build_loan_terms(applicant_id, app)
+
+        # Effective loan amount: prefer the explicit URLA / app value,
+        # then fall back to the rate-lock's loan_amount.
+        loan_amount = (
+            loan_terms.get("loan_amount")
+            or (loan_terms.get("rate_lock") or {}).get("loan_amount")
+        )
+        loan_amount_f = _f(loan_amount)
+
+        # Effective interest_rate / term — prefer rate-lock (the most
+        # recent and authoritative source) over URLA-stated.
+        rate_lock_d = loan_terms.get("rate_lock") or {}
+        interest_rate = (
+            rate_lock_d.get("locked_rate")
+            or loan_terms.get("interest_rate")
+            or app.get("interest_rate")
+        )
+        loan_term_months = (
+            loan_terms.get("loan_term_months")
+            or app.get("loan_term_months")
+        )
+
+        # Effective property value: appraised wins, fallback to
+        # purchase_price (per LTV underwriting convention — the lender
+        # uses the LOWER of the two when both are present, but if
+        # appraisal is missing, purchase price is the proxy).
+        appraised = (
+            (property_snapshot.appraised_value if property_snapshot else None)
+            or loan_terms.get("purchase_price")
+        )
+        appraised_f = _f(appraised)
+        purchase_price_f = _f(loan_terms.get("purchase_price"))
+
+        # LTV = loan_amount / min(appraised, purchase_price) × 100.
+        # Use the lower of appraised vs purchase when both present so a
+        # purchase loan never under-states LTV by appraising "high".
+        ltv: Optional[float] = None
+        if loan_amount_f and (appraised_f or purchase_price_f):
+            denominator = appraised_f
+            if purchase_price_f:
+                denominator = min(filter(None, [appraised_f, purchase_price_f]))
+            if denominator and denominator > 0:
+                ltv = round(loan_amount_f / denominator * 100, 2)
+
+        # PITI: use the property-assembler's value when present;
+        # otherwise compute inline from loan terms + property tax/HOI/HOA.
+        # The property assembler runs at /ingest/property-doc time and
+        # may have had empty loan_data — recomputing here lets us
+        # surface DTI even when the original assembly missed it.
+        piti_total: Optional[float] = (
+            property_snapshot.piti_total if property_snapshot else None
+        )
+        if piti_total is None:
+            piti_total = self._compute_piti_inline(
+                loan_amount=loan_amount_f,
+                annual_rate_pct=_f(interest_rate),
+                term_months=int(loan_term_months) if loan_term_months else None,
+                annual_taxes=(
+                    property_snapshot.annual_taxes if property_snapshot else None
+                ),
+                hoi_monthly=(
+                    property_snapshot.hoi_monthly if property_snapshot else None
+                ),
+                hoa_monthly=(
+                    property_snapshot.hoa_monthly if property_snapshot else 0
+                ),
             )
 
-        ltv: Optional[float] = None
-        loan_amount = app.get("loan_amount")
-        if (
-            property_snapshot
-            and property_snapshot.appraised_value
-            and loan_amount
-            and float(loan_amount) > 0
-        ):
-            ltv = round(
-                float(loan_amount)
-                / float(property_snapshot.appraised_value)
-                * 100,
-                2,
+        front_dti: Optional[float] = None
+        back_dti: Optional[float] = None
+        if piti_total and combined_monthly > 0:
+            front_dti = round(piti_total / combined_monthly * 100, 2)
+            back_dti = round(
+                (piti_total + total_obligations) / combined_monthly * 100, 2,
             )
 
         vendor_checks = await self._get_vendor_checks(application_id)
@@ -130,11 +194,8 @@ class ContextAssembler:
         primary_assets   = await self._read_asset_summary(applicant_id)
         primary_identity = await self._read_identity_summary(applicant_id)
 
-        # Loan-terms section — merged view of URLA / RATE_LOCK /
-        # PURCHASE_AGREEMENT docs plus the application row's own
-        # loan_amount / loan_purpose. Derived on every assembly because
-        # these docs change (rate-lock especially) frequently.
-        loan_terms = await self._build_loan_terms(applicant_id, app)
+        # ``loan_terms`` was already built above (we needed it early for
+        # the LTV / DTI math). Reused here for the context payload.
 
         # Conflicts block — pulls the top contradicts edges from the
         # graph so a Decision OS reader doesn't need a separate
@@ -563,6 +624,15 @@ class ContextAssembler:
         if not flags.title_received:
             missing.append("title_commitment")
 
+        # title_clear: TITLE_COMMITMENT received AND TITLE_INSURANCE
+        # received. We can't determine which exceptions on a commitment
+        # are blocking from the extracted_fields alone, but having an
+        # insurance binder issued is the underwriter's signal that the
+        # title is insurable — effectively clear for lending purposes.
+        flags.title_clear = bool(
+            "TITLE_COMMITMENT" in doc_types and "TITLE_INSURANCE" in doc_types
+        )
+
         # tax_docs_received: W2 always; 1040 only if self-employed
         # (Schedule C / E / F or 1099 income present in the doc set).
         has_w2 = "W2_CURRENT" in doc_types or "W2_PRIOR" in doc_types
@@ -643,6 +713,44 @@ class ContextAssembler:
         except Exception:
             return set()
         return {d.get("document_type") for d in docs if d.get("document_type")}
+
+    @staticmethod
+    def _compute_piti_inline(
+        loan_amount: Optional[float],
+        annual_rate_pct: Optional[float],
+        term_months: Optional[int],
+        annual_taxes: Optional[float],
+        hoi_monthly: Optional[float],
+        hoa_monthly: Optional[float] = 0,
+    ) -> Optional[float]:
+        """Compute monthly PITI from loan terms + property carrying costs.
+
+        Returns ``None`` when the loan terms are insufficient (no
+        principal, missing rate, or missing term). When loan terms are
+        present but the property carrying-cost fields are missing,
+        defaults the missing pieces to zero so the caller still gets a
+        usable PI-only floor — better than ``None`` for DTI gating when
+        an UR LA + rate-lock are on file but the appraisal hasn't
+        landed yet.
+        """
+        if not loan_amount or loan_amount <= 0:
+            return None
+        if not annual_rate_pct or annual_rate_pct <= 0:
+            return None
+        if not term_months or term_months <= 0:
+            return None
+        # Standard amortization: M = P × r(1+r)^n / ((1+r)^n − 1)
+        r = annual_rate_pct / 100 / 12
+        n = term_months
+        try:
+            growth = (1 + r) ** n
+            monthly_pi = loan_amount * (r * growth) / (growth - 1)
+        except (OverflowError, ZeroDivisionError):
+            return None
+        monthly_tax = (annual_taxes or 0) / 12
+        monthly_hoi = hoi_monthly or 0
+        monthly_hoa = hoa_monthly or 0
+        return round(monthly_pi + monthly_tax + monthly_hoi + monthly_hoa, 2)
 
     async def _build_loan_terms(self, applicant_id: str, app: dict) -> dict:
         """Merge URLA / RATE_LOCK / PURCHASE_AGREEMENT extracted_fields

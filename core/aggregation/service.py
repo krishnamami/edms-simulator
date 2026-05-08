@@ -151,6 +151,24 @@ class AggregationService:
         }
         await self.postgres_store.save_application(application)
 
+        # Persist loan terms (amount / rate / term / purpose) onto the
+        # applications row so ContextAssembler.assemble can compute
+        # LTV + DTI without re-reading them from URLA / RATE_LOCK each
+        # time. Without this the application row carries no loan_amount
+        # and ltv_calculable / dti_calculable both stay False even after
+        # the income / property layers fully assemble.
+        loan_payload = p.get("loan") or {}
+        if loan_payload:
+            try:
+                await self.postgres_store.update_application_loan_data(
+                    application_id, loan_payload,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "update_application_loan_data_failed",
+                    extra={"application_id": application_id, "error": str(exc)},
+                )
+
         await self._run_assembly(
             applicant_id=primary_gr.applicant_id,
             application_id=application_id,
