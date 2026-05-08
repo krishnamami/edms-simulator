@@ -50,7 +50,12 @@ parties.
 | Application context | One-call `GET /application/{id}/context` returns nested `borrower` (income / credit / assets / identity / document_count / qualifying_monthly), `co_borrower_aggregation`, `loan_terms` (URLA / RATE_LOCK / PURCHASE_AGREEMENT merged), `conflicts: {count, critical: [...]}` (top contradicts edges), legacy `primary` / `co_borrower` snapshots (kept for backwards compat), property, vendor_checks, DTI/LTV, readiness flags, missing_items. Cached at `context:{application_id}` (TTL 30m). |
 | Readiness flags | 19 flags covering: borrower (income_verified, credit_pulled, identity_verified, employment_verified, assets_verified, identity_complete, tax_docs_received), property (appraisal_complete, title_clear, title_received, insurance_bound, flood_cert_received), application (dti_calculable, ltv_calculable, aus_ready), loan terms (loan_application_complete, purchase_agreement_received, rate_locked — date-aware), and a cross-doc fraud signal (no_critical_conflicts). |
 | Missing-documents catalog | `GET /application/{id}/missing-documents` returns 15 required slots (with `alternates` for W2_CURRENT∥W2_PRIOR / AUS_DU∥LP / HOI_BINDER∥HOI_DECLARATIONS) + 9 conditional slots (IRS transcript, 1040, Schedule C/E, gift letter, wind/hail, WDO, well/septic, HOA — each with the `reason` clause that triggers it) + `received` + `total_expected` / `total_received` / `completeness_pct`. |
-| API | FastAPI app, `X-API-Key` auth, `/health` + `/ready`, structured-log middleware, all `/ingest/*` and `/loans*` endpoints. |
+| API | FastAPI app, structured-log middleware, all `/ingest/*` and `/loans*` endpoints. Three Decision-OS-facing API interfaces sit on top of the same data layer: **Application API** (real-time per-entity context — `/loans`, `/documents/upload`, `/application/{id}/context`, `/applicant/{id}/income-profile`, etc.), **Report API** (`/reports/{pipeline,conflicts,completeness,extraction-quality,income-verification}` — paginated cross-loan analytics with 5-min Redis cache), **Bulk Export API** (`/export/{entities,documents,graph,profiles,applications}` — streaming JSONL/CSV with optional `?since=` incremental cutoff and per-consumer watermark CRUD). |
+| Auth + multi-tenancy | DB-backed `verify_api_key` resolves the inbound `X-API-Key` against the `api_keys` table (5-min Redis cache at `apikey:{key}`), with a legacy env-var fallback for tests. Every domain row tags `tenant_id` + every read filters on it; Redis keys are prefixed `{tenant_id}:`; reports cache key + every export stream filter on tenant. `Admin` API: `POST /admin/tenants` / `POST /admin/api-keys` (generates `edms_<32-char-token>`) / `GET` listings (api_keys masked) / `DELETE` deactivation, all gated by `Depends(require_admin)`. |
+| Rate limiting | One ASGI middleware (`core/middleware/rate_limiter.py`) gates every authenticated request. Three tiers — **application** 1000/min, **reports** 100/min, **export** 10/hour — keyed by raw `X-API-Key` value (per-key, not per-tenant). `X-RateLimit-Limit/Remaining/Reset` on every gated response; `429 + Retry-After` on bust. Bypass list covers `/health`, `/ready`, `/docs`, `/redoc`, `/openapi.json`, `/dashboard`, `/admin/*`. Fail-open on Redis errors. |
+| Async webhook outbox | `WebhookPublisher.publish()` writes one `webhook_outbox` row per subscriber (one INSERT each) and returns immediately — uploads no longer block on subscriber availability. A background asyncio task (`core/webhooks/delivery_worker.py`) drains pending rows under `Semaphore(10)`, POSTs with `httpx.AsyncClient(timeout=10)` + HMAC-SHA256, marks `delivered` on 2xx, applies `2^attempts × 30s` backoff (cap 1h) on failure, flips to `status='failed'` after `max_attempts`. `POST /webhooks/{id}/retry-failed` resets failed rows; `/health` reports `{pending, failed, delivered_last_hour, oldest_pending_age_seconds}`. |
+| Schema auto-migration | Lifespan applies `infra/schema.sql` against the connected pool right after `db.get_pool()`. Idempotent (every CREATE/ALTER is `IF NOT EXISTS`, every seed `ON CONFLICT DO NOTHING`); `already exists` is `skipped`, anything else is `errors` with the first failing statement logged but startup continues. Off-switch via `AUTO_MIGRATE_ON_STARTUP=false`. Each ECS deploy auto-applies new DDL — no separate `apply_schema.py` task for routine rollouts. |
+| OpenAPI / Swagger | Title `EDMS Knowledge Graph API` v1.0.0 with multi-paragraph description, contact + license, four ordered tag groups (Application / Reports / Export / System / Admin) each with prose blurbs. `custom_openapi()` post-processor classifies every operation by URL prefix and stamps the `ApiKeyAuth` security scheme on every non-public path. `summary` + `responses={200/401/404/422/429}` + per-Query `description=` on every public endpoint. Multi-content-type 200 examples on streaming endpoints. |
 | Resilience | Anthropic upstream errors map to HTTP 502 with detail; email body fallback preserves attachment processing. |
 | Walkthrough | `scripts/simulate_local.py` runs all 7 ingestion-+aggregation steps end-to-end. |
 
@@ -66,7 +71,7 @@ parties.
 
 ### Non-goals
 
-- Production-grade rate limiting / authn / authz beyond the dev `X-API-Key`.
+- ~~Production-grade rate limiting / authn / authz beyond the dev `X-API-Key`.~~ **Shipped:** DB-backed multi-tenancy + per-API-key rate limiting across three tiers + admin scope CRUD.
 - A UI. The simulator is API + scripts only.
 - Real bureau-pull integrations (Experian / Equifax / TransUnion APIs). The
   `CreditAssembler` synthesizes a plausible profile from the requested band.
@@ -105,8 +110,8 @@ The simulator is considered "running correctly" when:
 
 1. `docker compose up -d postgres redis` brings both services healthy.
 2. `python -m pytest tests/ --ignore=tests/integration -q` reports
-   `329 passed, 2 skipped` (live tests skipped without API key) on a
-   fresh checkout. Integration + smoke add 11 more for `340 green`.
+   `332 passed, 2 skipped` (live tests skipped without API key) on a
+   fresh checkout. Integration + smoke add 11 more for `343 green`.
    `python scripts/stress_test_indexing.py` reports `23 passed, 0 failed`
    across 7 concurrency / cache / throughput / webhook tests.
 3. `python scripts/simulate_local.py` exits 0 and produces:
@@ -145,7 +150,7 @@ The simulator is considered "running correctly" when:
 | Risk | Mitigation |
 |------|-----------|
 | Anthropic API key leaks via logs | Adapters never log the key; `_claude_client` reads env each call (no print). `.env` is gitignored. |
-| Schema drift between `infra/schema.sql` and a running DB | The Phase A side fix (xref unique constraint) updated both. Future schema changes should land in both places + add a migration step. |
+| Schema drift between `infra/schema.sql` and a running DB | The lifespan now auto-applies `infra/schema.sql` on every API startup (`core/storage/migrations.py`); idempotent CREATE/ALTER `IF NOT EXISTS` so re-runs are no-ops. Each ECS deploy picks up new DDL automatically. |
 | Confidence ranking diverges from real underwriting truth | The numbers in `SOURCE_CONFIDENCE_RANKING` are spec-driven; underwriting can override per-deployment by editing the dict — it's the only source. |
 | `XRefStore` in-memory state diverges from Postgres | Documented in `context.md`. Workaround: truncate before each fresh demo. Real fix: hydrate from Postgres at startup. |
 

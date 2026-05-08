@@ -35,6 +35,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logging.warning("aurora_pool_not_available_at_startup: %s", e)
 
+    # Auto-apply infra/schema.sql so a freshly-deployed ECS task picks
+    # up any new DDL the moment it boots — no separate one-off
+    # migration step. Idempotent: every CREATE/ALTER is IF NOT EXISTS,
+    # every seed is ON CONFLICT DO NOTHING. Off-switch via
+    # AUTO_MIGRATE_ON_STARTUP=false for the unit-test path that
+    # bypasses Postgres entirely.
+    if os.getenv("AUTO_MIGRATE_ON_STARTUP", "true").lower() == "true":
+        try:
+            from core.storage.migrations import apply_schema
+            await apply_schema()
+        except Exception as exc:
+            # Failures are already logged inside apply_schema; we
+            # double-guard here so a malformed schema file can never
+            # take the API process down.
+            logging.warning("schema_migration_unhandled: %s", exc)
+
     app.state.redis_store = RedisStore()
     app.state.postgres_store = PostgresStore()
     app.state.s3_client = S3Client()
