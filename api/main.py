@@ -233,7 +233,15 @@ from api.middleware import RequestMiddleware  # noqa: E402
 from api.reports import router as reports_router  # noqa: E402
 from api.routes import router  # noqa: E402
 
+from core.middleware.rate_limiter import RateLimitMiddleware  # noqa: E402
+
+# Middleware order matters — the *last* add_middleware call wraps
+# outermost and dispatches *first*. We want rate limiting to gate the
+# request before any logging happens (a 429'd request shouldn't pollute
+# the structured log stream); since RequestMiddleware is registered
+# first below, RateLimitMiddleware ends up outermost and runs first.
 app.add_middleware(RequestMiddleware)
+app.add_middleware(RateLimitMiddleware)
 app.include_router(router)
 app.include_router(health_router)
 app.include_router(reports_router, prefix="/reports", tags=["Reports"])

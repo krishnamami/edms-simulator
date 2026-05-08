@@ -12,8 +12,9 @@ companion ``/export/watermark`` POST/GET lets the consumer persist its
 own watermark on the server so it can resume after a restart without
 keeping client-side state.
 
-Rate limit: 10 export requests per hour per API key, tracked via Redis
-INCR + 1h EXPIRE.
+Rate limiting (10 export requests / hour / API key) lives in
+``core.middleware.rate_limiter.RateLimitMiddleware`` alongside the
+application + reports tiers; this module is rate-limit-naive.
 """
 from __future__ import annotations
 
@@ -50,8 +51,6 @@ _EXPORT_RESPONSES: dict = {
 # Constants
 # ---------------------------------------------------------------------------
 
-_RATE_LIMIT_PER_HOUR = 10
-_RATE_LIMIT_TTL_SECONDS = 3600
 _DEFAULT_FORMAT = "jsonl"
 _VALID_FORMATS = ("jsonl", "csv")
 _VALID_REL_TYPES = ("confirms", "contradicts", "corroborates", "supersedes", "references")
@@ -123,38 +122,6 @@ def _ensure_dict(value: Any) -> dict:
         except Exception:
             return {}
     return {}
-
-
-async def _enforce_rate_limit(redis_store, api_key: str, endpoint: str) -> None:
-    """Increment ``export_rate:{api_key}`` once per request; reject when
-    the bucket already shows >= _RATE_LIMIT_PER_HOUR. The bucket lives
-    for an hour from its first INCR so the next hour's quota refills
-    cleanly. A redis outage (returning None / raising) MUST NOT block
-    legitimate traffic — bulk exports are SLA-critical for downstream
-    DWH pipelines, so we fail open on the limit and just log a warning."""
-    key = f"export_rate:{api_key}"
-    try:
-        client = redis_store._r
-        count = await client.incr(key)
-        if int(count) == 1:
-            await client.expire(key, _RATE_LIMIT_TTL_SECONDS)
-        if int(count) > _RATE_LIMIT_PER_HOUR:
-            ttl = await client.ttl(key)
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Export rate limit exceeded: {_RATE_LIMIT_PER_HOUR}/hr; "
-                    f"retry after {ttl}s"
-                ),
-                headers={"Retry-After": str(max(int(ttl or 1), 1))},
-            )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.warning(
-            "export_rate_limit_check_failed",
-            extra={"endpoint": endpoint, "error": str(exc)},
-        )
 
 
 def _export_headers(
@@ -564,7 +531,6 @@ async def export_entities(
         description="Comma-separated subset of `income,credit,assets,identity`. JSONL only — CSV always emits all columns.",
     ),
 ):
-    x_api_key = request.headers.get("X-API-Key") or "anon"
     fmt = _validate_format(format)
     since_ts = _parse_iso(since, "since")
 
@@ -580,7 +546,6 @@ async def export_entities(
 
     pg = request.app.state.postgres_store
     redis = request.app.state.redis_store
-    await _enforce_rate_limit(redis, x_api_key or "anon", "entities")
 
     counter = [0]
 
@@ -622,13 +587,11 @@ async def export_documents(
     doc_type: Optional[str] = Query(None, description="Filter by canonical document_type (e.g. `W2_CURRENT`)."),
     category: Optional[str] = Query(None, description="Filter by document_category (`income`, `credit`, `property`, `vendor`, …)."),
 ):
-    x_api_key = request.headers.get("X-API-Key") or "anon"
     fmt = _validate_format(format)
     since_ts = _parse_iso(since, "since")
 
     pg = request.app.state.postgres_store
     redis = request.app.state.redis_store
-    await _enforce_rate_limit(redis, x_api_key or "anon", "documents")
 
     counter = [0]
     raw_iter = pg.stream_documents(since=since_ts, doc_type=doc_type, category=category, tenant_id=current_tenant_id())
@@ -658,7 +621,6 @@ async def export_graph(
         description="Filter to one of `confirms`, `contradicts`, `corroborates`, `supersedes`, `references`.",
     ),
 ):
-    x_api_key = request.headers.get("X-API-Key") or "anon"
     fmt = _validate_format(format)
     since_ts = _parse_iso(since, "since")
     if relationship_type and relationship_type not in _VALID_REL_TYPES:
@@ -669,7 +631,6 @@ async def export_graph(
 
     pg = request.app.state.postgres_store
     redis = request.app.state.redis_store
-    await _enforce_rate_limit(redis, x_api_key or "anon", "graph")
 
     counter = [0]
     raw_iter = pg.stream_graph_edges(since=since_ts, relationship_type=relationship_type, tenant_id=current_tenant_id())
@@ -696,7 +657,6 @@ async def export_profiles(
     since: Optional[str] = Query(None, description="Incremental cutoff (ISO 8601)."),
     profile_type: str = Query("all", description="`income`, `credit`, or `all` (default — emits both, each row keyed by `profile_kind`)."),
 ):
-    x_api_key = request.headers.get("X-API-Key") or "anon"
     fmt = _validate_format(format)
     since_ts = _parse_iso(since, "since")
     if profile_type not in _VALID_PROFILE_TYPES:
@@ -707,7 +667,6 @@ async def export_profiles(
 
     pg = request.app.state.postgres_store
     redis = request.app.state.redis_store
-    await _enforce_rate_limit(redis, x_api_key or "anon", "profiles")
 
     counter = [0]
 
@@ -756,13 +715,11 @@ async def export_applications(
     format: str = Query(_DEFAULT_FORMAT, description="`jsonl` or `csv`."),
     since: Optional[str] = Query(None, description="Incremental cutoff (ISO 8601). Filters on `COALESCE(updated_at, created_at)`."),
 ):
-    x_api_key = request.headers.get("X-API-Key") or "anon"
     fmt = _validate_format(format)
     since_ts = _parse_iso(since, "since")
 
     pg = request.app.state.postgres_store
     redis = request.app.state.redis_store
-    await _enforce_rate_limit(redis, x_api_key or "anon", "applications")
 
     counter = [0]
     raw_iter = pg.stream_applications_export(since=since_ts, tenant_id=current_tenant_id())
