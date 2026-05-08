@@ -21,6 +21,7 @@ Run lifecycle (per source, default ``s3``)::
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -40,6 +41,13 @@ _PROPERTY_DOC_TYPES = {
     "PROPERTY_TAX_TRANSCRIPT", "SURVEY", "PEST_INSPECTION", "HOA_CERT",
     "CONDO_QUESTIONNAIRE", "PURCHASE_AGREEMENT",
 }
+
+# Cap how many distinct applicants we work on at once. The per-applicant
+# assembly lock from core/aggregation/service.py already serializes
+# concurrent assemblies for the *same* applicant — this semaphore caps
+# parallelism across *different* applicants so a 500-applicant batch
+# doesn't open 500 PG connections at once.
+_MAX_CONCURRENT_APPLICANTS = 10
 
 
 class BatchIndexer:
@@ -108,22 +116,30 @@ class BatchIndexer:
                     "batch_index_groups",
                     extra={"applicants": len(groups), "files": len(new_docs)},
                 )
-                for los_id, docs in groups.items():
-                    try:
-                        result = await self._process_applicant(
-                            los_id=los_id, new_docs=docs, dry_run=dry_run
-                        )
-                        if not result["applicant_known"]:
-                            # Unknown LOS — count as skipped, not error.
-                            stats["skipped"] += len(docs)
-                        else:
-                            stats["processed"] += result["processed"]
-                            stats["skipped_already_indexed"] += result[
-                                "skipped_already_indexed"
-                            ]
-                            if result["processed"] > 0:
-                                stats["applicants_affected"] += 1
-                    except Exception as exc:
+
+                # Process applicants in parallel, capped by a semaphore.
+                # Each task returns (los_id, result_or_none, exc_or_none) so
+                # the gather call itself never raises — exceptions surface
+                # in the result tuple and roll up into stats below.
+                sem = asyncio.Semaphore(_MAX_CONCURRENT_APPLICANTS)
+
+                async def _process_with_sem(los_id, docs):
+                    async with sem:
+                        try:
+                            result = await self._process_applicant(
+                                los_id=los_id, new_docs=docs, dry_run=dry_run
+                            )
+                            return los_id, result, None
+                        except Exception as exc:
+                            return los_id, None, exc
+
+                tasks = [
+                    _process_with_sem(lid, d) for lid, d in groups.items()
+                ]
+                results = await asyncio.gather(*tasks)
+
+                for los_id, result, exc in results:
+                    if exc is not None:
                         stats["errors"] += 1
                         stats["error_details"].append({
                             "los_id": los_id, "error": str(exc)[:200],
@@ -132,6 +148,17 @@ class BatchIndexer:
                             "batch_index_applicant_error",
                             extra={"los_id": los_id, "error": str(exc)[:200]},
                         )
+                        continue
+                    if not result["applicant_known"]:
+                        # Unknown LOS — count as skipped, not error.
+                        stats["skipped"] += len(groups[los_id])
+                    else:
+                        stats["processed"] += result["processed"]
+                        stats["skipped_already_indexed"] += result[
+                            "skipped_already_indexed"
+                        ]
+                        if result["processed"] > 0:
+                            stats["applicants_affected"] += 1
 
             if not dry_run:
                 stats["duration_ms"] = int((time.time() - start) * 1000)
