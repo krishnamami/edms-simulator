@@ -28,6 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from core.tenancy import current_tenant_id
 from api.routes import verify_api_key
 
 logger = logging.getLogger(__name__)
@@ -586,7 +587,7 @@ async def export_entities(
     if fmt == "jsonl":
         async def gen():
             async for chunk in _stream_jsonl(
-                pg.stream_entities(since=since_ts),
+                pg.stream_entities(since=since_ts, tenant_id=current_tenant_id()),
                 lambda r: _entity_record(r, include_set),
                 counter,
             ):
@@ -595,7 +596,7 @@ async def export_entities(
     else:
         async def gen():
             async for chunk in _stream_csv(
-                pg.stream_entities(since=since_ts),
+                pg.stream_entities(since=since_ts, tenant_id=current_tenant_id()),
                 lambda r: _entity_csv_row(r, include_set),
                 _ENTITY_CSV_COLUMNS,
                 counter,
@@ -630,7 +631,7 @@ async def export_documents(
     await _enforce_rate_limit(redis, x_api_key or "anon", "documents")
 
     counter = [0]
-    raw_iter = pg.stream_documents(since=since_ts, doc_type=doc_type, category=category)
+    raw_iter = pg.stream_documents(since=since_ts, doc_type=doc_type, category=category, tenant_id=current_tenant_id())
 
     if fmt == "jsonl":
         body = _stream_jsonl(raw_iter, _document_record, counter)
@@ -671,7 +672,7 @@ async def export_graph(
     await _enforce_rate_limit(redis, x_api_key or "anon", "graph")
 
     counter = [0]
-    raw_iter = pg.stream_graph_edges(since=since_ts, relationship_type=relationship_type)
+    raw_iter = pg.stream_graph_edges(since=since_ts, relationship_type=relationship_type, tenant_id=current_tenant_id())
 
     if fmt == "jsonl":
         body = _stream_jsonl(raw_iter, _graph_record, counter)
@@ -716,10 +717,10 @@ async def export_profiles(
         DWH consumer can split by type at load time without keeping
         two separate URLs."""
         if profile_type in ("income", "all"):
-            async for r in pg.stream_income_profiles(since=since_ts):
+            async for r in pg.stream_income_profiles(since=since_ts, tenant_id=current_tenant_id()):
                 yield _income_profile_record(r)
         if profile_type in ("credit", "all"):
-            async for r in pg.stream_credit_profiles(since=since_ts):
+            async for r in pg.stream_credit_profiles(since=since_ts, tenant_id=current_tenant_id()):
                 yield _credit_profile_record(r)
 
     if fmt == "jsonl":
@@ -764,7 +765,7 @@ async def export_applications(
     await _enforce_rate_limit(redis, x_api_key or "anon", "applications")
 
     counter = [0]
-    raw_iter = pg.stream_applications_export(since=since_ts)
+    raw_iter = pg.stream_applications_export(since=since_ts, tenant_id=current_tenant_id())
 
     if fmt == "jsonl":
         body = _stream_jsonl(raw_iter, _application_record, counter)

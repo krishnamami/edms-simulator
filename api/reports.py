@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from core.tenancy import current_tenant_id
 from api.routes import (
     _CONDITIONAL_DOCS,
     _REQUIRED_DOCS,
@@ -122,11 +123,13 @@ def _validate_page(page: int) -> int:
 
 
 def _cache_key(endpoint: str, params: dict) -> str:
-    """Deterministic cache key from endpoint + sorted-param hash. Keeps
-    keys readable under MONITOR while staying short enough for Redis."""
+    """Deterministic, tenant-scoped cache key. The tenant_id is folded
+    into the path prefix so two tenants asking the same /reports/pipeline
+    query never land on the same cached payload — that's the whole
+    point of multi-tenancy isolation."""
     blob = json.dumps(params, sort_keys=True, default=str).encode()
     digest = hashlib.sha256(blob).hexdigest()[:16]
-    return f"report:{endpoint}:{digest}"
+    return f"{current_tenant_id()}:report:{endpoint}:{digest}"
 
 
 async def _cache_get(redis_store, key: str) -> Optional[dict]:
@@ -288,8 +291,8 @@ async def report_pipeline(
         return cached
 
     offset = (page - 1) * page_size
-    total = await pg.count_pipeline_report(start, end, status)
-    rows = await pg.get_pipeline_report(start, end, status, page_size, offset)
+    total = await pg.count_pipeline_report(start, end, status, tenant_id=current_tenant_id())
+    rows = await pg.get_pipeline_report(start, end, status, page_size, offset, tenant_id=current_tenant_id())
 
     # documents_received counts the *populated slots* against the
     # required catalog — not the raw doc count — so a loan with 43
@@ -439,6 +442,7 @@ async def report_conflicts(
         # filter slice from going under page_size.
         all_rows = await pg.get_conflicts_report(
             start, end, min_delta_pct, limit=page_size * 4, offset=0,
+            tenant_id=current_tenant_id(),
         )
         filtered_rows = [
             r for r in all_rows
@@ -449,9 +453,10 @@ async def report_conflicts(
         page_rows = filtered_rows[offset : offset + page_size]
     else:
         offset = (page - 1) * page_size
-        total = await pg.count_conflicts_report(start, end, min_delta_pct)
+        total = await pg.count_conflicts_report(start, end, min_delta_pct, tenant_id=current_tenant_id())
         page_rows = await pg.get_conflicts_report(
             start, end, min_delta_pct, page_size, offset,
+            tenant_id=current_tenant_id(),
         )
 
     conflicts: list[dict] = []
@@ -526,7 +531,7 @@ async def report_completeness(
     if cached is not None:
         return cached
 
-    rows = await pg.get_applications_with_doc_types(start, end)
+    rows = await pg.get_applications_with_doc_types(start, end, tenant_id=current_tenant_id())
 
     expected = len(_REQUIRED_DOCS)
     below: list[dict] = []
@@ -601,8 +606,8 @@ async def report_extraction_quality(
     if cached is not None:
         return cached
 
-    totals = await pg.get_extraction_method_totals(start, end)
-    by_type_rows = await pg.get_extraction_method_by_doc_type(start, end)
+    totals = await pg.get_extraction_method_totals(start, end, tenant_id=current_tenant_id())
+    by_type_rows = await pg.get_extraction_method_by_doc_type(start, end, tenant_id=current_tenant_id())
 
     total = int(totals.get("total") or 0)
     deterministic = int(totals.get("deterministic") or 0)
@@ -683,7 +688,7 @@ async def report_income_verification(
     if cached is not None:
         return cached
 
-    rows = await pg.get_income_verification_data(start, end)
+    rows = await pg.get_income_verification_data(start, end, tenant_id=current_tenant_id())
 
     discrepancies: list[dict] = []
     for r in rows:

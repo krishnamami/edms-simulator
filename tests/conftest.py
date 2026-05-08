@@ -39,33 +39,38 @@ class FakePostgresStore:
         self.watermarks: dict = {}
         self.indexing_runs: dict = {}
 
-    async def save_golden_record(self, gr):
+    async def save_golden_record(self, gr, tenant_id="default"):
         # Round-trip storage so get_all_applicants / find_by_external_id can
         # observe records written through the regular pipeline.
+        gr = {**gr, "tenant_id": tenant_id}
         self.applicants[gr["applicant_id"]] = gr
-    async def find_by_applicant_id(self, applicant_id): return None
-    async def find_by_ssn_hash(self, ssn_hash): return None
-    async def find_by_name_dob(self, last_name, dob): return []
+    async def find_by_applicant_id(self, applicant_id, tenant_id="default"): return None
+    async def find_by_ssn_hash(self, ssn_hash, tenant_id="default"): return None
+    async def find_by_name_dob(self, last_name, dob, tenant_id="default"): return []
     async def update_status(self, applicant_id, status): pass
     async def next_sequence(self): return 1
 
     async def save_xref(self, xref):
         self.xrefs.append(xref)
 
-    async def save_application(self, app):
-        self.applications[app["application_id"]] = app
+    async def save_application(self, app, tenant_id="default"):
+        self.applications[app["application_id"]] = {**app, "tenant_id": tenant_id}
 
-    async def get_application_by_los_id(self, los_id):
+    async def get_application_by_los_id(self, los_id, tenant_id="default"):
         for app in self.applications.values():
-            if app["los_id"] == los_id:
+            if app["los_id"] == los_id and app.get("tenant_id", "default") == tenant_id:
                 return app
         return None
 
-    async def get_application(self, application_id):
-        return self.applications.get(application_id)
+    async def get_application(self, application_id, tenant_id="default"):
+        app = self.applications.get(application_id)
+        if app and app.get("tenant_id", "default") != tenant_id:
+            return None
+        return app
 
-    async def get_all_applications(self, limit=50):
-        rows = list(self.applications.values())
+    async def get_all_applications(self, limit=50, tenant_id="default"):
+        rows = [a for a in self.applications.values()
+                if a.get("tenant_id", "default") == tenant_id]
         return rows[:limit]
 
     async def get_raw_ingestion_for_application(self, application_id):
@@ -73,36 +78,44 @@ class FakePostgresStore:
         # callers handle the empty list path.
         return []
 
-    async def get_application_by_applicant(self, applicant_id):
+    async def get_application_by_applicant(self, applicant_id, tenant_id="default"):
         for app in self.applications.values():
-            if app.get("applicant_id") == applicant_id \
-                    or app.get("co_applicant_id") == applicant_id:
+            if (app.get("applicant_id") == applicant_id
+                    or app.get("co_applicant_id") == applicant_id) \
+                    and app.get("tenant_id", "default") == tenant_id:
                 return app
         return None
 
     async def update_application_loan_data(self, application_id, loan_data):
         await self.update_application_loan_fields(application_id, loan_data)
 
-    async def save_income_profile(self, profile):
+    async def save_income_profile(self, profile, tenant_id="default"):
         applicant_id = profile["applicant_id"]
         prior = self.income_profiles.get(applicant_id)
         version = (prior.get("_version", 0) + 1) if prior else 1
-        profile = {**profile, "_version": version}
+        profile = {**profile, "_version": version, "tenant_id": tenant_id}
         self.income_profiles[applicant_id] = profile
         return f"profile-{applicant_id}-{version}"
 
-    async def get_income_profile(self, applicant_id):
-        return self.income_profiles.get(applicant_id)
+    async def get_income_profile(self, applicant_id, tenant_id="default"):
+        row = self.income_profiles.get(applicant_id)
+        if row and row.get("tenant_id", "default") != tenant_id:
+            return None
+        return row
 
-    async def save_credit_profile(self, profile):
-        self.credit_profiles[profile["applicant_id"]] = profile
+    async def save_credit_profile(self, profile, tenant_id="default"):
+        self.credit_profiles[profile["applicant_id"]] = {**profile, "tenant_id": tenant_id}
 
-    async def get_credit_profile(self, applicant_id):
-        return self.credit_profiles.get(applicant_id)
+    async def get_credit_profile(self, applicant_id, tenant_id="default"):
+        row = self.credit_profiles.get(applicant_id)
+        if row and row.get("tenant_id", "default") != tenant_id:
+            return None
+        return row
 
-    async def save_document(self, doc):
+    async def save_document(self, doc, tenant_id="default"):
         # Mirror production's ON CONFLICT (document_id) DO UPDATE so the
         # batch indexer's save → assembler save flow doesn't double-row.
+        doc = {**doc, "tenant_id": tenant_id}
         for i, existing in enumerate(self.documents):
             if existing.get("document_id") == doc.get("document_id"):
                 self.documents[i] = doc
@@ -115,32 +128,39 @@ class FakePostgresStore:
                 return d
         return None
 
-    async def get_documents_for_applicant(self, applicant_id):
-        return [d for d in self.documents if d["applicant_id"] == applicant_id]
+    async def get_documents_for_applicant(self, applicant_id, tenant_id="default"):
+        return [d for d in self.documents
+                if d["applicant_id"] == applicant_id
+                and d.get("tenant_id", "default") == tenant_id]
 
-    async def get_documents_for_application(self, application_id):
-        return [d for d in self.documents if d.get("application_id") == application_id]
+    async def get_documents_for_application(self, application_id, tenant_id="default"):
+        return [d for d in self.documents
+                if d.get("application_id") == application_id
+                and d.get("tenant_id", "default") == tenant_id]
 
     async def get_all_applicants(self):
         return list(self.applicants.values())
 
     # graph methods
-    async def save_relationship(self, rel):
-        self.relationships.append(rel)
+    async def save_relationship(self, rel, tenant_id="default"):
+        self.relationships.append({**rel, "tenant_id": tenant_id})
 
-    async def get_relationships_for_applicant(self, applicant_id):
-        return [r for r in self.relationships if r["applicant_id"] == applicant_id]
+    async def get_relationships_for_applicant(self, applicant_id, tenant_id="default"):
+        return [r for r in self.relationships
+                if r["applicant_id"] == applicant_id
+                and r.get("tenant_id", "default") == tenant_id]
 
-    async def get_conflicts_for_applicant(self, applicant_id):
+    async def get_conflicts_for_applicant(self, applicant_id, tenant_id="default"):
         return [
             r for r in self.relationships
             if r["applicant_id"] == applicant_id
             and r["relationship_type"] == "contradicts"
+            and r.get("tenant_id", "default") == tenant_id
         ]
 
-    async def get_graph_summary(self, applicant_id):
-        docs = await self.get_documents_for_applicant(applicant_id)
-        rels = await self.get_relationships_for_applicant(applicant_id)
+    async def get_graph_summary(self, applicant_id, tenant_id="default"):
+        docs = await self.get_documents_for_applicant(applicant_id, tenant_id)
+        rels = await self.get_relationships_for_applicant(applicant_id, tenant_id)
         conflicts = [r for r in rels if r["relationship_type"] == "contradicts"]
         confirms  = [r for r in rels if r["relationship_type"] == "confirms"]
         return {
@@ -187,30 +207,39 @@ class FakePostgresStore:
                 app[k] = loan_data[k]
 
     # property layer
-    async def save_property(self, prop):
-        self.properties[prop["property_id"]] = dict(prop)
+    async def save_property(self, prop, tenant_id="default"):
+        self.properties[prop["property_id"]] = {**dict(prop), "tenant_id": tenant_id}
         return prop["property_id"]
 
-    async def get_property(self, property_id):
-        return self.properties.get(property_id)
+    async def get_property(self, property_id, tenant_id="default"):
+        row = self.properties.get(property_id)
+        if row and row.get("tenant_id", "default") != tenant_id:
+            return None
+        return row
 
-    async def get_property_by_application(self, application_id):
+    async def get_property_by_application(self, application_id, tenant_id="default"):
         for p in self.properties.values():
-            if p.get("application_id") == application_id:
+            if p.get("application_id") == application_id \
+                    and p.get("tenant_id", "default") == tenant_id:
                 return p
         return None
 
-    async def save_property_profile(self, profile):
+    async def save_property_profile(self, profile, tenant_id="default"):
         property_id = profile["property_id"]
         prior = self.property_profiles.get(property_id)
         version = (prior.get("_version", 0) + 1) if prior else 1
-        self.property_profiles[property_id] = {**profile, "_version": version}
+        self.property_profiles[property_id] = {
+            **profile, "_version": version, "tenant_id": tenant_id,
+        }
         return f"profile-{property_id}-{version}"
 
-    async def get_property_profile(self, property_id):
-        return self.property_profiles.get(property_id)
+    async def get_property_profile(self, property_id, tenant_id="default"):
+        row = self.property_profiles.get(property_id)
+        if row and row.get("tenant_id", "default") != tenant_id:
+            return None
+        return row
 
-    async def get_property_docs(self, property_id):
+    async def get_property_docs(self, property_id, tenant_id="default"):
         prop = self.properties.get(property_id)
         if not prop:
             return []
@@ -219,6 +248,7 @@ class FakePostgresStore:
             d for d in self.documents
             if d.get("application_id") == application_id
             and d.get("document_category") == "property"
+            and d.get("tenant_id", "default") == tenant_id
         ]
 
     async def update_application_property(self, application_id, property_id):
@@ -400,6 +430,47 @@ class FakePostgresStore:
             "export_watermarks":       len(getattr(self, "export_watermarks", {})),
         }
         return mapping.get(table_name, 0)
+
+    # Multi-tenancy stubs — tests don't exercise the api_keys path
+    # (auth uses the legacy env-var fallback when API_KEY is set), but
+    # AggregationService route paths may pass tenant_id through.
+
+    async def get_api_key(self, api_key):
+        return getattr(self, "_api_keys", {}).get(api_key)
+
+    async def touch_api_key(self, api_key):
+        pass
+
+    async def create_api_key(self, api_key, tenant_id, name=None, scopes="read,write"):
+        if not hasattr(self, "_api_keys"):
+            self._api_keys = {}
+        row = {"api_key": api_key, "tenant_id": tenant_id, "name": name,
+               "scopes": scopes, "is_active": True}
+        self._api_keys[api_key] = row
+        return row
+
+    async def list_api_keys(self, tenant_id=None):
+        rows = list(getattr(self, "_api_keys", {}).values())
+        if tenant_id:
+            rows = [r for r in rows if r["tenant_id"] == tenant_id]
+        return rows
+
+    async def deactivate_api_key(self, api_key):
+        if hasattr(self, "_api_keys") and api_key in self._api_keys:
+            self._api_keys[api_key]["is_active"] = False
+
+    async def get_tenant(self, tenant_id):
+        return getattr(self, "_tenants", {}).get(tenant_id)
+
+    async def create_tenant(self, tenant_id, name):
+        if not hasattr(self, "_tenants"):
+            self._tenants = {}
+        row = {"tenant_id": tenant_id, "name": name, "is_active": True}
+        self._tenants[tenant_id] = row
+        return row
+
+    async def list_tenants(self):
+        return list(getattr(self, "_tenants", {}).values())
 
     # Bulk-export streams + watermarks (Interface 3) — minimal stubs so
     # service-layer tests don't blow up if a code path tries to exercise

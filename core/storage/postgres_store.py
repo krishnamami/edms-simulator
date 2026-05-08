@@ -31,6 +31,8 @@ def _to_jsonb(value):
     return json.dumps(value, default=str)
 
 
+
+
 def _row_to_dict(row) -> Optional[dict]:
     if row is None:
         return None
@@ -66,17 +68,19 @@ def _row_to_dict(row) -> Optional[dict]:
 class PostgresStore:
     # ---------------- applicants / golden record -----------------
 
-    async def save_golden_record(self, gr: dict) -> None:
+    async def save_golden_record(self, gr: dict, tenant_id: str = "default") -> None:
         await db.execute(
             """
             INSERT INTO applicants (
                 applicant_id, full_name, first_name, last_name, dob,
                 ssn_hash, ssn_last4, email, phone, address_current,
-                status, identity_xrefs, application_ids, created_at, updated_at
+                status, identity_xrefs, application_ids, tenant_id,
+                created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5::date,
                 $6, $7, $8, $9, $10::jsonb,
-                $11, $12::jsonb, $13::jsonb, NOW(), NOW()
+                $11, $12::jsonb, $13::jsonb, $14,
+                NOW(), NOW()
             )
             ON CONFLICT (applicant_id) DO UPDATE SET
                 full_name       = EXCLUDED.full_name,
@@ -91,6 +95,7 @@ class PostgresStore:
                 status          = EXCLUDED.status,
                 identity_xrefs  = EXCLUDED.identity_xrefs,
                 application_ids = EXCLUDED.application_ids,
+                tenant_id       = EXCLUDED.tenant_id,
                 updated_at      = NOW()
             """,
             gr["applicant_id"],
@@ -106,25 +111,38 @@ class PostgresStore:
             gr.get("status", "placeholder"),
             _to_jsonb(gr.get("identity_xrefs", [])),
             _to_jsonb(gr.get("application_ids", [])),
+            tenant_id,
         )
 
-    async def find_by_applicant_id(self, applicant_id: str) -> Optional[dict]:
+    async def find_by_applicant_id(
+        self, applicant_id: str, tenant_id: str = "default",
+    ) -> Optional[dict]:
         row = await db.fetchrow(
-            "SELECT * FROM applicants WHERE applicant_id = $1", applicant_id
+            "SELECT * FROM applicants WHERE applicant_id = $1 AND tenant_id = $2",
+            applicant_id, tenant_id,
         )
         return _row_to_dict(row)
 
-    async def find_by_ssn_hash(self, ssn_hash: str) -> Optional[dict]:
+    async def find_by_ssn_hash(
+        self, ssn_hash: str, tenant_id: str = "default",
+    ) -> Optional[dict]:
         row = await db.fetchrow(
-            "SELECT * FROM applicants WHERE ssn_hash = $1", ssn_hash
+            "SELECT * FROM applicants WHERE ssn_hash = $1 AND tenant_id = $2",
+            ssn_hash, tenant_id,
         )
         return _row_to_dict(row)
 
-    async def find_by_name_dob(self, last_name: str, dob: str) -> list:
+    async def find_by_name_dob(
+        self, last_name: str, dob: str, tenant_id: str = "default",
+    ) -> list:
         rows = await db.fetch(
-            "SELECT * FROM applicants WHERE LOWER(last_name) = LOWER($1) AND dob = $2::date",
-            last_name,
-            dob,
+            """
+            SELECT * FROM applicants
+             WHERE LOWER(last_name) = LOWER($1)
+               AND dob = $2::date
+               AND tenant_id = $3
+            """,
+            last_name, dob, tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -157,43 +175,59 @@ class PostgresStore:
 
     # ---------------- applications -----------------
 
-    async def save_application(self, app: dict) -> None:
+    async def save_application(
+        self, app: dict, tenant_id: str = "default",
+    ) -> None:
         await db.execute(
             """
             INSERT INTO applications (
-                application_id, applicant_id, co_applicant_id, los_id, status, created_at
-            ) VALUES ($1, $2, $3, $4, $5, NOW())
+                application_id, applicant_id, co_applicant_id, los_id,
+                status, tenant_id, created_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
             ON CONFLICT (application_id) DO UPDATE SET
                 applicant_id    = EXCLUDED.applicant_id,
                 co_applicant_id = EXCLUDED.co_applicant_id,
-                status          = EXCLUDED.status
+                status          = EXCLUDED.status,
+                tenant_id       = EXCLUDED.tenant_id
             """,
             app["application_id"],
             app["applicant_id"],
             app.get("co_applicant_id"),
             app["los_id"],
             app.get("status", "active"),
+            tenant_id,
         )
 
-    async def get_application_by_los_id(self, los_id: str) -> Optional[dict]:
+    async def get_application_by_los_id(
+        self, los_id: str, tenant_id: str = "default",
+    ) -> Optional[dict]:
         row = await db.fetchrow(
-            "SELECT * FROM applications WHERE los_id = $1", los_id
+            "SELECT * FROM applications WHERE los_id = $1 AND tenant_id = $2",
+            los_id, tenant_id,
         )
         return _row_to_dict(row)
 
-    async def get_application(self, application_id: str) -> Optional[dict]:
-        """Lookup an application by its primary key."""
+    async def get_application(
+        self, application_id: str, tenant_id: str = "default",
+    ) -> Optional[dict]:
+        """Lookup an application by its primary key, scoped to ``tenant_id``."""
         row = await db.fetchrow(
-            "SELECT * FROM applications WHERE application_id = $1",
-            application_id,
+            "SELECT * FROM applications WHERE application_id = $1 AND tenant_id = $2",
+            application_id, tenant_id,
         )
         return _row_to_dict(row)
 
-    async def get_all_applications(self, limit: int = 50) -> list:
-        """Return the N most-recent applications. Used by the dashboard."""
+    async def get_all_applications(
+        self, limit: int = 50, tenant_id: str = "default",
+    ) -> list:
+        """Return the N most-recent applications for ``tenant_id``."""
         rows = await db.fetch(
-            "SELECT * FROM applications ORDER BY created_at DESC LIMIT $1",
-            limit,
+            """
+            SELECT * FROM applications
+             WHERE tenant_id = $2
+             ORDER BY created_at DESC LIMIT $1
+            """,
+            limit, tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -219,18 +253,18 @@ class PostgresStore:
         return [_row_to_dict(r) for r in rows]
 
     async def get_application_by_applicant(
-        self, applicant_id: str
+        self, applicant_id: str, tenant_id: str = "default",
     ) -> Optional[dict]:
         """Return the most-recent application that has ``applicant_id`` as
-        primary or co-applicant. Used by the service layer to invalidate
-        the right context cache after a borrower-side update."""
+        primary or co-applicant. Scoped to ``tenant_id``."""
         row = await db.fetchrow(
             """
             SELECT * FROM applications
-            WHERE applicant_id = $1 OR co_applicant_id = $1
+            WHERE (applicant_id = $1 OR co_applicant_id = $1)
+              AND tenant_id = $2
             ORDER BY created_at DESC LIMIT 1
             """,
-            applicant_id,
+            applicant_id, tenant_id,
         )
         return _row_to_dict(row)
 
@@ -557,25 +591,22 @@ class PostgresStore:
 
     # ---------------- income profiles (versioned) -----------------
 
-    async def save_income_profile(self, profile: dict) -> str:
-        """Upsert a single current income profile per applicant. Old rows
-        are removed rather than versioned via superseded_by — one row per
-        applicant, not a growing history. Functionally equivalent to
-        INSERT ... ON CONFLICT (applicant_id) DO UPDATE, implemented as
-        DELETE + INSERT because the schema doesn't carry a unique
-        constraint on applicant_id and we want to avoid a prod-side
-        migration to add one."""
+    async def save_income_profile(
+        self, profile: dict, tenant_id: str = "default",
+    ) -> str:
+        """Upsert a single current income profile per applicant, tagged
+        with ``tenant_id``. Same DELETE-then-INSERT pattern as before."""
         applicant_id = profile["applicant_id"]
         await db.execute(
-            "DELETE FROM income_profiles WHERE applicant_id = $1",
-            applicant_id,
+            "DELETE FROM income_profiles WHERE applicant_id = $1 AND tenant_id = $2",
+            applicant_id, tenant_id,
         )
         new_id = await db.fetchval(
             """
             INSERT INTO income_profiles (
                 applicant_id, application_id, assembled_at, profile_data,
-                lineage_hash, version
-            ) VALUES ($1, $2, $3::timestamptz, $4::jsonb, $5, 1)
+                lineage_hash, version, tenant_id
+            ) VALUES ($1, $2, $3::timestamptz, $4::jsonb, $5, 1, $6)
             RETURNING profile_id
             """,
             applicant_id,
@@ -583,18 +614,21 @@ class PostgresStore:
             _to_ts(profile["assembled_at"]),
             _to_jsonb(profile),
             profile.get("lineage_hash", ""),
+            tenant_id,
         )
         return str(new_id)
 
-    async def get_income_profile(self, applicant_id: str) -> Optional[dict]:
+    async def get_income_profile(
+        self, applicant_id: str, tenant_id: str = "default",
+    ) -> Optional[dict]:
         row = await db.fetchrow(
             """
             SELECT profile_data, lineage_hash, version, assembled_at
             FROM income_profiles
-            WHERE applicant_id = $1 AND superseded_by IS NULL
+            WHERE applicant_id = $1 AND tenant_id = $2 AND superseded_by IS NULL
             ORDER BY created_at DESC LIMIT 1
             """,
-            applicant_id,
+            applicant_id, tenant_id,
         )
         if not row:
             return None
@@ -606,25 +640,21 @@ class PostgresStore:
 
     # ---------------- credit profiles -----------------
 
-    async def save_credit_profile(self, profile: dict) -> None:
-        """Upsert a single current credit profile per applicant. Old rows
-        (including any historical is_current=FALSE rows from the prior
-        versioned implementation) are removed so the table stays at one
-        row per applicant. Functionally equivalent to INSERT ... ON
-        CONFLICT (applicant_id) DO UPDATE; uses DELETE + INSERT to avoid
-        a prod-side schema migration to promote the partial unique index
-        idx_credit_current to a full unique constraint."""
+    async def save_credit_profile(
+        self, profile: dict, tenant_id: str = "default",
+    ) -> None:
+        """Upsert one current credit profile per applicant, scoped to ``tenant_id``."""
         applicant_id = profile["applicant_id"]
         await db.execute(
-            "DELETE FROM credit_profiles WHERE applicant_id = $1",
-            applicant_id,
+            "DELETE FROM credit_profiles WHERE applicant_id = $1 AND tenant_id = $2",
+            applicant_id, tenant_id,
         )
         await db.execute(
             """
             INSERT INTO credit_profiles (
                 applicant_id, mid_score, credit_band, profile_data,
-                report_date, expiry_date, is_current
-            ) VALUES ($1, $2, $3, $4::jsonb, $5::date, $6::date, TRUE)
+                report_date, expiry_date, is_current, tenant_id
+            ) VALUES ($1, $2, $3, $4::jsonb, $5::date, $6::date, TRUE, $7)
             """,
             applicant_id,
             int(profile["mid_score"]),
@@ -632,17 +662,20 @@ class PostgresStore:
             _to_jsonb(profile),
             _to_date(profile.get("report_date")),
             _to_date(profile.get("expiry_date")),
+            tenant_id,
         )
 
-    async def get_credit_profile(self, applicant_id: str) -> Optional[dict]:
+    async def get_credit_profile(
+        self, applicant_id: str, tenant_id: str = "default",
+    ) -> Optional[dict]:
         row = await db.fetchrow(
             """
             SELECT profile_data
             FROM credit_profiles
-            WHERE applicant_id = $1 AND is_current = TRUE
+            WHERE applicant_id = $1 AND tenant_id = $2 AND is_current = TRUE
             ORDER BY created_at DESC LIMIT 1
             """,
-            applicant_id,
+            applicant_id, tenant_id,
         )
         if not row:
             return None
@@ -653,7 +686,9 @@ class PostgresStore:
 
     # ---------------- documents -----------------
 
-    async def save_document(self, doc: dict) -> None:
+    async def save_document(
+        self, doc: dict, tenant_id: str = "default",
+    ) -> None:
         # extraction_method priority on upsert:
         #   deterministic > caller_supplied > ai_vision > none
         # The CASE picks the higher-ranked of the existing row's
@@ -670,10 +705,10 @@ class PostgresStore:
                 document_id, applicant_id, application_id, document_type,
                 document_category, borrower_role, s3_key, status,
                 expiry_date, is_current, extracted_fields, confidence_score,
-                extraction_method
+                extraction_method, tenant_id
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
-                $9::date, $10, $11::jsonb, $12, $13
+                $9::date, $10, $11::jsonb, $12, $13, $14
             )
             ON CONFLICT (document_id) DO UPDATE SET
                 applicant_id      = EXCLUDED.applicant_id,
@@ -687,6 +722,7 @@ class PostgresStore:
                 is_current        = EXCLUDED.is_current,
                 extracted_fields  = EXCLUDED.extracted_fields,
                 confidence_score  = EXCLUDED.confidence_score,
+                tenant_id         = EXCLUDED.tenant_id,
                 extraction_method = CASE
                     WHEN document_index.extraction_method = 'deterministic'
                          OR EXCLUDED.extraction_method = 'deterministic'
@@ -713,6 +749,7 @@ class PostgresStore:
             _to_jsonb(doc.get("extracted_fields")),
             doc.get("confidence_score"),
             doc.get("extraction_method") or "none",
+            tenant_id,
         )
 
     async def get_document(self, document_id: str) -> Optional[dict]:
@@ -725,14 +762,17 @@ class PostgresStore:
         )
         return _row_to_dict(row)
 
-    async def get_documents_for_applicant(self, applicant_id: str) -> list:
+    async def get_documents_for_applicant(
+        self, applicant_id: str, tenant_id: str = "default",
+    ) -> list:
         rows = await db.fetch(
             """
             SELECT * FROM document_index
             WHERE applicant_id = $1 AND is_current = TRUE
+              AND tenant_id = $2
             ORDER BY received_at DESC
             """,
-            applicant_id,
+            applicant_id, tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -872,14 +912,17 @@ class PostgresStore:
 
         return sorted(docs, key=sort_key, reverse=True)[0]
 
-    async def get_documents_for_application(self, application_id: str) -> list:
+    async def get_documents_for_application(
+        self, application_id: str, tenant_id: str = "default",
+    ) -> list:
         rows = await db.fetch(
             """
             SELECT * FROM document_index
             WHERE application_id = $1 AND is_current = TRUE
+              AND tenant_id = $2
             ORDER BY received_at DESC
             """,
-            application_id,
+            application_id, tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -892,14 +935,16 @@ class PostgresStore:
 
     # ---------------- document knowledge graph -----------------
 
-    async def save_relationship(self, rel: dict) -> None:
+    async def save_relationship(
+        self, rel: dict, tenant_id: str = "default",
+    ) -> None:
         await db.execute(
             """
             INSERT INTO document_relationships (
                 relationship_id, applicant_id, source_doc_id, target_doc_id,
                 relationship_type, field_name, source_value, target_value,
-                delta_pct, confidence, reasoning, created_by
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12)
+                delta_pct, confidence, reasoning, created_by, tenant_id
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13)
             ON CONFLICT (relationship_id) DO NOTHING
             """,
             rel["relationship_id"],
@@ -914,33 +959,41 @@ class PostgresStore:
             rel["confidence"],
             rel.get("reasoning", ""),
             rel.get("created_by", "reconciler"),
+            tenant_id,
         )
 
-    async def get_relationships_for_applicant(self, applicant_id: str) -> list:
+    async def get_relationships_for_applicant(
+        self, applicant_id: str, tenant_id: str = "default",
+    ) -> list:
         rows = await db.fetch(
             """
             SELECT * FROM document_relationships
-            WHERE applicant_id = $1
+            WHERE applicant_id = $1 AND tenant_id = $2
             ORDER BY created_at DESC
             """,
-            applicant_id,
+            applicant_id, tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
-    async def get_conflicts_for_applicant(self, applicant_id: str) -> list:
+    async def get_conflicts_for_applicant(
+        self, applicant_id: str, tenant_id: str = "default",
+    ) -> list:
         rows = await db.fetch(
             """
             SELECT * FROM document_relationships
             WHERE applicant_id = $1 AND relationship_type = 'contradicts'
+              AND tenant_id = $2
             ORDER BY confidence DESC
             """,
-            applicant_id,
+            applicant_id, tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
-    async def get_graph_summary(self, applicant_id: str) -> dict:
-        docs = await self.get_documents_for_applicant(applicant_id)
-        rels = await self.get_relationships_for_applicant(applicant_id)
+    async def get_graph_summary(
+        self, applicant_id: str, tenant_id: str = "default",
+    ) -> dict:
+        docs = await self.get_documents_for_applicant(applicant_id, tenant_id)
+        rels = await self.get_relationships_for_applicant(applicant_id, tenant_id)
         conflicts = [r for r in rels if r["relationship_type"] == "contradicts"]
         confirms  = [r for r in rels if r["relationship_type"] == "confirms"]
         # Per-applicant extraction-method breakdown so ops can see at a
@@ -1011,17 +1064,17 @@ class PostgresStore:
 
     # ---------------- properties (Phase B) -----------------
 
-    async def save_property(self, prop: dict) -> str:
-        """Insert or update a property row. Returns the property_id."""
+    async def save_property(self, prop: dict, tenant_id: str = "default") -> str:
+        """Insert or update a property row, tagged with ``tenant_id``."""
         await db.execute(
             """
             INSERT INTO properties (
                 property_id, application_id, address_line1, address_line2,
                 city, state, zip_code, property_type, units, year_built,
-                sqft, status, created_at, updated_at
+                sqft, status, tenant_id, created_at, updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, NOW(), NOW()
+                $11, $12, $13, NOW(), NOW()
             )
             ON CONFLICT (property_id) DO UPDATE SET
                 application_id = EXCLUDED.application_id,
@@ -1035,6 +1088,7 @@ class PostgresStore:
                 year_built     = EXCLUDED.year_built,
                 sqft           = EXCLUDED.sqft,
                 status         = EXCLUDED.status,
+                tenant_id      = EXCLUDED.tenant_id,
                 updated_at     = NOW()
             """,
             prop["property_id"],
@@ -1049,38 +1103,42 @@ class PostgresStore:
             prop.get("year_built"),
             prop.get("sqft"),
             prop.get("status", "pending"),
+            tenant_id,
         )
         return prop["property_id"]
 
-    async def get_property(self, property_id: str) -> Optional[dict]:
+    async def get_property(self, property_id: str, tenant_id: str = "default") -> Optional[dict]:
         row = await db.fetchrow(
-            "SELECT * FROM properties WHERE property_id = $1", property_id
+            "SELECT * FROM properties WHERE property_id = $1 AND tenant_id = $2",
+            property_id, tenant_id,
         )
         return _row_to_dict(row)
 
     async def get_property_by_application(
-        self, application_id: str
+        self, application_id: str, tenant_id: str = "default",
     ) -> Optional[dict]:
         row = await db.fetchrow(
             """
-            SELECT * FROM properties WHERE application_id = $1
-            ORDER BY created_at DESC LIMIT 1
+            SELECT * FROM properties
+             WHERE application_id = $1 AND tenant_id = $2
+             ORDER BY created_at DESC LIMIT 1
             """,
-            application_id,
+            application_id, tenant_id,
         )
         return _row_to_dict(row)
 
-    async def save_property_profile(self, profile: dict) -> str:
-        """Insert a new property profile version, marking the prior current
-        version superseded."""
+    async def save_property_profile(self, profile: dict, tenant_id: str = "default") -> str:
+        """Insert a new property profile version (tenant-scoped), marking
+        the prior current version for the same (property_id, tenant_id)
+        superseded."""
         property_id = profile["property_id"]
         current = await db.fetchrow(
             """
             SELECT profile_id, version
             FROM property_profiles
-            WHERE property_id = $1 AND superseded_by IS NULL
+            WHERE property_id = $1 AND tenant_id = $2 AND superseded_by IS NULL
             """,
-            property_id,
+            property_id, tenant_id,
         )
         version = (current["version"] + 1) if current else 1
 
@@ -1093,11 +1151,11 @@ class PostgresStore:
                 hoi_annual, hoi_monthly, flood_zone, flood_insurance_required,
                 flood_insurance_monthly, hoa_monthly, condition_rating,
                 piti_components, profile_data, lineage_hash, version,
-                assembled_at
+                assembled_at, tenant_id
             ) VALUES (
                 $1, $2, $3, $4::date, $5, $6, $7, $8, $9, $10, $11, $12,
                 $13, $14, $15, $16, $17, $18::jsonb, $19::jsonb, $20, $21,
-                $22::timestamptz
+                $22::timestamptz, $23
             )
             RETURNING profile_id
             """,
@@ -1123,6 +1181,7 @@ class PostgresStore:
             profile.get("lineage_hash", ""),
             version,
             _to_ts(profile.get("assembled_at")) or datetime.utcnow(),
+            tenant_id,
         )
         if current:
             await db.execute(
@@ -1132,15 +1191,15 @@ class PostgresStore:
             )
         return str(new_id)
 
-    async def get_property_profile(self, property_id: str) -> Optional[dict]:
+    async def get_property_profile(self, property_id: str, tenant_id: str = "default") -> Optional[dict]:
         row = await db.fetchrow(
             """
             SELECT profile_data, lineage_hash, version, assembled_at
             FROM property_profiles
-            WHERE property_id = $1 AND superseded_by IS NULL
+            WHERE property_id = $1 AND tenant_id = $2 AND superseded_by IS NULL
             ORDER BY created_at DESC LIMIT 1
             """,
-            property_id,
+            property_id, tenant_id,
         )
         if not row:
             return None
@@ -1150,19 +1209,21 @@ class PostgresStore:
         data["_version"] = row["version"]
         return data
 
-    async def get_property_docs(self, property_id: str) -> list:
+    async def get_property_docs(self, property_id: str, tenant_id: str = "default") -> list:
         """Property documents are tagged via document_index.application_id ->
-        properties.application_id. Resolve via the join."""
+        properties.application_id. Resolve via the join, scoped to ``tenant_id``."""
         rows = await db.fetch(
             """
             SELECT di.* FROM document_index di
             JOIN properties p ON di.application_id = p.application_id
             WHERE p.property_id = $1
+              AND p.tenant_id = $2
+              AND di.tenant_id = $2
               AND di.is_current = TRUE
               AND di.document_category = 'property'
             ORDER BY di.received_at DESC
             """,
-            property_id,
+            property_id, tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -1223,6 +1284,7 @@ class PostgresStore:
         date_from,
         date_to,
         status: Optional[str] = None,
+        tenant_id: str = "default",
     ) -> int:
         val = await db.fetchval(
             """
@@ -1231,8 +1293,9 @@ class PostgresStore:
             WHERE a.created_at >= $1::timestamptz
               AND a.created_at <  $2::timestamptz
               AND ($3::text IS NULL OR a.status = $3)
+              AND a.tenant_id = $4
             """,
-            _to_ts(date_from), _to_ts(date_to), status,
+            _to_ts(date_from), _to_ts(date_to), status, tenant_id,
         )
         return int(val or 0)
 
@@ -1243,6 +1306,7 @@ class PostgresStore:
         status: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
+        tenant_id: str = "default",
     ) -> list:
         """One row per application with the heavy lifting done in SQL —
         per-applicant doc count, conflict count, max(received_at) — joined
@@ -1311,10 +1375,12 @@ class PostgresStore:
             WHERE a.created_at >= $1::timestamptz
               AND a.created_at <  $2::timestamptz
               AND ($3::text IS NULL OR a.status = $3)
+              AND a.tenant_id = $6
             ORDER BY a.created_at DESC
             LIMIT $4 OFFSET $5
             """,
-            _to_ts(date_from), _to_ts(date_to), status, int(limit), int(offset),
+            _to_ts(date_from), _to_ts(date_to), status,
+            int(limit), int(offset), tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -1323,6 +1389,7 @@ class PostgresStore:
         date_from,
         date_to,
         min_delta_pct: Optional[float] = None,
+        tenant_id: str = "default",
     ) -> int:
         val = await db.fetchval(
             """
@@ -1332,8 +1399,9 @@ class PostgresStore:
               AND dr.created_at >= $1::timestamptz
               AND dr.created_at <  $2::timestamptz
               AND ($3::float IS NULL OR COALESCE(dr.delta_pct, 0) >= $3)
+              AND dr.tenant_id = $4
             """,
-            _to_ts(date_from), _to_ts(date_to), min_delta_pct,
+            _to_ts(date_from), _to_ts(date_to), min_delta_pct, tenant_id,
         )
         return int(val or 0)
 
@@ -1344,6 +1412,7 @@ class PostgresStore:
         min_delta_pct: Optional[float] = None,
         limit: int = 50,
         offset: int = 0,
+        tenant_id: str = "default",
     ) -> list:
         """Every contradicts edge in the window, joined to source/target
         document_type and the application that owns the applicant. The
@@ -1380,11 +1449,12 @@ class PostgresStore:
               AND dr.created_at >= $1::timestamptz
               AND dr.created_at <  $2::timestamptz
               AND ($3::float IS NULL OR COALESCE(dr.delta_pct, 0) >= $3)
+              AND dr.tenant_id = $6
             ORDER BY dr.delta_pct DESC NULLS LAST, dr.created_at DESC
             LIMIT $4 OFFSET $5
             """,
             _to_ts(date_from), _to_ts(date_to), min_delta_pct,
-            int(limit), int(offset),
+            int(limit), int(offset), tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -1392,6 +1462,7 @@ class PostgresStore:
         self,
         date_from,
         date_to,
+        tenant_id: str = "default",
     ) -> list:
         """Every application in the window with the de-duped set of
         document_types its file currently carries (across the primary +
@@ -1418,11 +1489,12 @@ class PostgresStore:
                       AND di.applicant_id = a.co_applicant_id))
             WHERE a.created_at >= $1::timestamptz
               AND a.created_at <  $2::timestamptz
+              AND a.tenant_id = $3
             GROUP BY a.application_id, a.los_id, a.applicant_id,
                      a.co_applicant_id, a.created_at
             ORDER BY a.created_at DESC
             """,
-            _to_ts(date_from), _to_ts(date_to),
+            _to_ts(date_from), _to_ts(date_to), tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -1430,10 +1502,10 @@ class PostgresStore:
         self,
         date_from,
         date_to,
+        tenant_id: str = "default",
     ) -> dict:
         """One row of grand totals for the extraction-quality report —
-        one count column per extraction_method bucket. Filtered on
-        received_at so the numerator/denominator stay in the same window."""
+        one count column per extraction_method bucket. Tenant-scoped."""
         row = await db.fetchrow(
             """
             SELECT
@@ -1446,8 +1518,9 @@ class PostgresStore:
             FROM document_index
             WHERE received_at >= $1::timestamptz
               AND received_at <  $2::timestamptz
+              AND tenant_id = $3
             """,
-            _to_ts(date_from), _to_ts(date_to),
+            _to_ts(date_from), _to_ts(date_to), tenant_id,
         )
         return _row_to_dict(row) or {}
 
@@ -1455,6 +1528,7 @@ class PostgresStore:
         self,
         date_from,
         date_to,
+        tenant_id: str = "default",
     ) -> list:
         rows = await db.fetch(
             """
@@ -1469,10 +1543,11 @@ class PostgresStore:
             FROM document_index
             WHERE received_at >= $1::timestamptz
               AND received_at <  $2::timestamptz
+              AND tenant_id = $3
             GROUP BY document_type
             ORDER BY total DESC, document_type
             """,
-            _to_ts(date_from), _to_ts(date_to),
+            _to_ts(date_from), _to_ts(date_to), tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -1480,6 +1555,7 @@ class PostgresStore:
         self,
         date_from,
         date_to,
+        tenant_id: str = "default",
     ) -> list:
         """Pair every URLA_1003 with every W2_CURRENT for the same
         applicant in the window, surfacing the raw stated/documented
@@ -1513,8 +1589,10 @@ class PostgresStore:
               AND u.extracted_fields ? 'monthly_income_stated'
               AND u.received_at >= $1::timestamptz
               AND u.received_at <  $2::timestamptz
+              AND u.tenant_id = $3
+              AND w.tenant_id = $3
             """,
-            _to_ts(date_from), _to_ts(date_to),
+            _to_ts(date_from), _to_ts(date_to), tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -1540,6 +1618,7 @@ class PostgresStore:
         self,
         since=None,
         prefetch: int = 500,
+        tenant_id: str = "default",
     ):
         """One row per applicant joined with the latest income +
         credit profiles, owning application, and a few document /
@@ -1621,9 +1700,10 @@ class PostgresStore:
             LEFT JOIN credit_profiles cp
               ON cp.applicant_id = a.applicant_id AND cp.is_current = TRUE
             WHERE ($1::timestamptz IS NULL OR a.updated_at > $1::timestamptz)
+              AND a.tenant_id = $2
             ORDER BY a.updated_at ASC, a.applicant_id ASC
         """
-        async for row in db.stream(query, _to_ts(since), prefetch=prefetch):
+        async for row in db.stream(query, _to_ts(since), tenant_id, prefetch=prefetch):
             yield _row_to_dict(row)
 
     async def stream_documents(
@@ -1632,6 +1712,7 @@ class PostgresStore:
         doc_type: Optional[str] = None,
         category: Optional[str] = None,
         prefetch: int = 500,
+        tenant_id: str = "default",
     ):
         """Every row in ``document_index`` ordered by received_at, with
         optional doc_type / category / since filters."""
@@ -1655,10 +1736,11 @@ class PostgresStore:
             WHERE ($1::timestamptz IS NULL OR received_at > $1::timestamptz)
               AND ($2::text IS NULL OR document_type = $2)
               AND ($3::text IS NULL OR document_category = $3)
+              AND tenant_id = $4
             ORDER BY received_at ASC, document_id ASC
         """
         async for row in db.stream(
-            query, _to_ts(since), doc_type, category, prefetch=prefetch,
+            query, _to_ts(since), doc_type, category, tenant_id, prefetch=prefetch,
         ):
             yield _row_to_dict(row)
 
@@ -1667,6 +1749,7 @@ class PostgresStore:
         since=None,
         relationship_type: Optional[str] = None,
         prefetch: int = 500,
+        tenant_id: str = "default",
     ):
         query = """
             SELECT
@@ -1686,10 +1769,11 @@ class PostgresStore:
             FROM document_relationships
             WHERE ($1::timestamptz IS NULL OR created_at > $1::timestamptz)
               AND ($2::text IS NULL OR relationship_type = $2)
+              AND tenant_id = $3
             ORDER BY created_at ASC, relationship_id ASC
         """
         async for row in db.stream(
-            query, _to_ts(since), relationship_type, prefetch=prefetch,
+            query, _to_ts(since), relationship_type, tenant_id, prefetch=prefetch,
         ):
             yield _row_to_dict(row)
 
@@ -1697,6 +1781,7 @@ class PostgresStore:
         self,
         since=None,
         prefetch: int = 500,
+        tenant_id: str = "default",
     ):
         query = """
             SELECT
@@ -1706,15 +1791,17 @@ class PostgresStore:
             FROM income_profiles
             WHERE superseded_by IS NULL
               AND ($1::timestamptz IS NULL OR assembled_at > $1::timestamptz)
+              AND tenant_id = $2
             ORDER BY assembled_at ASC, profile_id ASC
         """
-        async for row in db.stream(query, _to_ts(since), prefetch=prefetch):
+        async for row in db.stream(query, _to_ts(since), tenant_id, prefetch=prefetch):
             yield _row_to_dict(row)
 
     async def stream_credit_profiles(
         self,
         since=None,
         prefetch: int = 500,
+        tenant_id: str = "default",
     ):
         query = """
             SELECT
@@ -1723,15 +1810,17 @@ class PostgresStore:
             FROM credit_profiles
             WHERE is_current = TRUE
               AND ($1::timestamptz IS NULL OR created_at > $1::timestamptz)
+              AND tenant_id = $2
             ORDER BY created_at ASC, profile_id ASC
         """
-        async for row in db.stream(query, _to_ts(since), prefetch=prefetch):
+        async for row in db.stream(query, _to_ts(since), tenant_id, prefetch=prefetch):
             yield _row_to_dict(row)
 
     async def stream_applications_export(
         self,
         since=None,
         prefetch: int = 500,
+        tenant_id: str = "default",
     ):
         """Application-level summary including loan terms, joined to
         the borrower golden record + the latest context_versions
@@ -1769,9 +1858,10 @@ class PostgresStore:
             LEFT JOIN applicants cp ON cp.applicant_id = a.co_applicant_id
             WHERE ($1::timestamptz IS NULL
                    OR COALESCE(a.updated_at, a.created_at) > $1::timestamptz)
+              AND a.tenant_id = $2
             ORDER BY COALESCE(a.updated_at, a.created_at) ASC, a.application_id ASC
         """
-        async for row in db.stream(query, _to_ts(since), prefetch=prefetch):
+        async for row in db.stream(query, _to_ts(since), tenant_id, prefetch=prefetch):
             yield _row_to_dict(row)
 
     # ---- export watermarks (DWH consumer state) ----
@@ -1803,6 +1893,96 @@ class PostgresStore:
             consumer, table_name, _to_ts(watermark_ts),
         )
         return await self.get_export_watermark(consumer, table_name)
+
+    # ---------------- multi-tenancy: tenants + api_keys -----------------
+
+    async def get_api_key(self, api_key: str) -> Optional[dict]:
+        row = await db.fetchrow(
+            """
+            SELECT api_key, tenant_id, name, scopes, is_active,
+                   created_at, last_used_at
+              FROM api_keys
+             WHERE api_key = $1
+            """,
+            api_key,
+        )
+        return _row_to_dict(row)
+
+    async def touch_api_key(self, api_key: str) -> None:
+        await db.execute(
+            "UPDATE api_keys SET last_used_at = NOW() WHERE api_key = $1",
+            api_key,
+        )
+
+    async def create_api_key(
+        self, api_key: str, tenant_id: str,
+        name: Optional[str] = None,
+        scopes: str = "read,write",
+    ) -> dict:
+        await db.execute(
+            """
+            INSERT INTO api_keys (api_key, tenant_id, name, scopes)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (api_key) DO NOTHING
+            """,
+            api_key, tenant_id, name, scopes,
+        )
+        return await self.get_api_key(api_key)
+
+    async def list_api_keys(
+        self, tenant_id: Optional[str] = None
+    ) -> list:
+        if tenant_id:
+            rows = await db.fetch(
+                """
+                SELECT api_key, tenant_id, name, scopes, is_active,
+                       created_at, last_used_at
+                  FROM api_keys
+                 WHERE tenant_id = $1
+                 ORDER BY created_at DESC
+                """,
+                tenant_id,
+            )
+        else:
+            rows = await db.fetch(
+                """
+                SELECT api_key, tenant_id, name, scopes, is_active,
+                       created_at, last_used_at
+                  FROM api_keys
+                 ORDER BY created_at DESC
+                """
+            )
+        return [_row_to_dict(r) for r in rows]
+
+    async def deactivate_api_key(self, api_key: str) -> None:
+        await db.execute(
+            "UPDATE api_keys SET is_active = FALSE WHERE api_key = $1",
+            api_key,
+        )
+
+    async def get_tenant(self, tenant_id: str) -> Optional[dict]:
+        row = await db.fetchrow(
+            "SELECT tenant_id, name, is_active, created_at FROM tenants WHERE tenant_id = $1",
+            tenant_id,
+        )
+        return _row_to_dict(row)
+
+    async def create_tenant(self, tenant_id: str, name: str) -> dict:
+        await db.execute(
+            """
+            INSERT INTO tenants (tenant_id, name)
+            VALUES ($1, $2)
+            ON CONFLICT (tenant_id) DO NOTHING
+            """,
+            tenant_id, name,
+        )
+        return await self.get_tenant(tenant_id)
+
+    async def list_tenants(self) -> list:
+        rows = await db.fetch(
+            "SELECT tenant_id, name, is_active, created_at FROM tenants ORDER BY created_at"
+        )
+        return [_row_to_dict(r) for r in rows]
 
     async def list_export_watermarks(
         self, consumer: Optional[str] = None

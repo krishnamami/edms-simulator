@@ -513,3 +513,86 @@ CREATE INDEX IF NOT EXISTS idx_doc_received_asc
 CREATE INDEX IF NOT EXISTS idx_rel_created_asc
     ON document_relationships(created_at);
 
+-- =====================================================================
+-- Multi-tenancy. Every domain table gains a tenant_id column with a
+-- 'default' fallback so existing rows survive the migration. Auth
+-- resolves the inbound X-API-Key against api_keys, attaches tenant_id
+-- to the request, and every Postgres read/write filters/tags by it.
+-- The 'default' tenant is the implicit pre-multi-tenant world; new
+-- deployments create discrete tenants via POST /admin/tenants.
+-- =====================================================================
+ALTER TABLE applicants
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+ALTER TABLE applications
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+ALTER TABLE document_index
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+ALTER TABLE document_relationships
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+ALTER TABLE income_profiles
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+ALTER TABLE credit_profiles
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+ALTER TABLE properties
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+ALTER TABLE property_profiles
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+ALTER TABLE export_watermarks
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+ALTER TABLE context_versions
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+ALTER TABLE raw_ingestion
+    ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(50) NOT NULL DEFAULT 'default';
+
+-- Composite indexes — the tenant_id filter is the leading column on
+-- every analytical / cross-loan query, so it pays off as the first
+-- key. Existing single-column indexes stay (point lookups by ID).
+CREATE INDEX IF NOT EXISTS idx_applicants_tenant
+    ON applicants(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_applications_tenant
+    ON applications(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_document_index_tenant
+    ON document_index(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_document_relationships_tenant
+    ON document_relationships(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_income_profiles_tenant
+    ON income_profiles(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_credit_profiles_tenant
+    ON credit_profiles(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_properties_tenant
+    ON properties(tenant_id);
+
+CREATE TABLE IF NOT EXISTS tenants (
+    tenant_id   VARCHAR(50) PRIMARY KEY,
+    name        VARCHAR(200) NOT NULL,
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO tenants (tenant_id, name)
+VALUES ('default', 'Default Tenant')
+ON CONFLICT (tenant_id) DO NOTHING;
+
+-- API keys → tenant binding. ``scopes`` is a comma-separated list — the
+-- spec uses 'read,write,admin'. Auth caches the row in Redis for 5 min;
+-- ``last_used_at`` is updated best-effort on each request (off the hot
+-- path; missed updates are harmless).
+CREATE TABLE IF NOT EXISTS api_keys (
+    api_key       VARCHAR(64) PRIMARY KEY,
+    tenant_id     VARCHAR(50) NOT NULL REFERENCES tenants(tenant_id),
+    name          VARCHAR(100),
+    scopes        VARCHAR(200) NOT NULL DEFAULT 'read,write',
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(is_active) WHERE is_active;
+
+-- Seed the development key with admin scope so the local dev workflow
+-- and the existing 329 tests (which all use edms_dev_key) continue to
+-- work without modification on a fresh DB.
+INSERT INTO api_keys (api_key, tenant_id, name, scopes)
+VALUES ('edms_dev_key', 'default', 'Development Key', 'read,write,admin')
+ON CONFLICT (api_key) DO NOTHING;
+

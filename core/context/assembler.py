@@ -9,6 +9,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+from core.tenancy import current_tenant_id
 from core.context.models import (
     ApplicationContext,
     BorrowerAggregation,
@@ -53,7 +54,7 @@ class ContextAssembler:
         """Read every layer for an application and return a fresh
         ``ApplicationContext``. Caches the result under
         ``context:{application_id}`` in Redis."""
-        app = await self.pg.get_application(application_id)
+        app = await self.pg.get_application(application_id, tenant_id=current_tenant_id())
         if not app:
             raise ValueError(f"No application: {application_id}")
 
@@ -64,8 +65,8 @@ class ContextAssembler:
         # IncomeProfile is stored once under the primary applicant_id but
         # carries both ``primary_borrower`` and ``co_borrower`` sections.
         # Fetch once, route by role.
-        primary_income = await self.redis.get_income_profile(applicant_id) \
-            or await self.pg.get_income_profile(applicant_id)
+        primary_income = await self.redis.get_income_profile(applicant_id, tenant_id=current_tenant_id()) \
+            or await self.pg.get_income_profile(applicant_id, tenant_id=current_tenant_id())
 
         primary = await self._build_borrower_snapshot(
             applicant_id, "primary", primary_income
@@ -182,7 +183,7 @@ class ContextAssembler:
         )
 
         try:
-            graph_summary = await self.pg.get_graph_summary(applicant_id)
+            graph_summary = await self.pg.get_graph_summary(applicant_id, tenant_id=current_tenant_id())
         except Exception as exc:
             logger.warning("graph_summary_failed", extra={"error": str(exc)})
             graph_summary = {}
@@ -271,7 +272,7 @@ class ContextAssembler:
             requires_review=requires_review,
         )
 
-        await self.redis.set_application_context(application_id, ctx.model_dump())
+        await self.redis.set_application_context(application_id, ctx.model_dump(), tenant_id=current_tenant_id())
 
         # Phase E — snapshot every assembly into context_versions for audit.
         try:
@@ -327,16 +328,16 @@ class ContextAssembler:
         # passes the primary's profile via ``primary_income``.
         income = primary_income
         if income is None:
-            income = await self.redis.get_income_profile(applicant_id)
+            income = await self.redis.get_income_profile(applicant_id, tenant_id=current_tenant_id())
             if not income:
-                income = await self.pg.get_income_profile(applicant_id)
+                income = await self.pg.get_income_profile(applicant_id, tenant_id=current_tenant_id())
 
         # Credit profile is rowed per applicant_id, so look it up directly.
-        credit = await self.redis.get_credit_profile(applicant_id)
+        credit = await self.redis.get_credit_profile(applicant_id, tenant_id=current_tenant_id())
         if not credit:
-            credit = await self.pg.get_credit_profile(applicant_id)
+            credit = await self.pg.get_credit_profile(applicant_id, tenant_id=current_tenant_id())
 
-        gr = await self.pg.find_by_applicant_id(applicant_id)
+        gr = await self.pg.find_by_applicant_id(applicant_id, tenant_id=current_tenant_id())
         full_name = (gr or {}).get("full_name") or applicant_id
 
         qualifying_monthly = 0.0
@@ -385,13 +386,13 @@ class ContextAssembler:
     async def _build_property_snapshot(
         self, property_id: str, app: dict
     ) -> Optional[PropertySnapshot]:
-        cached = await self.redis.get_property_profile(property_id)
+        cached = await self.redis.get_property_profile(property_id, tenant_id=current_tenant_id())
         if not cached:
-            cached = await self.pg.get_property_profile(property_id)
+            cached = await self.pg.get_property_profile(property_id, tenant_id=current_tenant_id())
         if not cached:
             return None
 
-        prop = await self.pg.get_property(property_id)
+        prop = await self.pg.get_property(property_id, tenant_id=current_tenant_id())
         address = ""
         if prop:
             address = (
@@ -454,7 +455,7 @@ class ContextAssembler:
         }
 
         try:
-            docs = await self.pg.get_documents_for_application(application_id)
+            docs = await self.pg.get_documents_for_application(application_id, tenant_id=current_tenant_id())
         except Exception as exc:
             logger.warning("vendor_docs_fetch_failed", extra={"error": str(exc)})
             docs = []
@@ -687,7 +688,7 @@ class ContextAssembler:
 
     async def _read_asset_summary(self, applicant_id: str) -> dict:
         try:
-            return await self.redis.get_asset_summary(applicant_id) or {}
+            return await self.redis.get_asset_summary(applicant_id, tenant_id=current_tenant_id()) or {}
         except Exception as exc:
             logger.warning(
                 "asset_summary_read_failed",
@@ -697,7 +698,7 @@ class ContextAssembler:
 
     async def _read_identity_summary(self, applicant_id: str) -> dict:
         try:
-            return await self.redis.get_identity_summary(applicant_id) or {}
+            return await self.redis.get_identity_summary(applicant_id, tenant_id=current_tenant_id()) or {}
         except Exception as exc:
             logger.warning(
                 "identity_summary_read_failed",
@@ -709,7 +710,7 @@ class ContextAssembler:
         """Set of canonical document_type strings the applicant has on
         file. Used for readiness flags that gate on doc presence."""
         try:
-            docs = await self.pg.get_documents_for_applicant(applicant_id)
+            docs = await self.pg.get_documents_for_applicant(applicant_id, tenant_id=current_tenant_id())
         except Exception:
             return set()
         return {d.get("document_type") for d in docs if d.get("document_type")}
@@ -764,7 +765,7 @@ class ContextAssembler:
             "loan_purpose":  app.get("loan_purpose"),
         }
         try:
-            docs = await self.pg.get_documents_for_applicant(applicant_id)
+            docs = await self.pg.get_documents_for_applicant(applicant_id, tenant_id=current_tenant_id())
         except Exception:
             return out
 
@@ -813,7 +814,7 @@ class ContextAssembler:
         """
         out = {"count": 0, "critical": []}
         try:
-            rels = await self.pg.get_relationships_for_applicant(applicant_id)
+            rels = await self.pg.get_relationships_for_applicant(applicant_id, tenant_id=current_tenant_id())
         except Exception:
             return out
 

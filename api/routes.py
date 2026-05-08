@@ -4,7 +4,9 @@ Auth: X-API-Key validated against the edms/api/keys secret.
 Cache pattern: Redis -> Postgres.
 """
 import base64
+import json
 import os
+import secrets as _secrets
 from typing import Any, Optional
 
 import structlog
@@ -87,15 +89,161 @@ logger = structlog.get_logger()
 router = APIRouter()
 
 
-def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
+DEFAULT_TENANT_ID = "default"
+_API_KEY_CACHE_TTL_SECONDS = 300  # 5 minutes
+
+
+class AuthContext:
+    """The shape stamped onto ``request.state`` by ``verify_api_key``.
+
+    ``tenant_id`` gates every Postgres read/write and Redis key prefix
+    downstream. ``scopes`` is the comma-list from ``api_keys.scopes`` —
+    routes with ``Depends(require_admin)`` enforce ``admin`` on it.
+    Plain string set so future callers can do ``"write" in scopes``.
+    """
+    __slots__ = ("tenant_id", "scopes", "api_key", "name")
+
+    def __init__(self, tenant_id: str, scopes: set[str], api_key: str, name: Optional[str] = None):
+        self.tenant_id = tenant_id
+        self.scopes = scopes
+        self.api_key = api_key
+        self.name = name
+
+
+def _legacy_env_key() -> Optional[str]:
+    """Fallback static key for tests + bootstrap. Tests set ``API_KEY``
+    directly via conftest; production reads from Secrets Manager when
+    the env-var is empty. Either way, a match grants the 'default'
+    tenant with admin scope so 329 existing tests + dev workflows
+    keep working without seeding ``api_keys`` first."""
     expected = os.getenv("API_KEY")
-    if not expected:
+    if expected:
+        return expected
+    try:
         from core.storage.secrets import get_secrets
         keys = get_secrets().get_secret("edms/api/keys")
-        expected = keys.get("decision_os_api_key")
-    if not x_api_key or x_api_key != expected:
+        return keys.get("decision_os_api_key") if isinstance(keys, dict) else None
+    except Exception:
+        return None
+
+
+async def _lookup_api_key(request: Request, key: str) -> Optional[dict]:
+    """Resolve an API key → ``{tenant_id, scopes, name}`` via Redis
+    cache → Postgres. Cache hits are 5-min TTL; misses fall through to
+    a single SELECT against ``api_keys``. Failures (Redis down, DB
+    pool not initialised in unit tests) silently return None so the
+    legacy env-var fallback can run instead of failing the request."""
+    redis = getattr(request.app.state, "redis_store", None)
+    cache_key = f"apikey:{key}"
+    if redis is not None:
+        try:
+            raw = await redis._r.get(cache_key)
+            if raw:
+                return json.loads(raw)
+        except Exception as exc:
+            logger.debug("apikey_cache_get_failed", error=str(exc))
+
+    pg = getattr(request.app.state, "postgres_store", None)
+    if pg is None or not hasattr(pg, "get_api_key"):
+        return None
+    try:
+        row = await pg.get_api_key(key)
+    except Exception as exc:
+        logger.debug("apikey_lookup_failed", error=str(exc))
+        return None
+    if not row or not row.get("is_active"):
+        return None
+
+    record = {
+        "tenant_id": row["tenant_id"],
+        "scopes":    row.get("scopes") or "read,write",
+        "name":      row.get("name"),
+    }
+    if redis is not None:
+        try:
+            await redis._r.setex(
+                cache_key,
+                _API_KEY_CACHE_TTL_SECONDS,
+                json.dumps(record),
+            )
+        except Exception as exc:
+            logger.debug("apikey_cache_set_failed", error=str(exc))
+    return record
+
+
+async def verify_api_key(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> AuthContext:
+    """Resolve the inbound ``X-API-Key`` to a tenant + scopes.
+
+    Resolution order:
+      1. Postgres ``api_keys`` table (cached in Redis 5 min).
+      2. Legacy static env-var fallback (``API_KEY`` / Secrets Manager).
+         Matches grant the 'default' tenant with admin scope.
+
+    Either path attaches ``tenant_id`` + ``scopes`` + ``api_key`` to
+    ``request.state`` so downstream code can read them via
+    ``request.state.tenant_id``. ``last_used_at`` is bumped best-effort
+    after a successful DB-backed match (non-blocking).
+    """
+    if not x_api_key:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    return x_api_key
+
+    record = await _lookup_api_key(request, x_api_key)
+    if record:
+        ctx = AuthContext(
+            tenant_id=record["tenant_id"],
+            scopes={s.strip() for s in (record.get("scopes") or "").split(",") if s.strip()},
+            api_key=x_api_key,
+            name=record.get("name"),
+        )
+        # Best-effort last-used touch — never blocks the request and
+        # silently swallows pool-not-ready errors in tests.
+        pg = getattr(request.app.state, "postgres_store", None)
+        if pg is not None and hasattr(pg, "touch_api_key"):
+            try:
+                await pg.touch_api_key(x_api_key)
+            except Exception:
+                pass
+    else:
+        legacy = _legacy_env_key()
+        if not legacy or x_api_key != legacy:
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        ctx = AuthContext(
+            tenant_id=DEFAULT_TENANT_ID,
+            scopes={"read", "write", "admin"},
+            api_key=x_api_key,
+            name="legacy_env",
+        )
+
+    request.state.tenant_id = ctx.tenant_id
+    request.state.scopes    = ctx.scopes
+    request.state.api_key   = ctx.api_key
+    # Mirror onto the per-task contextvar so service + store code that
+    # doesn't take a Request can read the current tenant via
+    # core.tenancy.current_tenant_id() instead of threading it through
+    # every method signature.
+    from core.tenancy import set_tenant_id
+    set_tenant_id(ctx.tenant_id)
+    return ctx
+
+
+async def require_admin(
+    request: Request,
+    auth: AuthContext = Depends(verify_api_key),
+) -> AuthContext:
+    """Use as ``dependencies=[Depends(require_admin)]`` on /admin routes.
+    Runs ``verify_api_key`` first, then enforces ``admin`` ∈ scopes."""
+    if "admin" not in auth.scopes:
+        raise HTTPException(status_code=403, detail="admin scope required")
+    return auth
+
+
+def get_tenant_id(request: Request) -> str:
+    """Read the tenant_id off ``request.state``, defaulting to 'default'
+    when no auth has run (unit-test paths that bypass middleware)."""
+    return getattr(request.state, "tenant_id", DEFAULT_TENANT_ID) or DEFAULT_TENANT_ID
 
 
 @router.post(
@@ -175,18 +323,19 @@ async def get_applicant_id(request: Request, los_id: str):
 async def get_income_profile(request: Request, applicant_id: str):
     redis_store = request.app.state.redis_store
     postgres_store = request.app.state.postgres_store
+    tid = get_tenant_id(request)
 
-    cached = await redis_store.get_income_profile(applicant_id)
+    cached = await redis_store.get_income_profile(applicant_id, tenant_id=tid)
     if cached:
         return IncomeProfileResponse(
             applicant_id=applicant_id, profile=cached, cached=True,
             source="cache", data=cached,
         )
 
-    profile = await postgres_store.get_income_profile(applicant_id)
+    profile = await postgres_store.get_income_profile(applicant_id, tenant_id=tid)
     if not profile:
         raise HTTPException(status_code=404, detail="Income profile not found")
-    await redis_store.set_income_profile(applicant_id, profile)
+    await redis_store.set_income_profile(applicant_id, profile, tenant_id=tid)
     return IncomeProfileResponse(
         applicant_id=applicant_id, profile=profile, cached=False,
         source="postgres", data=profile,
@@ -206,18 +355,19 @@ async def get_income_profile(request: Request, applicant_id: str):
 async def get_credit_profile(request: Request, applicant_id: str):
     redis_store = request.app.state.redis_store
     postgres_store = request.app.state.postgres_store
+    tid = get_tenant_id(request)
 
-    cached = await redis_store.get_credit_profile(applicant_id)
+    cached = await redis_store.get_credit_profile(applicant_id, tenant_id=tid)
     if cached:
         return CreditProfileResponse(
             applicant_id=applicant_id, profile=cached, cached=True,
             source="cache", data=cached,
         )
 
-    profile = await postgres_store.get_credit_profile(applicant_id)
+    profile = await postgres_store.get_credit_profile(applicant_id, tenant_id=tid)
     if not profile:
         raise HTTPException(status_code=404, detail="Credit profile not found")
-    await redis_store.set_credit_profile(applicant_id, profile)
+    await redis_store.set_credit_profile(applicant_id, profile, tenant_id=tid)
     return CreditProfileResponse(
         applicant_id=applicant_id, profile=profile, cached=False,
         source="postgres", data=profile,
@@ -1225,7 +1375,8 @@ async def get_application_context(request: Request, application_id: str):
     """The single endpoint Decision OS calls — folded borrower + property
     + readiness + DTI/LTV. Redis cache → re-assemble if stale."""
     redis = request.app.state.redis_store
-    cached = await redis.get_application_context(application_id)
+    tid = get_tenant_id(request)
+    cached = await redis.get_application_context(application_id, tenant_id=tid)
     if cached:
         return {"source": "cache", "data": cached}
 

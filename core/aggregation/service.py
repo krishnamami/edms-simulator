@@ -20,6 +20,7 @@ from core.aggregation.status import GoldenRecordStatus, StatusMachine
 from core.identity.resolver import IdentityResolver, IdentitySignals
 from core.ingestion.events import ChannelType, NormalizedIngestEvent
 from core.property.assembler import PropertyAssembler
+from core.tenancy import current_tenant_id
 
 logger = structlog.get_logger()
 
@@ -132,11 +133,11 @@ class AggregationService:
             )
             co_result = self.resolver.resolve(co_signals)
             co_applicant_id = co_result.golden_record.applicant_id
-            await self.postgres_store.save_golden_record(co_result.golden_record.model_dump())
+            await self.postgres_store.save_golden_record(co_result.golden_record.model_dump(), tenant_id=current_tenant_id())
             for xref in co_result.golden_record.identity_xrefs:
                 await self.postgres_store.save_xref(xref.model_dump())
 
-        await self.postgres_store.save_golden_record(primary_gr.model_dump())
+        await self.postgres_store.save_golden_record(primary_gr.model_dump(), tenant_id=current_tenant_id())
         for xref in primary_gr.identity_xrefs:
             await self.postgres_store.save_xref(xref.model_dump())
 
@@ -149,7 +150,7 @@ class AggregationService:
             "status": "active",
             "created_at": datetime.utcnow().isoformat(),
         }
-        await self.postgres_store.save_application(application)
+        await self.postgres_store.save_application(application, tenant_id=current_tenant_id())
 
         # Persist loan terms (amount / rate / term / purpose) onto the
         # applications row so ContextAssembler.assemble can compute
@@ -182,7 +183,7 @@ class AggregationService:
         ):
             primary_gr.status = GoldenRecordStatus.ACTIVE
             self.golden_record_store.save(primary_gr)
-        await self.redis_store.set_status(primary_gr.applicant_id, "active")
+        await self.redis_store.set_status(primary_gr.applicant_id, "active", tenant_id=current_tenant_id())
         await self.redis_store.set_app_lookup(
             los_id,
             {
@@ -190,6 +191,7 @@ class AggregationService:
                 "applicant_id": primary_gr.applicant_id,
                 "co_applicant_id": co_applicant_id,
             },
+            tenant_id=current_tenant_id(),
         )
 
         self._publish(
@@ -228,7 +230,7 @@ class AggregationService:
                 gr.status, GoldenRecordStatus.STALE
             )
             self.golden_record_store.save(gr)
-            await self.redis_store.set_status(applicant_id, "stale")
+            await self.redis_store.set_status(applicant_id, "stale", tenant_id=current_tenant_id())
 
         # Hydrate the application context so single-doc uploads still see the
         # full borrower picture. Without this:
@@ -244,9 +246,9 @@ class AggregationService:
         co_applicant_id: Optional[str] = None
         loan_data: dict = {}
         if application_id:
-            app = await self.postgres_store.get_application(application_id)
+            app = await self.postgres_store.get_application(application_id, tenant_id=current_tenant_id())
         else:
-            app = await self.postgres_store.get_application_by_applicant(applicant_id)
+            app = await self.postgres_store.get_application_by_applicant(applicant_id, tenant_id=current_tenant_id())
         if app:
             application_id = application_id or app.get("application_id", "")
             co_applicant_id = app.get("co_applicant_id")
@@ -270,7 +272,7 @@ class AggregationService:
         # / credit profiles we just wrote are otherwise hidden behind the
         # 30-min context TTL.
         if application_id:
-            await self.redis_store.invalidate_context(application_id)
+            await self.redis_store.invalidate_context(application_id, tenant_id=current_tenant_id())
 
         gr.status = StatusMachine.transition(
             GoldenRecordStatus.STALE, GoldenRecordStatus.ACTIVE
@@ -330,13 +332,13 @@ class AggregationService:
         # have been computed from an incomplete doc set. Lock keys on
         # applicant_id (not application_id) so co-borrower-only uploads
         # filed under the primary's applicant_id still serialize.
-        if not await self.redis_store.try_acquire_assembly_lock(applicant_id):
+        if not await self.redis_store.try_acquire_assembly_lock(applicant_id, tenant_id=current_tenant_id()):
             # Brief wait + one retry. If another assembly is running for
             # this applicant it'll re-read the full doc set from PG
             # (now including the docs we persisted above) and compute
             # the right answer — so giving up is safe.
             await asyncio.sleep(0.5)
-            if not await self.redis_store.try_acquire_assembly_lock(applicant_id):
+            if not await self.redis_store.try_acquire_assembly_lock(applicant_id, tenant_id=current_tenant_id()):
                 logger.warning(
                     "assembly_lock_contention",
                     applicant_id=applicant_id,
@@ -419,10 +421,10 @@ class AggregationService:
                     s.get("source_type") for s in profile.primary_borrower.get("sources", [])
                 ],
             )
-            await self.postgres_store.save_income_profile(profile.model_dump())
-            await self.postgres_store.save_credit_profile(primary_credit)
+            await self.postgres_store.save_income_profile(profile.model_dump(), tenant_id=current_tenant_id())
+            await self.postgres_store.save_credit_profile(primary_credit, tenant_id=current_tenant_id())
             if co_credit:
-                await self.postgres_store.save_credit_profile(co_credit)
+                await self.postgres_store.save_credit_profile(co_credit, tenant_id=current_tenant_id())
 
             # Invalidate the context cache BEFORE warming income /
             # credit so the worst case is "no cache" (next GET
@@ -436,19 +438,19 @@ class AggregationService:
             # covers both primary and co-applicant.
             try:
                 app = await self.postgres_store.get_application_by_applicant(
-                    applicant_id
+                    applicant_id, tenant_id=current_tenant_id(),
                 )
                 if app:
-                    await self.redis_store.invalidate_context(app["application_id"])
+                    await self.redis_store.invalidate_context(app["application_id"], tenant_id=current_tenant_id())
                 elif application_id:
-                    await self.redis_store.invalidate_context(application_id)
+                    await self.redis_store.invalidate_context(application_id, tenant_id=current_tenant_id())
             except Exception as exc:
                 logger.warning("invalidate_context_failed", error=str(exc))
 
-            await self.redis_store.set_income_profile(applicant_id, profile.model_dump())
-            await self.redis_store.set_credit_profile(applicant_id, primary_credit)
+            await self.redis_store.set_income_profile(applicant_id, profile.model_dump(), tenant_id=current_tenant_id())
+            await self.redis_store.set_credit_profile(applicant_id, primary_credit, tenant_id=current_tenant_id())
             if co_credit:
-                await self.redis_store.set_credit_profile(co_applicant_id, co_credit)
+                await self.redis_store.set_credit_profile(co_applicant_id, co_credit, tenant_id=current_tenant_id())
 
             # Aggregate the asset + identity layers from the same merged
             # doc set we just used for income/credit. These are
@@ -478,7 +480,7 @@ class AggregationService:
             except Exception as exc:
                 logger.warning("identity_aggregation_failed", error=str(exc))
         finally:
-            await self.redis_store.release_assembly_lock(applicant_id)
+            await self.redis_store.release_assembly_lock(applicant_id, tenant_id=current_tenant_id())
 
     async def _merge_request_with_indexed_docs(
         self,
@@ -500,7 +502,7 @@ class AggregationService:
             if not aid:
                 return []
             try:
-                return await self.postgres_store.get_documents_for_applicant(aid)
+                return await self.postgres_store.get_documents_for_applicant(aid, tenant_id=current_tenant_id())
             except Exception as exc:
                 logger.warning("hydrate_docs_failed", applicant_id=aid, error=str(exc))
                 return []
@@ -622,7 +624,7 @@ class AggregationService:
             "months_reserves":      None,
             "assembled_at":         datetime.utcnow().isoformat(),
         }
-        await self.redis_store.set_asset_summary(applicant_id, summary)
+        await self.redis_store.set_asset_summary(applicant_id, summary, tenant_id=current_tenant_id())
         return summary
 
     async def _aggregate_and_cache_identity(
@@ -658,7 +660,7 @@ class AggregationService:
                                     if d.get("document_id")],
             "assembled_at":        datetime.utcnow().isoformat(),
         }
-        await self.redis_store.set_identity_summary(applicant_id, summary)
+        await self.redis_store.set_identity_summary(applicant_id, summary, tenant_id=current_tenant_id())
         return summary
 
     async def _persist_and_reconcile_documents(
@@ -683,13 +685,13 @@ class AggregationService:
         if co_applicant_id:
             try:
                 other_docs_for_primary = await self.postgres_store.get_documents_for_applicant(
-                    co_applicant_id
+                    co_applicant_id, tenant_id=current_tenant_id(),
                 )
             except Exception as exc:
                 logger.warning("hydrate_co_docs_failed", extra={"error": str(exc)})
             try:
                 other_docs_for_co = await self.postgres_store.get_documents_for_applicant(
-                    applicant_id
+                    applicant_id, tenant_id=current_tenant_id(),
                 )
             except Exception as exc:
                 logger.warning("hydrate_primary_docs_failed", extra={"error": str(exc)})
@@ -782,7 +784,7 @@ class AggregationService:
                 "extraction_method": extraction_method,
             }
             try:
-                await self.postgres_store.save_document(saved_doc)
+                await self.postgres_store.save_document(saved_doc, tenant_id=current_tenant_id())
             except Exception as exc:
                 logger.warning("save_document_failed", extra={"error": str(exc)})
                 continue
@@ -821,16 +823,16 @@ class AggregationService:
                     conflict_count=len(conflicts),
                     conflicts=[r.reasoning for r in conflicts],
                 )
-                await self.redis_store.invalidate_income_profile(doc_applicant)
+                await self.redis_store.invalidate_income_profile(doc_applicant, tenant_id=current_tenant_id())
 
         # Always bust the graph cache after persisting docs — even without
         # conflicts. Otherwise /graph/summary keeps returning a stale
         # document_count from before the inserts. Use a graph-only invalidate
         # so we don't blow away the income/credit caches _run_assembly just
         # warmed (invalidate_income_profile would clobber them).
-        await self.redis_store.invalidate_graph_summary(applicant_id)
+        await self.redis_store.invalidate_graph_summary(applicant_id, tenant_id=current_tenant_id())
         if co_applicant_id:
-            await self.redis_store.invalidate_graph_summary(co_applicant_id)
+            await self.redis_store.invalidate_graph_summary(co_applicant_id, tenant_id=current_tenant_id())
 
     async def _handle_property_document_uploaded(self, event) -> dict:
         """Re-assemble a PropertyProfile after a new property doc lands.
@@ -843,23 +845,19 @@ class AggregationService:
         property_id = p["property_id"]
         log = logger.bind(property_id=property_id, handler="property_doc_uploaded")
 
-        prop = await self.postgres_store.get_property(property_id)
+        prop = await self.postgres_store.get_property(property_id, tenant_id=current_tenant_id())
         if not prop:
             raise ValueError(f"No property for: {property_id}")
         application_id = prop.get("application_id") or p.get("application_id") or ""
 
         property_docs = p.get("property_docs")
         if property_docs is None:
-            property_docs = await self.postgres_store.get_property_docs(
-                property_id
-            )
+            property_docs = await self.postgres_store.get_property_docs(property_id, tenant_id=current_tenant_id())
 
         loan_data = p.get("loan_data") or {}
         if application_id and not loan_data:
             try:
-                app = await self.postgres_store.get_application_by_los_id(
-                    application_id
-                )
+                app = await self.postgres_store.get_application_by_los_id(application_id, tenant_id=current_tenant_id())
             except Exception:
                 app = None
             if app:
@@ -877,10 +875,10 @@ class AggregationService:
         )
         profile_dict = profile.model_dump()
 
-        await self.postgres_store.save_property_profile(profile_dict)
-        await self.redis_store.set_property_profile(property_id, profile_dict)
+        await self.postgres_store.save_property_profile(profile_dict, tenant_id=current_tenant_id())
+        await self.redis_store.set_property_profile(property_id, profile_dict, tenant_id=current_tenant_id())
         if application_id:
-            await self.redis_store.invalidate_context(application_id)
+            await self.redis_store.invalidate_context(application_id, tenant_id=current_tenant_id())
 
         piti_total = (profile.piti_components.total_piti
                       if profile.piti_components else None)

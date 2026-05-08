@@ -171,6 +171,14 @@ OPENAPI_TAGS = [
             "the public dashboard."
         ),
     },
+    {
+        "name": "Admin",
+        "description": (
+            "Multi-tenancy administration. Create tenants, provision per-"
+            "tenant API keys, and manage their lifecycle. All endpoints "
+            "require an API key with the `admin` scope."
+        ),
+    },
 ]
 
 API_DESCRIPTION = """\
@@ -218,6 +226,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+from api.admin import router as admin_router  # noqa: E402
 from api.exports import router as exports_router  # noqa: E402
 from api.health import health_router  # noqa: E402
 from api.middleware import RequestMiddleware  # noqa: E402
@@ -229,6 +238,7 @@ app.include_router(router)
 app.include_router(health_router)
 app.include_router(reports_router, prefix="/reports", tags=["Reports"])
 app.include_router(exports_router, prefix="/export", tags=["Export"])
+app.include_router(admin_router, prefix="/admin", tags=["Admin"])
 
 
 # OpenAPI tag classifier — centralized so we don't hand-edit tags on
@@ -239,6 +249,7 @@ app.include_router(exports_router, prefix="/export", tags=["Export"])
 _TAG_RULES: list[tuple[str, str]] = [
     ("/reports/",            "Reports"),
     ("/export/",             "Export"),
+    ("/admin/",              "Admin"),
     # System: ops + observability + indexing + webhooks
     ("/health",              "System"),
     ("/ready",               "System"),
