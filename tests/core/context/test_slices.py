@@ -134,14 +134,25 @@ async def test_missing_documents_list(app_seeded, postgres_store):
     )
     assert resp.status_code == 200
     data = resp.json()
-    # No documents at all yet — required catalog items should all be missing
-    assert "W2_CURRENT" in data["borrower_missing"]
-    assert "BANK_STATEMENT_M1" in data["borrower_missing"]
-    assert "APPRAISAL_URAR" in data["property_missing"]
-    assert "AUS_DU_FINDINGS" in data["vendor_missing"]
-    assert any(
-        item["doc_type"] == "HOI_BINDER" for item in data["checklist"]
-    )
+    # No documents at all yet — required catalog items should all be
+    # missing. The endpoint now returns a unified `required` list with
+    # every required slot (across income/credit/asset/identity/property/
+    # loan_terms/vendor categories) plus a separate `conditional` list
+    # for situational docs (IRS transcript, gift letter, WDO, etc.).
+    required_types = {item["doc_type"] for item in data["required"]}
+    assert "W2_CURRENT"       in required_types
+    assert "BANK_STATEMENT_M1" in required_types
+    assert "APPRAISAL_URAR"   in required_types
+    assert "AUS_DU_FINDINGS"  in required_types
+    assert "HOI_BINDER"       in required_types
+    # Conditional docs come back with a `reason` so callers can decide
+    # whether the rule fires for this loan.
+    conditional_types = {item["doc_type"] for item in data["conditional"]}
+    assert "GIFT_LETTER" in conditional_types
+    # Completeness math is exposed.
+    assert data["total_expected"] >= 14
+    assert data["total_received"] == 0
+    assert data["completeness_pct"] == 0.0
 
 
 @pytest.mark.asyncio

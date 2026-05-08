@@ -306,7 +306,18 @@ class BatchIndexer:
             cat = (s3_doc.category or "").lower()
             if cat == "property" or s3_doc.doc_type in _PROPERTY_DOC_TYPES:
                 property_touched = True
-            elif cat in ("income", "credit", "asset"):
+            elif cat in (
+                # Categories whose docs feed an entity cache that
+                # _run_assembly refreshes write-through:
+                #   income / employment → income profile
+                #   credit               → credit profile
+                #   asset                → asset:{aid} summary
+                #   identity             → identity:{aid} summary
+                #   loan_terms / vendor  → context invalidation (DTI etc.
+                #                          can shift on rate-lock or AUS)
+                "income", "credit", "asset", "identity",
+                "employment", "loan_terms", "vendor",
+            ):
                 income_touched = True
 
             logger.info(

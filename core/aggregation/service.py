@@ -431,6 +431,34 @@ class AggregationService:
             await self.redis_store.set_credit_profile(applicant_id, primary_credit)
             if co_credit:
                 await self.redis_store.set_credit_profile(co_applicant_id, co_credit)
+
+            # Aggregate the asset + identity layers from the same merged
+            # doc set we just used for income/credit. These are
+            # write-through caches keyed per-applicant; readers (slices,
+            # context) get one Redis hit instead of scanning
+            # document_index. Failures log but never block the upload —
+            # the source-of-truth rows are already in PG.
+            try:
+                await self._aggregate_and_cache_assets(
+                    applicant_id, primary_docs,
+                )
+                if co_applicant_id:
+                    await self._aggregate_and_cache_assets(
+                        co_applicant_id, co_docs,
+                    )
+            except Exception as exc:
+                logger.warning("asset_aggregation_failed", error=str(exc))
+
+            try:
+                await self._aggregate_and_cache_identity(
+                    applicant_id, primary_docs,
+                )
+                if co_applicant_id:
+                    await self._aggregate_and_cache_identity(
+                        co_applicant_id, co_docs,
+                    )
+            except Exception as exc:
+                logger.warning("identity_aggregation_failed", error=str(exc))
         finally:
             await self.redis_store.release_assembly_lock(applicant_id)
 
@@ -495,6 +523,125 @@ class AggregationService:
                 merged[doc_id] = d
 
         return list(merged.values())
+
+    # ------------------------------------------------------------------
+    # Asset / identity aggregators — recompute on every assembly so the
+    # write-through cache reflects the current document_index state.
+    # Both are cheap (in-memory pass over the already-merged doc list)
+    # and idempotent.
+
+    _ASSET_DOC_TYPES = {
+        "BANK_STATEMENT_M1", "BANK_STATEMENT_M2", "BANK_STATEMENT_M3",
+        "ASSET_STATEMENT_RETIREMENT", "ASSET_STATEMENT_BROKERAGE",
+        "GIFT_LETTER",
+    }
+
+    _IDENTITY_DOC_TYPES = {
+        "IDENTITY_DL", "IDENTITY_PASSPORT", "IDENTITY_GREEN_CARD",
+        "IDENTITY_VISA", "IDENTITY_SSN_CARD", "IDENTITY_ITIN",
+        "SSN_VALIDATION", "OFAC_REPORT",
+    }
+
+    @staticmethod
+    def _coerce_amount(value) -> Optional[float]:
+        """Best-effort numeric coercion. Tolerates None, ``"$45,000.00"``,
+        bool, and arbitrary strings."""
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(str(value).replace("$", "").replace(",", "").strip())
+        except (ValueError, TypeError):
+            return None
+
+    async def _aggregate_and_cache_assets(
+        self, applicant_id: str, documents: list
+    ) -> dict:
+        """Compute the asset summary for ``applicant_id`` from
+        ``documents`` and write it through to Redis at ``asset:{aid}``."""
+        asset_docs = [
+            d for d in documents
+            if (d.get("document_category") == "asset")
+            or (d.get("document_type") in self._ASSET_DOC_TYPES)
+        ]
+
+        liquid = 0.0
+        retirement = 0.0
+        gift_funds = 0.0
+        for d in asset_docs:
+            t = d.get("document_type") or ""
+            ending = self._coerce_amount(
+                d.get("ending_balance") or d.get("balance")
+            )
+            if t.startswith("BANK_STATEMENT_") and ending is not None:
+                liquid += ending
+            elif t == "ASSET_STATEMENT_BROKERAGE" and ending is not None:
+                liquid += ending
+            elif t == "ASSET_STATEMENT_RETIREMENT":
+                vested = self._coerce_amount(
+                    d.get("vested_balance") or d.get("ending_balance")
+                )
+                if vested is not None:
+                    retirement += vested
+            elif t == "GIFT_LETTER":
+                amt = self._coerce_amount(
+                    d.get("gift_amount") or d.get("amount")
+                )
+                if amt is not None:
+                    gift_funds += amt
+
+        summary = {
+            "applicant_id":         applicant_id,
+            "total_liquid_assets":  round(liquid, 2),
+            "total_retirement":     round(retirement, 2),
+            "gift_funds":           round(gift_funds, 2),
+            "asset_doc_count":      len(asset_docs),
+            "doc_ids":              [d.get("document_id") for d in asset_docs
+                                     if d.get("document_id")],
+            # months_reserves is left unset — needs PITI from the property
+            # layer. Context assembler folds it in when present.
+            "months_reserves":      None,
+            "assembled_at":         datetime.utcnow().isoformat(),
+        }
+        await self.redis_store.set_asset_summary(applicant_id, summary)
+        return summary
+
+    async def _aggregate_and_cache_identity(
+        self, applicant_id: str, documents: list
+    ) -> dict:
+        """Compute the identity summary for ``applicant_id`` and write it
+        through to Redis at ``identity:{aid}``."""
+        identity_docs = [
+            d for d in documents
+            if (d.get("document_category") == "identity")
+            or (d.get("document_type") in self._IDENTITY_DOC_TYPES)
+        ]
+
+        def _has(doc_type: str) -> bool:
+            return any(
+                d.get("document_type") == doc_type
+                and d.get("status") in ("indexed", "received", None)
+                for d in identity_docs
+            )
+
+        dl_verified  = _has("IDENTITY_DL")
+        ssn_verified = _has("SSN_VALIDATION") or _has("IDENTITY_SSN_CARD")
+        ofac_clear   = _has("OFAC_REPORT")
+
+        summary = {
+            "applicant_id":        applicant_id,
+            "dl_verified":         dl_verified,
+            "ssn_verified":        ssn_verified,
+            "ofac_clear":          ofac_clear,
+            "identity_complete":   dl_verified and ssn_verified and ofac_clear,
+            "identity_doc_count":  len(identity_docs),
+            "doc_ids":             [d.get("document_id") for d in identity_docs
+                                    if d.get("document_id")],
+            "assembled_at":        datetime.utcnow().isoformat(),
+        }
+        await self.redis_store.set_identity_summary(applicant_id, summary)
+        return summary
 
     async def _persist_and_reconcile_documents(
         self,
@@ -572,12 +719,28 @@ class AggregationService:
                 "indexed" if has_fields else "received",
             )
 
+            # Canonicalize the doc_type so caller-supplied aliases (e.g.
+            # DRIVERS_LICENSE → IDENTITY_DL, FORM_1040 →
+            # TAX_RETURN_1040_CURRENT) end up rowed against the same slot
+            # the assemblers + missing-documents catalog read from.
+            from core.ingestion.mismo import (
+                canonicalize_doc_type, MISMOMapper,
+            )
+            doc_type = canonicalize_doc_type(d.get("document_type")) or "UNKNOWN"
+            # If the caller didn't supply a category, derive it from the
+            # canonical doc_type. Caller wins if explicit so callers can
+            # still file a doc into a non-standard slot.
+            doc_category = d.get("document_category") or (
+                MISMOMapper.get_document_category(doc_type)
+                if doc_type and doc_type != "UNKNOWN" else "income"
+            )
+
             saved_doc = {
                 "document_id":       d.get("document_id"),
                 "applicant_id":      doc_applicant,
                 "application_id":    application_id,
-                "document_type":     d.get("document_type", "UNKNOWN"),
-                "document_category": d.get("document_category", "income"),
+                "document_type":     doc_type,
+                "document_category": doc_category,
                 "borrower_role":     role,
                 "s3_key":            d.get("s3_key"),
                 "status":            status,

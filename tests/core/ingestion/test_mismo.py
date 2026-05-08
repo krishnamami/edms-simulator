@@ -72,11 +72,14 @@ def test_document_category_mapping():
     assert MISMOMapper.get_document_category("CREDIT_REPORT") == "credit"
     assert MISMOMapper.get_document_category("FLOOD_CERT") == "property"
     assert MISMOMapper.get_document_category("BANK_STATEMENT_M1") == "asset"
-    assert MISMOMapper.get_document_category("URLA_1003") == "loan"
+    # "loan" → "loan_terms" rename to align with the missing-documents
+    # catalog vocabulary; "compliance" → "vendor" to match the synthetic
+    # AUS path and the catalog's "vendor" slot.
+    assert MISMOMapper.get_document_category("URLA_1003") == "loan_terms"
     assert MISMOMapper.get_document_category("IDENTITY_DL") == "identity"
-    assert MISMOMapper.get_document_category("AUS_DU_FINDINGS") == "compliance"
-    # Unknown internal types fall back to "loan"
-    assert MISMOMapper.get_document_category("WHATEVER_NEW_TYPE") == "loan"
+    assert MISMOMapper.get_document_category("AUS_DU_FINDINGS") == "vendor"
+    # Unknown internal types fall back to "loan_terms"
+    assert MISMOMapper.get_document_category("WHATEVER_NEW_TYPE") == "loan_terms"
 
 
 def test_reverse_mapping_complete():

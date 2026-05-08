@@ -1715,29 +1715,76 @@ async def get_context_at_timestamp(
 
 
 # ---- missing documents -----------------------------------------------------
+#
+# The catalog is the authoritative list of every doc type a complete
+# mortgage file is expected to carry. Required slots gate close;
+# conditional slots only apply when the loan / property / borrower meets
+# a stated rule (self-employed, gift funds, coastal flood zone, etc.).
+# A slot is "received" when document_index has at least one row whose
+# canonical document_type matches the slot's doc_type or any of its
+# ``alternates`` (e.g. W2_CURRENT slot accepts W2_PRIOR; AUS slot
+# accepts DU OR LP findings).
 
 
-_BORROWER_REQUIRED_DOCS = [
-    {"item": "W-2 — most recent year",          "required": True,  "category": "income",   "doc_type": "W2_CURRENT"},
-    {"item": "Pay stub — most recent",          "required": True,  "category": "income",   "doc_type": "PAYSTUB_CURRENT"},
-    {"item": "Bank statements — 2 months",      "required": True,  "category": "asset",    "doc_type": "BANK_STATEMENT_M1"},
-    {"item": "Driver's license",                "required": True,  "category": "identity", "doc_type": "ID_DRIVERS_LICENSE"},
-    {"item": "Credit report",                   "required": True,  "category": "credit",   "doc_type": "CREDIT_REPORT"},
+_REQUIRED_DOCS = [
+    # Income — at least one current proof. W2_PRIOR satisfies if no
+    # current W2 yet (e.g. mid-year hire).
+    {"item": "W-2 — current year",            "category": "income",     "doc_type": "W2_CURRENT",       "alternates": ["W2_PRIOR"]},
+    {"item": "Pay stub — most recent",        "category": "income",     "doc_type": "PAYSTUB_CURRENT",  "alternates": ["PAYSTUB_PRIOR"]},
+    # Credit
+    {"item": "Credit report",                 "category": "credit",     "doc_type": "CREDIT_REPORT"},
+    # Asset
+    {"item": "Bank statement — month 1",      "category": "asset",      "doc_type": "BANK_STATEMENT_M1"},
+    # Identity / KYC
+    {"item": "Driver's license",              "category": "identity",   "doc_type": "IDENTITY_DL"},
+    {"item": "SSN validation",                "category": "identity",   "doc_type": "SSN_VALIDATION",   "alternates": ["IDENTITY_SSN_CARD"]},
+    {"item": "OFAC clearance",                "category": "identity",   "doc_type": "OFAC_REPORT"},
+    # Property
+    {"item": "URAR appraisal",                "category": "property",   "doc_type": "APPRAISAL_URAR"},
+    {"item": "Title commitment",              "category": "property",   "doc_type": "TITLE_COMMITMENT"},
+    {"item": "Homeowner's insurance binder",  "category": "property",   "doc_type": "HOI_BINDER",       "alternates": ["HOI_DECLARATIONS"]},
+    {"item": "Flood certificate",             "category": "property",   "doc_type": "FLOOD_CERT"},
+    {"item": "Property tax bill",             "category": "property",   "doc_type": "PROPERTY_TAX_BILL"},
+    # Loan terms
+    {"item": "URLA / 1003",                   "category": "loan_terms", "doc_type": "URLA_1003"},
+    {"item": "Purchase agreement",            "category": "loan_terms", "doc_type": "PURCHASE_AGREEMENT"},
+    # Vendor — DU or LP satisfies. Either AUS_LP_FINDINGS or
+    # AUS_DU_FINDINGS in have closes the slot.
+    {"item": "AUS findings",                  "category": "vendor",     "doc_type": "AUS_DU_FINDINGS",  "alternates": ["AUS_LP_FINDINGS"]},
 ]
 
-_PROPERTY_REQUIRED_DOCS = [
-    {"item": "URAR appraisal",                  "required": True,  "category": "property", "doc_type": "APPRAISAL_URAR"},
-    {"item": "Title commitment",                "required": True,  "category": "property", "doc_type": "TITLE_COMMITMENT"},
-    {"item": "Homeowner's insurance binder",    "required": True,  "category": "property", "doc_type": "HOI_BINDER"},
-    {"item": "Flood certificate",               "required": True,  "category": "property", "doc_type": "FLOOD_CERT"},
-    {"item": "Property tax bill",               "required": True,  "category": "property", "doc_type": "PROPERTY_TAX_BILL"},
+
+_CONDITIONAL_DOCS = [
+    {"item": "IRS wage & income transcript",  "category": "income",     "doc_type": "IRS_TRANSCRIPT",
+     "reason": "required if self-employed or income > $100k"},
+    {"item": "Form 1040",                     "category": "income",     "doc_type": "TAX_RETURN_1040_CURRENT",
+     "reason": "required if self-employed"},
+    {"item": "Schedule C",                    "category": "income",     "doc_type": "SCHEDULE_C",
+     "reason": "required if self-employed (sole proprietor)"},
+    {"item": "Schedule E",                    "category": "income",     "doc_type": "SCHEDULE_E",
+     "reason": "required if rental income claimed"},
+    {"item": "Gift letter",                   "category": "asset",      "doc_type": "GIFT_LETTER",
+     "reason": "required if gift funds used for down payment"},
+    {"item": "Wind / hail insurance",         "category": "property",   "doc_type": "WIND_HAIL_INSURANCE",
+     "reason": "required if property in TX/FL coastal counties"},
+    {"item": "Wood-destroying-organism (WDO) report", "category": "property", "doc_type": "PEST_WDO_INSPECTION",
+     "reason": "required by state (FL, TX, LA, etc.)"},
+    {"item": "Well & septic inspection",      "category": "property",   "doc_type": "WELL_SEPTIC_INSPECTION",
+     "reason": "required if rural property"},
+    {"item": "HOA certification",             "category": "property",   "doc_type": "HOA_CERT",
+     "reason": "required if condo or PUD"},
 ]
 
-_VENDOR_REQUIRED_DOCS = [
-    {"item": "AUS findings (DU or LP)",         "required": True,  "category": "vendor",   "doc_type": "AUS_DU_FINDINGS"},
-    {"item": "Employment verification",         "required": False, "category": "vendor",   "doc_type": "EMPLOYMENT_VERIFICATION"},
-    {"item": "Fraud / KYC report",              "required": False, "category": "vendor",   "doc_type": "FRAUD_REPORT"},
-]
+
+def _slot_received(slot: dict, have: set) -> bool:
+    """Return True when ``have`` contains the slot's doc_type or any of
+    its alternates."""
+    if slot["doc_type"] in have:
+        return True
+    for alt in slot.get("alternates") or []:
+        if alt in have:
+            return True
+    return False
 
 
 @router.get(
@@ -1745,11 +1792,19 @@ _VENDOR_REQUIRED_DOCS = [
     dependencies=[Depends(verify_api_key)],
 )
 async def get_missing_documents(request: Request, application_id: str):
+    """Return a comprehensive checklist of every doc type the loan file
+    is expected to carry. Required slots gate close; conditional slots
+    return with the rule that triggers them so the caller can decide
+    whether they apply."""
+    from core.ingestion.mismo import canonicalize_doc_type
+
     pg = request.app.state.postgres_store
     docs = await pg.get_documents_for_application(application_id)
-    have = {d.get("document_type") for d in docs}
-    # The borrower-required income / asset docs are usually rowed against
-    # the applicant rather than the application — pull those too.
+    have: set[str] = {canonicalize_doc_type(d.get("document_type")) for d in docs}
+    have.discard(None)
+    # The borrower-required income / asset / identity docs are usually
+    # rowed against the applicant rather than the application — pull
+    # those too.
     app_row = await pg.get_application(application_id)
     if app_row:
         try:
@@ -1758,25 +1813,41 @@ async def get_missing_documents(request: Request, application_id: str):
             )
         except Exception:
             applicant_docs = []
-        have |= {d.get("document_type") for d in applicant_docs}
+        have |= {canonicalize_doc_type(d.get("document_type"))
+                 for d in applicant_docs}
+        have.discard(None)
+        # Co-applicant docs too — joint applications often file a single
+        # set of identity / asset docs under the co-borrower.
+        co_aid = app_row.get("co_applicant_id")
+        if co_aid:
+            try:
+                co_docs = await pg.get_documents_for_applicant(co_aid)
+            except Exception:
+                co_docs = []
+            have |= {canonicalize_doc_type(d.get("document_type"))
+                     for d in co_docs}
+            have.discard(None)
 
-    def _missing(catalog):
-        return [d for d in catalog if d["doc_type"] not in have and d["required"]]
+    required_missing = [
+        s for s in _REQUIRED_DOCS if not _slot_received(s, have)
+    ]
+    conditional_missing = [
+        s for s in _CONDITIONAL_DOCS if not _slot_received(s, have)
+    ]
 
-    borrower_missing = _missing(_BORROWER_REQUIRED_DOCS)
-    property_missing = _missing(_PROPERTY_REQUIRED_DOCS)
-    vendor_missing   = _missing(_VENDOR_REQUIRED_DOCS)
-
-    # AUS_DU_FINDINGS ⟂ AUS_LP_FINDINGS — either satisfies the gate.
-    if "AUS_LP_FINDINGS" in have:
-        vendor_missing = [v for v in vendor_missing if v["doc_type"] != "AUS_DU_FINDINGS"]
+    total_expected = len(_REQUIRED_DOCS)
+    total_received = total_expected - len(required_missing)
+    completeness_pct = round(total_received / total_expected * 100, 1) \
+        if total_expected else 0.0
 
     return {
-        "application_id":   application_id,
-        "borrower_missing": [m["doc_type"] for m in borrower_missing],
-        "property_missing": [m["doc_type"] for m in property_missing],
-        "vendor_missing":   [m["doc_type"] for m in vendor_missing],
-        "checklist":        borrower_missing + property_missing + vendor_missing,
+        "application_id":     application_id,
+        "required":           required_missing,
+        "conditional":        conditional_missing,
+        "received":           sorted(have),
+        "total_expected":     total_expected,
+        "total_received":     total_received,
+        "completeness_pct":   completeness_pct,
     }
 
 

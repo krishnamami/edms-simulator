@@ -142,6 +142,56 @@ MISMO_ALIASES: dict[str, str] = {
 }
 
 
+# ── Internal doc-type aliases — caller-supplied → canonical ─────────────
+# Callers (and Decision OS) often send the "common name" for a doc type
+# rather than the canonical form the simulator stores in document_index.
+# E.g. a UI might send ``DRIVERS_LICENSE`` while the canonical type is
+# ``IDENTITY_DL``. ``canonicalize_doc_type`` resolves these so:
+#   - the missing-documents catalog and identity / asset aggregators see a
+#     single doc_type per slot regardless of which name was uploaded
+#   - downstream readers (graph, slices, context) don't have to dedup
+DOC_TYPE_ALIASES: dict[str, str] = {
+    # Income — the canonical types use TAX_RETURN_1040_* / 1099_NEC etc.
+    "FORM_1040":                "TAX_RETURN_1040_CURRENT",
+    "FORM_1040_CURRENT":        "TAX_RETURN_1040_CURRENT",
+    "FORM_1040_PRIOR":          "TAX_RETURN_1040_PRIOR",
+    "FORM_1099_NEC":            "1099_NEC",
+    "K1_SCHEDULE":              "K1_PARTNERSHIP",
+    "RENTAL_LEASE":             "LEASE_AGREEMENT",
+    "MILITARY_LES":             "LES",
+    # Credit
+    "CREDIT_EXPLANATION":       "CREDIT_EXPLANATION_LETTER",
+    # Asset — UI-friendly names → canonical "ASSET_STATEMENT_*" forms
+    "RETIREMENT_ACCOUNT":       "ASSET_STATEMENT_RETIREMENT",
+    "BROKERAGE_ACCOUNT":        "ASSET_STATEMENT_BROKERAGE",
+    "ASSET_BROKERAGE":          "ASSET_STATEMENT_BROKERAGE",
+    "ASSET_RETIREMENT":         "ASSET_STATEMENT_RETIREMENT",
+    # Identity
+    "DRIVERS_LICENSE":          "IDENTITY_DL",
+    "ID_DRIVERS_LICENSE":       "IDENTITY_DL",
+    "PASSPORT":                 "IDENTITY_PASSPORT",
+    "SSN_CARD":                 "IDENTITY_SSN_CARD",
+    "SSA_VALIDATION":           "SSN_VALIDATION",
+    "OFAC_CHECK":               "OFAC_REPORT",
+    # Property
+    "WDO_REPORT":               "PEST_WDO_INSPECTION",
+    "TERMITE_REPORT":           "PEST_WDO_INSPECTION",
+    "WIND_HAIL":                "WIND_HAIL_INSURANCE",
+}
+
+
+def canonicalize_doc_type(doc_type: Optional[str]) -> Optional[str]:
+    """Resolve a caller-supplied doc_type to its canonical internal form.
+
+    No-op when ``doc_type`` is None / empty / already canonical. Used by
+    the persistence layer so two callers passing ``DRIVERS_LICENSE`` and
+    ``IDENTITY_DL`` end up rowed against the same identity slot.
+    """
+    if not doc_type:
+        return doc_type
+    return DOC_TYPE_ALIASES.get(doc_type, doc_type)
+
+
 # Internal → MISMO reverse map. Used when emitting MISMO-shaped responses
 # back to a counterparty (e.g. a downstream Decision OS that wants the
 # canonical MISMO name).
@@ -252,7 +302,9 @@ _CATEGORY_MAP: dict[str, list[str]] = {
         "MILITARY_", "VOE_",
         "STUDENT_LOAN_", "DIVORCE_", "CHILD_SUPPORT_", "LEASE_",
     ],
-    "credit":     ["CREDIT_", "OFAC_", "SSN_"],
+    # OFAC_ and SSN_ moved to "vendor" — they're vendor-side checks, not
+    # credit. Pure credit-bureau docs only here.
+    "credit":     ["CREDIT_"],
     "asset":      ["BANK_STATEMENT", "ASSET_STATEMENT", "ASSET_RETIREMENT",
                    "ASSET_BROKERAGE", "GIFT_LETTER"],
     "property":   [
@@ -263,12 +315,20 @@ _CATEGORY_MAP: dict[str, list[str]] = {
         "WIND_HAIL_", "PROPERTY_TAX_TRANSCRIPT",
         "EARNEST_",
     ],
-    "loan":       ["URLA_", "FORM_1008", "RATE_LOCK", "PURCHASE_", "EARNEST_"],
-    "compliance": [
+    # Renamed from "loan" → "loan_terms" so the category column matches the
+    # missing-documents catalog vocabulary. No callers depend on the old
+    # name (verified via grep at the time of the rename).
+    "loan_terms": ["URLA_", "FORM_1008", "RATE_LOCK", "PURCHASE_", "EARNEST_"],
+    # Renamed from "compliance" → "vendor". The synthetic AUS path in
+    # api/routes.py and the missing-documents catalog already used
+    # "vendor" — this aligns _CATEGORY_MAP with that convention.
+    "vendor":     [
         "FRAUD_", "AUS_", "HMDA_",
         # Build: comprehensive indexing
         "BANKRUPTCY_", "JUDGMENT_", "UNDISCLOSED_", "HOI_VERIF",
         "LOAN_ESTIMATE", "CLOSING_DISCLOSURE",
+        # Vendor-side identity / employment verifications
+        "OFAC_", "SSN_VALIDATION",
     ],
     "identity":   ["IDENTITY_"],
 }
@@ -403,9 +463,9 @@ class MISMOMapper:
     def get_document_category(internal_type: str) -> str:
         """Map an internal doc-type to ``document_category`` for ``document_index``.
 
-        Falls back to ``loan`` if no prefix matches.
+        Falls back to ``loan_terms`` if no prefix matches.
         """
         for category, prefixes in _CATEGORY_MAP.items():
             if any(internal_type.startswith(p) for p in prefixes):
                 return category
-        return "loan"
+        return "loan_terms"

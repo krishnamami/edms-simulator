@@ -311,3 +311,79 @@ class RedisStore:
             logger.warning(
                 "redis_invalidate_context_failed", extra={"error": str(e)}
             )
+
+    # ---------------- asset summary (per-applicant) -----------------
+    #
+    # Aggregated view of every asset doc the borrower has supplied: liquid
+    # bank balances, brokerage, retirement, gift funds. Recomputed on
+    # write-through whenever an asset-category doc lands; readers (slices,
+    # context, /readiness) get a single-key fetch instead of scanning
+    # document_index. Same TTL as income (4h) — these are computed from
+    # the same source-of-truth and should refresh on the same cadence.
+
+    async def set_asset_summary(
+        self, applicant_id: str, summary: dict, ttl: Optional[int] = None
+    ) -> bool:
+        try:
+            await self._r.setex(
+                f"asset:{applicant_id}",
+                ttl or self.TTL_INCOME_PROFILE,
+                json.dumps(summary, default=str),
+            )
+            return True
+        except Exception as e:
+            logger.warning("redis_set_asset_failed", extra={"error": str(e)})
+            return False
+
+    async def get_asset_summary(self, applicant_id: str) -> Optional[dict]:
+        try:
+            raw = await self._r.get(f"asset:{applicant_id}")
+            return json.loads(raw) if raw else None
+        except Exception as e:
+            logger.warning("redis_get_asset_failed", extra={"error": str(e)})
+            return None
+
+    async def invalidate_asset_summary(self, applicant_id: str) -> None:
+        try:
+            await self._r.delete(f"asset:{applicant_id}")
+        except Exception as e:
+            logger.warning("redis_invalidate_asset_failed", extra={"error": str(e)})
+
+    # ---------------- identity summary (per-applicant) -----------------
+    #
+    # Aggregated view of every identity / KYC artifact the borrower has on
+    # file: driver's license, SSN validation, OFAC clearance. Same TTL as
+    # the golden-record status (24h) — identity rarely changes within a
+    # session, and a stale read is harmless because the source-of-truth
+    # rows in document_index are the gating data; this cache only powers
+    # fast reads on the readiness / compliance slices.
+
+    async def set_identity_summary(
+        self, applicant_id: str, summary: dict, ttl: Optional[int] = None
+    ) -> bool:
+        try:
+            await self._r.setex(
+                f"identity:{applicant_id}",
+                ttl or self.TTL_GOLDEN_STATUS,
+                json.dumps(summary, default=str),
+            )
+            return True
+        except Exception as e:
+            logger.warning("redis_set_identity_failed", extra={"error": str(e)})
+            return False
+
+    async def get_identity_summary(self, applicant_id: str) -> Optional[dict]:
+        try:
+            raw = await self._r.get(f"identity:{applicant_id}")
+            return json.loads(raw) if raw else None
+        except Exception as e:
+            logger.warning("redis_get_identity_failed", extra={"error": str(e)})
+            return None
+
+    async def invalidate_identity_summary(self, applicant_id: str) -> None:
+        try:
+            await self._r.delete(f"identity:{applicant_id}")
+        except Exception as e:
+            logger.warning(
+                "redis_invalidate_identity_failed", extra={"error": str(e)}
+            )
