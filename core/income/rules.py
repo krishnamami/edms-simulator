@@ -27,7 +27,7 @@ def calculate_w2_salaried(
     if not paystubs:
         warnings.append("No pay stub - using W2 annualized only")
     w2 = w2_docs[0]
-    annual = float(w2.get("box1_wages", 0))
+    annual = float(w2.get("box1_wages") or 0)
     monthly = round(annual / 12, 2)
     conf = 0.97 if paystubs else 0.90
     doc_ids = [d.get("document_id", "") for d in w2_docs + paystubs]
@@ -63,8 +63,8 @@ def calculate_self_employed(
             exclusion_reason="Only 1 year available",
         )
     warnings: list[str] = []
-    yr1 = float(tax_returns[0].get("net_income_after_addbacks", 0))
-    yr2 = float(tax_returns[1].get("net_income_after_addbacks", 0))
+    yr1 = float(tax_returns[0].get("net_income_after_addbacks") or 0)
+    yr2 = float(tax_returns[1].get("net_income_after_addbacks") or 0)
     if yr2 < yr1 * 0.80:
         warnings.append(
             f"Business declining: yr2 ${yr2:,.0f} < 80% of yr1 ${yr1:,.0f}"
@@ -109,8 +109,12 @@ def calculate_rental(
             excluded=True,
             exclusion_reason="Missing Schedule E",
         )
-    gross = float(schedule_e.get("gross_rent_annual", 0)) / 12
-    expenses = float(schedule_e.get("expenses_annual", 0)) / 12
+    # ``or 0`` rather than ``.get(..., 0)`` because the key is sometimes
+    # present with value ``None`` (e.g. caller supplied an explicit None,
+    # or a doc was hydrated from PG with a NULL column). The default
+    # second arg only fires when the key is missing.
+    gross = float(schedule_e.get("gross_rent_annual") or 0) / 12
+    expenses = float(schedule_e.get("expenses_annual") or 0) / 12
     net = round((gross * 0.75) - expenses, 2)
     if net <= 0:
         return IncomeSource(
@@ -163,7 +167,7 @@ def calculate_retirement_ssa(
             excluded=True,
             exclusion_reason="Missing SSA award letter",
         )
-    benefit = float(ssa_letter.get("monthly_benefit", 0))
+    benefit = float(ssa_letter.get("monthly_benefit") or 0)
     non_taxable = ssa_letter.get("is_non_taxable", False)
     qualifying = round(benefit * 1.25 if non_taxable else benefit, 2)
     method = f"SSA ${benefit:,.2f}/mo"
@@ -202,7 +206,7 @@ def calculate_asset_depletion(
     total = 0.0
     for s in asset_statements:
         atype = s.get("account_type", "checking")
-        balance = float(s.get("balance", 0))
+        balance = float(s.get("balance") or 0)
         if atype in ["checking", "savings", "investment", "brokerage"]:
             total += balance
         elif atype in ["retirement", "401k", "ira"]:
@@ -246,10 +250,10 @@ def calculate_military(les_data: dict, borrower_id: str) -> IncomeSource:
             excluded=True,
             exclusion_reason="Missing Leave and Earnings Statement",
         )
-    base = float(les_data.get("base_pay_monthly", 0))
-    bah = float(les_data.get("bah_monthly", 0))
-    bas = float(les_data.get("bas_monthly", 0))
-    special = float(les_data.get("special_pay_monthly", 0))
+    base = float(les_data.get("base_pay_monthly") or 0)
+    bah = float(les_data.get("bah_monthly") or 0)
+    bas = float(les_data.get("bas_monthly") or 0)
+    special = float(les_data.get("special_pay_monthly") or 0)
     q = round(base + (bah * 1.25) + (bas * 1.25) + special, 2)
     return IncomeSource(
         source_type=IncomeSourceType.MILITARY,
