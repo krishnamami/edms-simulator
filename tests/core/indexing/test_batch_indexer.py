@@ -220,8 +220,8 @@ async def test_batch_indexer_property_invalidates_redis(
         property_id="PROP-P",
     )
     # Pre-warm the property profile cache so we can verify invalidation.
-    redis_store.set_property_profile("PROP-P", {"appraised_value": 400_000})
-    assert redis_store.get_property_profile("PROP-P") is not None
+    await redis_store.set_property_profile("PROP-P", {"appraised_value": 400_000})
+    assert await redis_store.get_property_profile("PROP-P") is not None
 
     later = datetime(2026, 6, 1, tzinfo=timezone.utc)
     docs = [_doc("LOS-P", "property", "appraisal_urar.pdf",
@@ -240,7 +240,7 @@ async def test_batch_indexer_property_invalidates_redis(
     stats = await indexer.run(source="s3")
     assert stats["applicants_affected"] == 1
     # Cache flushed
-    assert redis_store.get_property_profile("PROP-P") is None
+    assert await redis_store.get_property_profile("PROP-P") is None
 
 
 @pytest.mark.asyncio

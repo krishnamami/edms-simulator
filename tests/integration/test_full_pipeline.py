@@ -79,9 +79,9 @@ async def test_full_pipeline_single_borrower(
     assert income["combined_qualifying_monthly"] == 7000.0
     assert credit["mid_score"] >= 600
 
-    cached_status = redis_store.get_status(aid)
+    cached_status = await redis_store.get_status(aid)
     assert cached_status == "active"
-    cached_lookup = redis_store.get_app_lookup("INT-001")
+    cached_lookup = await redis_store.get_app_lookup("INT-001")
     assert cached_lookup["application_id"] == result["application_id"]
 
 

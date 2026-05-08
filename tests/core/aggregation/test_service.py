@@ -90,7 +90,7 @@ async def test_income_profile_persisted_after_submit(
     pg_profile = await postgres_store.get_income_profile(aid)
     assert pg_profile is not None
     assert pg_profile["combined_qualifying_monthly"] > 0
-    cached = redis_store.get_income_profile(aid)
+    cached = await redis_store.get_income_profile(aid)
     assert cached is not None
     assert cached["applicant_id"] == aid
 

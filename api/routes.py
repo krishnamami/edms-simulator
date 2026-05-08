@@ -122,7 +122,7 @@ async def get_applicant_id(request: Request, los_id: str):
     redis_store = request.app.state.redis_store
     postgres_store = request.app.state.postgres_store
 
-    cached = redis_store.get_app_lookup(los_id)
+    cached = await redis_store.get_app_lookup(los_id)
     if cached:
         return ApplicantIdResponse(
             applicant_id=cached["applicant_id"],
@@ -135,7 +135,7 @@ async def get_applicant_id(request: Request, los_id: str):
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
 
-    redis_store.set_app_lookup(
+    await redis_store.set_app_lookup(
         los_id,
         {
             "application_id": app["application_id"],
@@ -160,7 +160,7 @@ async def get_income_profile(request: Request, applicant_id: str):
     redis_store = request.app.state.redis_store
     postgres_store = request.app.state.postgres_store
 
-    cached = redis_store.get_income_profile(applicant_id)
+    cached = await redis_store.get_income_profile(applicant_id)
     if cached:
         return IncomeProfileResponse(
             applicant_id=applicant_id, profile=cached, cached=True,
@@ -170,7 +170,7 @@ async def get_income_profile(request: Request, applicant_id: str):
     profile = await postgres_store.get_income_profile(applicant_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Income profile not found")
-    redis_store.set_income_profile(applicant_id, profile)
+    await redis_store.set_income_profile(applicant_id, profile)
     return IncomeProfileResponse(
         applicant_id=applicant_id, profile=profile, cached=False,
         source="postgres", data=profile,
@@ -186,7 +186,7 @@ async def get_credit_profile(request: Request, applicant_id: str):
     redis_store = request.app.state.redis_store
     postgres_store = request.app.state.postgres_store
 
-    cached = redis_store.get_credit_profile(applicant_id)
+    cached = await redis_store.get_credit_profile(applicant_id)
     if cached:
         return CreditProfileResponse(
             applicant_id=applicant_id, profile=cached, cached=True,
@@ -196,7 +196,7 @@ async def get_credit_profile(request: Request, applicant_id: str):
     profile = await postgres_store.get_credit_profile(applicant_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Credit profile not found")
-    redis_store.set_credit_profile(applicant_id, profile)
+    await redis_store.set_credit_profile(applicant_id, profile)
     return CreditProfileResponse(
         applicant_id=applicant_id, profile=profile, cached=False,
         source="postgres", data=profile,
@@ -493,12 +493,12 @@ async def list_failed_ingestions(request: Request, limit: int = 50):
 )
 async def get_graph_summary(request: Request, applicant_id: str):
     redis = request.app.state.redis_store
-    cached = redis.get_graph_summary(applicant_id)
+    cached = await redis.get_graph_summary(applicant_id)
     if cached:
         return {"source": "cache", "data": cached}
     pg = request.app.state.postgres_store
     summary = await pg.get_graph_summary(applicant_id)
-    redis.set_graph_summary(applicant_id, summary)
+    await redis.set_graph_summary(applicant_id, summary)
     return {"source": "database", "data": summary}
 
 
@@ -948,14 +948,14 @@ async def get_property_profile(request: Request, property_id: str):
     redis = request.app.state.redis_store
     pg = request.app.state.postgres_store
 
-    cached = redis.get_property_profile(property_id)
+    cached = await redis.get_property_profile(property_id)
     if cached:
         return {"source": "cache", "data": cached}
 
     profile = await pg.get_property_profile(property_id)
     if not profile:
         raise HTTPException(status_code=404, detail="Property profile not found")
-    redis.set_property_profile(property_id, profile)
+    await redis.set_property_profile(property_id, profile)
     return {"source": "database", "data": profile}
 
 
@@ -1133,7 +1133,7 @@ async def get_application_context(request: Request, application_id: str):
     """The single endpoint Decision OS calls — folded borrower + property
     + readiness + DTI/LTV. Redis cache → re-assemble if stale."""
     redis = request.app.state.redis_store
-    cached = redis.get_application_context(application_id)
+    cached = await redis.get_application_context(application_id)
     if cached:
         return {"source": "cache", "data": cached}
 
@@ -1152,7 +1152,7 @@ async def get_application_context(request: Request, application_id: str):
 async def get_application_readiness(request: Request, application_id: str):
     """Lightweight readiness flags for "are we ready for AUS?" polling."""
     redis = request.app.state.redis_store
-    cached = redis.get_application_context(application_id)
+    cached = await redis.get_application_context(application_id)
     if cached:
         return {
             "application_id": application_id,
@@ -1178,7 +1178,7 @@ async def get_application_readiness(request: Request, application_id: str):
 async def refresh_application_context(request: Request, application_id: str):
     """Force re-assembly even if cached. Useful after a batch upload."""
     redis = request.app.state.redis_store
-    redis.invalidate_context(application_id)
+    await redis.invalidate_context(application_id)
     assembler = _context_assembler(request)
     try:
         ctx = await assembler.assemble(application_id)
@@ -1194,7 +1194,7 @@ async def refresh_application_context(request: Request, application_id: str):
 async def get_application_dti(request: Request, application_id: str):
     """DTI breakdown — derives PITI, income, and obligations from context."""
     redis = request.app.state.redis_store
-    cached = redis.get_application_context(application_id)
+    cached = await redis.get_application_context(application_id)
     if not cached:
         assembler = _context_assembler(request)
         try:
@@ -1331,7 +1331,7 @@ async def ingest_vendor_return(request: Request, body: dict):
 
     # Drop the cached context — next /context call recomputes including
     # the freshly-landed vendor return.
-    redis.invalidate_context(application_id)
+    await redis.invalidate_context(application_id)
 
     return {
         "ingest_id":             document_id,
@@ -1349,7 +1349,7 @@ async def get_application_vendor_checks(
     request: Request, application_id: str
 ):
     redis = request.app.state.redis_store
-    cached = redis.get_application_context(application_id)
+    cached = await redis.get_application_context(application_id)
     if cached and cached.get("vendor_checks") is not None:
         return {
             "application_id": application_id,
@@ -1385,7 +1385,7 @@ async def run_vendor_checks(request: Request, application_id: str):
         raise HTTPException(status_code=404, detail="Application not found")
     applicant_id = app["applicant_id"]
 
-    cached = redis.get_application_context(application_id) or {}
+    cached = await redis.get_application_context(application_id) or {}
     primary = (cached.get("primary") or {}) if cached else {}
     property_block = cached.get("property") if cached else None
     credit_score = primary.get("mid_score") or 720
@@ -1456,7 +1456,7 @@ async def run_vendor_checks(request: Request, application_id: str):
                 "error":       exc.detail,
             })
 
-    redis.invalidate_context(application_id)
+    await redis.invalidate_context(application_id)
     ctx = await _context_assembler(request).assemble(application_id)
     return {
         "application_id": application_id,
@@ -1476,7 +1476,7 @@ async def _ctx_dict(request: Request, application_id: str) -> dict:
     assembly when nothing is cached. Raises 404 if the application
     doesn't exist."""
     redis = request.app.state.redis_store
-    cached = redis.get_application_context(application_id)
+    cached = await redis.get_application_context(application_id)
     if cached:
         return cached
     assembler = _context_assembler(request)
@@ -1914,7 +1914,7 @@ async def dashboard(request: Request):
 
     summaries: list = []
     for app in apps:
-        ctx = redis.get_application_context(app["application_id"]) or {}
+        ctx = (await redis.get_application_context(app["application_id"])) or {}
         primary = ctx.get("primary") or {}
         summaries.append({
             "application_id":  app["application_id"],
@@ -1950,7 +1950,7 @@ async def application_pipeline_state(request: Request, application_id: str):
     if not app:
         raise HTTPException(status_code=404, detail="Application not found")
 
-    ctx = redis.get_application_context(application_id)
+    ctx = await redis.get_application_context(application_id)
     if not ctx:
         try:
             ctx_obj = await ContextAssembler(pg, redis).assemble(application_id)
@@ -2005,9 +2005,9 @@ async def application_pipeline_state(request: Request, application_id: str):
                 "obligations": credit.get("total_monthly_obligations"),
             },
             "redis_keys": {
-                "income": redis.key_state(f"income:{applicant_id}"),
-                "credit": redis.key_state(f"credit:{applicant_id}"),
-                "status": redis.key_state(f"status:{applicant_id}"),
+                "income": await redis.key_state(f"income:{applicant_id}"),
+                "credit": await redis.key_state(f"credit:{applicant_id}"),
+                "status": await redis.key_state(f"status:{applicant_id}"),
             },
         })
 
@@ -2049,7 +2049,7 @@ async def application_pipeline_state(request: Request, application_id: str):
                 "ltv":             ltv,
                 "flood_zone":      profile.get("flood_zone"),
             },
-            "redis_key": redis.key_state(f"property:{property_id}"),
+            "redis_key": await redis.key_state(f"property:{property_id}"),
         }
 
     # Graph
@@ -2085,9 +2085,10 @@ async def application_pipeline_state(request: Request, application_id: str):
 
     vendor_checks = ctx.get("vendor_checks") or {}
     readiness = ctx.get("readiness") or {}
+    ctx_key_state = await redis.key_state(f"context:{application_id}")
     context_block = {
-        "present":         redis.key_state(f"context:{application_id}").get("present", False),
-        "ttl_seconds":     redis.key_state(f"context:{application_id}").get("ttl_seconds"),
+        "present":         ctx_key_state.get("present", False),
+        "ttl_seconds":     ctx_key_state.get("ttl_seconds"),
         "front_end_dti":   ctx.get("front_end_dti"),
         "back_end_dti":    ctx.get("back_end_dti"),
         "ltv":             ctx.get("ltv"),

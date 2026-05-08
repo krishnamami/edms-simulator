@@ -1,8 +1,13 @@
 """ElastiCache Redis store with three-mode support.
 
-- USE_FAKE_REDIS=true   -> fakeredis (CI/unit tests)
+- USE_FAKE_REDIS=true   -> fakeredis.aioredis (CI/unit tests)
 - ENVIRONMENT=local     -> local Redis (docker-compose)
 - ENVIRONMENT=production-> ElastiCache via secrets manager
+
+All methods are async. The underlying client is ``redis.asyncio.Redis``
+so a setex / get / delete never blocks the event loop — important
+because every FastAPI request handler is async and a sync client would
+serialize concurrent traffic behind redis round-trips.
 """
 import json
 import logging
@@ -24,13 +29,13 @@ def get_redis():
 
 def _create_client():
     if os.getenv("USE_FAKE_REDIS", "false").lower() == "true":
-        import fakeredis
-        logger.info("redis_using_fakeredis")
-        return fakeredis.FakeRedis(decode_responses=True)
+        from fakeredis import aioredis as fake_aioredis
+        logger.info("redis_using_fakeredis_async")
+        return fake_aioredis.FakeRedis(decode_responses=True)
 
     secrets = get_secrets()
     creds = secrets.get_secret("edms/redis/endpoint")
-    import redis
+    from redis import asyncio as redis_asyncio
     # ElastiCache TransitEncryptionEnabled requires ssl=True on the client.
     # Trigger TLS on either an explicit REDIS_SSL=true (test/local override)
     # or ENVIRONMENT=production (default in the ECS task definition).
@@ -38,7 +43,7 @@ def _create_client():
         os.getenv("REDIS_SSL", "false").lower() == "true"
         or os.getenv("ENVIRONMENT", "local") == "production"
     )
-    client = redis.Redis(
+    client = redis_asyncio.Redis(
         host=creds["host"],
         port=creds["port"],
         password=creds.get("password") or None,
@@ -65,11 +70,11 @@ class RedisStore:
     def __init__(self, client=None):
         self._r = client or get_redis()
 
-    def set_income_profile(
+    async def set_income_profile(
         self, applicant_id: str, profile: dict, ttl: Optional[int] = None
     ) -> bool:
         try:
-            self._r.setex(
+            await self._r.setex(
                 f"income:{applicant_id}",
                 ttl or self.TTL_INCOME_PROFILE,
                 json.dumps(profile, default=str),
@@ -79,19 +84,19 @@ class RedisStore:
             logger.warning("redis_set_income_failed", extra={"error": str(e)})
             return False
 
-    def get_income_profile(self, applicant_id: str) -> Optional[dict]:
+    async def get_income_profile(self, applicant_id: str) -> Optional[dict]:
         try:
-            raw = self._r.get(f"income:{applicant_id}")
+            raw = await self._r.get(f"income:{applicant_id}")
             return json.loads(raw) if raw else None
         except Exception as e:
             logger.warning("redis_get_income_failed", extra={"error": str(e)})
             return None
 
-    def set_credit_profile(
+    async def set_credit_profile(
         self, applicant_id: str, profile: dict, ttl: Optional[int] = None
     ) -> bool:
         try:
-            self._r.setex(
+            await self._r.setex(
                 f"credit:{applicant_id}",
                 ttl or self.TTL_CREDIT_PROFILE,
                 json.dumps(profile, default=str),
@@ -101,31 +106,31 @@ class RedisStore:
             logger.warning("redis_set_credit_failed", extra={"error": str(e)})
             return False
 
-    def get_credit_profile(self, applicant_id: str) -> Optional[dict]:
+    async def get_credit_profile(self, applicant_id: str) -> Optional[dict]:
         try:
-            raw = self._r.get(f"credit:{applicant_id}")
+            raw = await self._r.get(f"credit:{applicant_id}")
             return json.loads(raw) if raw else None
         except Exception as e:
             logger.warning("redis_get_credit_failed", extra={"error": str(e)})
             return None
 
-    def set_status(self, applicant_id: str, status: str):
+    async def set_status(self, applicant_id: str, status: str):
         try:
-            self._r.setex(
+            await self._r.setex(
                 f"status:{applicant_id}", self.TTL_GOLDEN_STATUS, status
             )
         except Exception as e:
             logger.warning("redis_set_status_failed", extra={"error": str(e)})
 
-    def get_status(self, applicant_id: str) -> Optional[str]:
+    async def get_status(self, applicant_id: str) -> Optional[str]:
         try:
-            return self._r.get(f"status:{applicant_id}")
+            return await self._r.get(f"status:{applicant_id}")
         except Exception:
             return None
 
-    def set_app_lookup(self, los_id: str, data: dict):
+    async def set_app_lookup(self, los_id: str, data: dict):
         try:
-            self._r.setex(
+            await self._r.setex(
                 f"app_los:{los_id}",
                 self.TTL_APP_LOOKUP,
                 json.dumps(data, default=str),
@@ -133,20 +138,20 @@ class RedisStore:
         except Exception as e:
             logger.warning("redis_set_app_failed", extra={"error": str(e)})
 
-    def get_app_lookup(self, los_id: str) -> Optional[dict]:
+    async def get_app_lookup(self, los_id: str) -> Optional[dict]:
         try:
-            raw = self._r.get(f"app_los:{los_id}")
+            raw = await self._r.get(f"app_los:{los_id}")
             return json.loads(raw) if raw else None
         except Exception:
             return None
 
-    def ping(self) -> bool:
+    async def ping(self) -> bool:
         try:
-            return bool(self._r.ping())
+            return bool(await self._r.ping())
         except Exception:
             return False
 
-    def key_state(self, key: str) -> dict:
+    async def key_state(self, key: str) -> dict:
         """Return ``{"present": bool, "ttl_seconds": int|None}`` for a key.
 
         ``ttl_seconds`` is ``None`` when the key has no expiry (TTL=-1) or
@@ -154,7 +159,7 @@ class RedisStore:
         endpoints to surface every cache key with its remaining lifetime.
         """
         try:
-            ttl = int(self._r.ttl(key))
+            ttl = int(await self._r.ttl(key))
         except Exception as e:
             logger.warning("redis_ttl_failed", extra={"error": str(e)})
             return {"present": False, "ttl_seconds": None}
@@ -173,7 +178,7 @@ class RedisStore:
 
     _LOCK_TTL_SECONDS = 30
 
-    def try_acquire_assembly_lock(
+    async def try_acquire_assembly_lock(
         self, applicant_id: str, ttl: Optional[int] = None
     ) -> bool:
         """Attempt to acquire the per-applicant assembly lock.
@@ -186,40 +191,42 @@ class RedisStore:
         key = f"assembly_lock:{applicant_id}"
         try:
             return bool(
-                self._r.set(key, "1", nx=True, ex=ttl or self._LOCK_TTL_SECONDS)
+                await self._r.set(
+                    key, "1", nx=True, ex=ttl or self._LOCK_TTL_SECONDS
+                )
             )
         except Exception as e:
             logger.warning("redis_lock_acquire_failed", extra={"error": str(e)})
             return False
 
-    def release_assembly_lock(self, applicant_id: str) -> None:
+    async def release_assembly_lock(self, applicant_id: str) -> None:
         """Drop the lock so the next request can acquire it."""
         key = f"assembly_lock:{applicant_id}"
         try:
-            self._r.delete(key)
+            await self._r.delete(key)
         except Exception as e:
             logger.warning("redis_lock_release_failed", extra={"error": str(e)})
 
     # ---------------- document knowledge graph -----------------
 
-    def invalidate_income_profile(self, applicant_id: str) -> None:
+    async def invalidate_income_profile(self, applicant_id: str) -> None:
         """Drop income + graph caches for an applicant — call after a
         reconciler conflict so the next read recomputes."""
         try:
-            self._r.delete(f"income:{applicant_id}")
-            self._r.delete(f"graph:{applicant_id}")
+            await self._r.delete(f"income:{applicant_id}")
+            await self._r.delete(f"graph:{applicant_id}")
         except Exception as e:
             logger.warning("redis_invalidate_failed", extra={"error": str(e)})
 
-    def invalidate_graph_summary(self, applicant_id: str) -> None:
+    async def invalidate_graph_summary(self, applicant_id: str) -> None:
         try:
-            self._r.delete(f"graph:{applicant_id}")
+            await self._r.delete(f"graph:{applicant_id}")
         except Exception as e:
             logger.warning("redis_invalidate_graph_failed", extra={"error": str(e)})
 
-    def set_graph_summary(self, applicant_id: str, summary: dict) -> bool:
+    async def set_graph_summary(self, applicant_id: str, summary: dict) -> bool:
         try:
-            self._r.setex(
+            await self._r.setex(
                 f"graph:{applicant_id}",
                 self.TTL_GRAPH_SUMMARY,
                 json.dumps(summary, default=str),
@@ -229,20 +236,20 @@ class RedisStore:
             logger.warning("redis_set_graph_failed", extra={"error": str(e)})
             return False
 
-    def get_graph_summary(self, applicant_id: str) -> Optional[dict]:
+    async def get_graph_summary(self, applicant_id: str) -> Optional[dict]:
         try:
-            raw = self._r.get(f"graph:{applicant_id}")
+            raw = await self._r.get(f"graph:{applicant_id}")
             return json.loads(raw) if raw else None
         except Exception:
             return None
 
     # ---------------- property profiles (Phase B) -----------------
 
-    def set_property_profile(
+    async def set_property_profile(
         self, property_id: str, profile: dict, ttl: Optional[int] = None
     ) -> bool:
         try:
-            self._r.setex(
+            await self._r.setex(
                 f"property:{property_id}",
                 ttl or self.TTL_PROPERTY_PROFILE,
                 json.dumps(profile, default=str),
@@ -252,33 +259,33 @@ class RedisStore:
             logger.warning("redis_set_property_failed", extra={"error": str(e)})
             return False
 
-    def get_property_profile(self, property_id: str) -> Optional[dict]:
+    async def get_property_profile(self, property_id: str) -> Optional[dict]:
         try:
-            raw = self._r.get(f"property:{property_id}")
+            raw = await self._r.get(f"property:{property_id}")
             return json.loads(raw) if raw else None
         except Exception as e:
             logger.warning("redis_get_property_failed", extra={"error": str(e)})
             return None
 
-    def invalidate_property_profile(self, property_id: str) -> None:
+    async def invalidate_property_profile(self, property_id: str) -> None:
         try:
-            self._r.delete(f"property:{property_id}")
+            await self._r.delete(f"property:{property_id}")
         except Exception as e:
             logger.warning(
                 "redis_invalidate_property_failed", extra={"error": str(e)}
             )
 
-    def invalidate_application_context(self, application_id: str) -> None:
+    async def invalidate_application_context(self, application_id: str) -> None:
         """Backwards-compatible alias for :meth:`invalidate_context`."""
-        self.invalidate_context(application_id)
+        await self.invalidate_context(application_id)
 
     # ---------------- application context (Phase C) -----------------
 
-    def set_application_context(
+    async def set_application_context(
         self, application_id: str, ctx: dict, ttl: Optional[int] = None
     ) -> bool:
         try:
-            self._r.setex(
+            await self._r.setex(
                 f"context:{application_id}",
                 ttl or self.TTL_APPLICATION_CONTEXT,
                 json.dumps(ctx, default=str),
@@ -288,18 +295,18 @@ class RedisStore:
             logger.warning("redis_set_context_failed", extra={"error": str(e)})
             return False
 
-    def get_application_context(self, application_id: str) -> Optional[dict]:
+    async def get_application_context(self, application_id: str) -> Optional[dict]:
         try:
-            raw = self._r.get(f"context:{application_id}")
+            raw = await self._r.get(f"context:{application_id}")
             return json.loads(raw) if raw else None
         except Exception as e:
             logger.warning("redis_get_context_failed", extra={"error": str(e)})
             return None
 
-    def invalidate_context(self, application_id: str) -> None:
+    async def invalidate_context(self, application_id: str) -> None:
         """Drop the cached application context so the next read recomputes."""
         try:
-            self._r.delete(f"context:{application_id}")
+            await self._r.delete(f"context:{application_id}")
         except Exception as e:
             logger.warning(
                 "redis_invalidate_context_failed", extra={"error": str(e)}

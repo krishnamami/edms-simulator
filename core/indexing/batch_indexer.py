@@ -314,7 +314,7 @@ class BatchIndexer:
 
         if property_touched and app.get("property_id"):
             try:
-                self.redis.invalidate_property_profile(app["property_id"])
+                await self.redis.invalidate_property_profile(app["property_id"])
                 logger.info(
                     "batch_index_property_invalidated",
                     extra={"property_id": app["property_id"]},
@@ -326,7 +326,7 @@ class BatchIndexer:
                 )
 
         try:
-            self.redis.invalidate_context(application_id)
+            await self.redis.invalidate_context(application_id)
         except Exception as exc:
             logger.warning(
                 "batch_index_invalidate_context_failed",

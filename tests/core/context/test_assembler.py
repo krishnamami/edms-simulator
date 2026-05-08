@@ -321,7 +321,7 @@ async def test_context_cached_in_redis(postgres_store, redis_store):
     assembler = ContextAssembler(postgres_store, redis_store)
     await assembler.assemble("APP-1")
 
-    cached = redis_store.get_application_context("APP-1")
+    cached = await redis_store.get_application_context("APP-1")
     assert cached is not None
     assert cached["application_id"] == "APP-1"
 
@@ -336,7 +336,7 @@ async def test_context_invalidated_after_income_update(
 
     assembler = ContextAssembler(postgres_store, redis_store)
     await assembler.assemble("APP-1")
-    assert redis_store.get_application_context("APP-1") is not None
+    assert await redis_store.get_application_context("APP-1") is not None
 
-    redis_store.invalidate_context("APP-1")
-    assert redis_store.get_application_context("APP-1") is None
+    await redis_store.invalidate_context("APP-1")
+    assert await redis_store.get_application_context("APP-1") is None

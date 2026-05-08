@@ -161,7 +161,7 @@ async def smoke_inproc():
     )
 
     # 2: applicant lookup by los_id resolves
-    cached = redis.get_app_lookup("LOS-S001")
+    cached = await redis.get_app_lookup("LOS-S001")
     check(
         "GET /loan/{los_id}/applicant-id resolves correctly",
         cached and cached["applicant_id"] == r1["applicant_id"],
@@ -223,7 +223,7 @@ async def smoke_inproc():
 
     # 7-8: health + ready (in-proc proxies)
     check("/health -> ok", True)
-    check("/ready -> postgres + redis ok", redis.ping())
+    check("/ready -> postgres + redis ok", await redis.ping())
 
 
 async def smoke_api():

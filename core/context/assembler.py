@@ -53,7 +53,7 @@ class ContextAssembler:
         # IncomeProfile is stored once under the primary applicant_id but
         # carries both ``primary_borrower`` and ``co_borrower`` sections.
         # Fetch once, route by role.
-        primary_income = self.redis.get_income_profile(applicant_id) \
+        primary_income = await self.redis.get_income_profile(applicant_id) \
             or await self.pg.get_income_profile(applicant_id)
 
         primary = await self._build_borrower_snapshot(
@@ -153,7 +153,7 @@ class ContextAssembler:
             requires_review=requires_review,
         )
 
-        self.redis.set_application_context(application_id, ctx.model_dump())
+        await self.redis.set_application_context(application_id, ctx.model_dump())
 
         # Phase E — snapshot every assembly into context_versions for audit.
         try:
@@ -209,12 +209,12 @@ class ContextAssembler:
         # passes the primary's profile via ``primary_income``.
         income = primary_income
         if income is None:
-            income = self.redis.get_income_profile(applicant_id)
+            income = await self.redis.get_income_profile(applicant_id)
             if not income:
                 income = await self.pg.get_income_profile(applicant_id)
 
         # Credit profile is rowed per applicant_id, so look it up directly.
-        credit = self.redis.get_credit_profile(applicant_id)
+        credit = await self.redis.get_credit_profile(applicant_id)
         if not credit:
             credit = await self.pg.get_credit_profile(applicant_id)
 
@@ -267,7 +267,7 @@ class ContextAssembler:
     async def _build_property_snapshot(
         self, property_id: str, app: dict
     ) -> Optional[PropertySnapshot]:
-        cached = self.redis.get_property_profile(property_id)
+        cached = await self.redis.get_property_profile(property_id)
         if not cached:
             cached = await self.pg.get_property_profile(property_id)
         if not cached:

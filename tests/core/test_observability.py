@@ -156,7 +156,7 @@ async def test_pipeline_state_includes_redis_keys_for_active_keys(
 ):
     await _seed_basic(postgres_store)
     # Warm a redis key
-    redis_store.set_income_profile("APL-OBS", {"qualifying_monthly": 7700})
+    await redis_store.set_income_profile("APL-OBS", {"qualifying_monthly": 7700})
 
     client = TestClient(app_seeded)
     resp = client.get(

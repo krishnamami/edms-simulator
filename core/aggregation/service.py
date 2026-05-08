@@ -164,8 +164,8 @@ class AggregationService:
         ):
             primary_gr.status = GoldenRecordStatus.ACTIVE
             self.golden_record_store.save(primary_gr)
-        self.redis_store.set_status(primary_gr.applicant_id, "active")
-        self.redis_store.set_app_lookup(
+        await self.redis_store.set_status(primary_gr.applicant_id, "active")
+        await self.redis_store.set_app_lookup(
             los_id,
             {
                 "application_id": application_id,
@@ -210,7 +210,7 @@ class AggregationService:
                 gr.status, GoldenRecordStatus.STALE
             )
             self.golden_record_store.save(gr)
-            self.redis_store.set_status(applicant_id, "stale")
+            await self.redis_store.set_status(applicant_id, "stale")
 
         # Hydrate the application context so single-doc uploads still see the
         # full borrower picture. Without this:
@@ -252,13 +252,13 @@ class AggregationService:
         # / credit profiles we just wrote are otherwise hidden behind the
         # 30-min context TTL.
         if application_id:
-            self.redis_store.invalidate_context(application_id)
+            await self.redis_store.invalidate_context(application_id)
 
         gr.status = StatusMachine.transition(
             GoldenRecordStatus.STALE, GoldenRecordStatus.ACTIVE
         )
         self.golden_record_store.save(gr)
-        self.redis_store.set_status(applicant_id, "active")
+        await self.redis_store.set_status(applicant_id, "active")
 
         self._publish(
             {
@@ -281,7 +281,7 @@ class AggregationService:
         ):
             gr.status = GoldenRecordStatus.ACTIVE
             self.golden_record_store.save(gr)
-            self.redis_store.set_status(applicant_id, "active")
+            await self.redis_store.set_status(applicant_id, "active")
         return {"applicant_id": applicant_id, "status": "active"}
 
     async def _run_assembly(
@@ -312,13 +312,13 @@ class AggregationService:
         # have been computed from an incomplete doc set. Lock keys on
         # applicant_id (not application_id) so co-borrower-only uploads
         # filed under the primary's applicant_id still serialize.
-        if not self.redis_store.try_acquire_assembly_lock(applicant_id):
+        if not await self.redis_store.try_acquire_assembly_lock(applicant_id):
             # Brief wait + one retry. If another assembly is running for
             # this applicant it'll re-read the full doc set from PG
             # (now including the docs we persisted above) and compute
             # the right answer — so giving up is safe.
             await asyncio.sleep(0.5)
-            if not self.redis_store.try_acquire_assembly_lock(applicant_id):
+            if not await self.redis_store.try_acquire_assembly_lock(applicant_id):
                 logger.warning(
                     "assembly_lock_contention",
                     applicant_id=applicant_id,
@@ -421,18 +421,18 @@ class AggregationService:
                     applicant_id
                 )
                 if app:
-                    self.redis_store.invalidate_context(app["application_id"])
+                    await self.redis_store.invalidate_context(app["application_id"])
                 elif application_id:
-                    self.redis_store.invalidate_context(application_id)
+                    await self.redis_store.invalidate_context(application_id)
             except Exception as exc:
                 logger.warning("invalidate_context_failed", error=str(exc))
 
-            self.redis_store.set_income_profile(applicant_id, profile.model_dump())
-            self.redis_store.set_credit_profile(applicant_id, primary_credit)
+            await self.redis_store.set_income_profile(applicant_id, profile.model_dump())
+            await self.redis_store.set_credit_profile(applicant_id, primary_credit)
             if co_credit:
-                self.redis_store.set_credit_profile(co_applicant_id, co_credit)
+                await self.redis_store.set_credit_profile(co_applicant_id, co_credit)
         finally:
-            self.redis_store.release_assembly_lock(applicant_id)
+            await self.redis_store.release_assembly_lock(applicant_id)
 
     async def _merge_request_with_indexed_docs(
         self,
@@ -619,16 +619,16 @@ class AggregationService:
                     conflict_count=len(conflicts),
                     conflicts=[r.reasoning for r in conflicts],
                 )
-                self.redis_store.invalidate_income_profile(doc_applicant)
+                await self.redis_store.invalidate_income_profile(doc_applicant)
 
         # Always bust the graph cache after persisting docs — even without
         # conflicts. Otherwise /graph/summary keeps returning a stale
         # document_count from before the inserts. Use a graph-only invalidate
         # so we don't blow away the income/credit caches _run_assembly just
         # warmed (invalidate_income_profile would clobber them).
-        self.redis_store.invalidate_graph_summary(applicant_id)
+        await self.redis_store.invalidate_graph_summary(applicant_id)
         if co_applicant_id:
-            self.redis_store.invalidate_graph_summary(co_applicant_id)
+            await self.redis_store.invalidate_graph_summary(co_applicant_id)
 
     async def _handle_property_document_uploaded(self, event) -> dict:
         """Re-assemble a PropertyProfile after a new property doc lands.
@@ -676,9 +676,9 @@ class AggregationService:
         profile_dict = profile.model_dump()
 
         await self.postgres_store.save_property_profile(profile_dict)
-        self.redis_store.set_property_profile(property_id, profile_dict)
+        await self.redis_store.set_property_profile(property_id, profile_dict)
         if application_id:
-            self.redis_store.invalidate_context(application_id)
+            await self.redis_store.invalidate_context(application_id)
 
         piti_total = (profile.piti_components.total_piti
                       if profile.piti_components else None)

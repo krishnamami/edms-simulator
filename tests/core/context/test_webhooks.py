@@ -220,7 +220,7 @@ async def test_context_at_timestamp(postgres_store, redis_store):
     inc = postgres_store.income_profiles["APL-WH"]
     inc["primary_borrower"]["qualifying_monthly"] = 12_000
     inc["combined_qualifying_monthly"] = 12_000
-    redis_store.invalidate_context("APP-WH")
+    await redis_store.invalidate_context("APP-WH")
     ctx2 = await assembler.assemble("APP-WH", trigger_event="t2")
     postgres_store.context_versions[-1]["assembled_at"] = "2026-05-01T10:00:00"
 
