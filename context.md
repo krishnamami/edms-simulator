@@ -42,6 +42,7 @@ Redis port is **6380**.
 - **`extraction_method` per-doc provenance.** Every `document_index` row carries one of `deterministic` / `caller_supplied` / `ai_vision` / `none`. `save_document` enforces the priority `deterministic > caller_supplied > ai_vision > none` on the upsert via SQL `CASE` so a doc upserted by the indexer with `deterministic` correctly upgrades from a prior `caller_supplied`, and a later AI-Vision pass doesn't downgrade. `/applicant/{id}/field/{name}` surfaces the method on every response; `/applicant/{id}/graph/summary` exposes an `extraction_breakdown: {bucket: count}` for ops visibility.
 - **LTV / PITI / DTI now compute when loan terms are present.** `_handle_application_submitted` writes `loan_amount` / `interest_rate` / `loan_term_months` to the `applications` row from the `/loans` payload (was being silently dropped — root cause of `dti_calculable` / `ltv_calculable` being permanently false). `ContextAssembler` falls back through `loan_terms` (URLA / RATE_LOCK) → `app` for the effective values; LTV uses `loan_amount / min(appraised, purchase_price) × 100`; PITI computed inline via amortization when `PropertyAssembler.piti_total` is null. New `title_clear` logic: true when both `TITLE_COMMITMENT` AND `TITLE_INSURANCE` are received.
 - **Reconciler cross-applicant allow-list.** New `_CROSS_APPLICANT_PAIRS` frozenset in `core/graph/reconciler.py` — only same-type W2 / paystub pairs (whose only field tuple is `tax_year`) are allowed to compare across borrowers; everything else silently skips. Killed 6 false-positive contradicts edges (primary's IRS wages vs co-borrower's W2 wages). Synthetic-load contradicts dropped 13 → 5; all remaining edges are same-applicant (verified by direct PG query).
+- **Chaos-tested for unparseable input.** `scripts/feed_chaos_loans.py` (now tracked) drives 5 scenarios — self-employed, co-borrower, property disaster, data-quality chaos (`box1_wages="one hundred ten thousand"`), stale/expired — with **deterministic 69/69-uploads-succeeded result, VERDICT: ROBUST — no crashes, no upload failures.** API boundary now uses `Optional[Any]` on every numeric/bool field in `DocumentSchema` so unparseable values land in `document_index` instead of being 422'd into the void; `core/income/rules.py` has a new `_f()` helper that NEVER raises (handles None, bool, currency strings, AND unparseable like `"one hundred ten thousand"` → returns `0.0`). The bad field is silently skipped by the assembler; the doc is still tracked, counted in completeness, and visible in the graph.
 - **Every doc type a real loan file carries is now indexed, cached, and tracked.** `MISMO_TO_INTERNAL` + new `DOC_TYPE_ALIASES` canonicalize caller-supplied names (`DRIVERS_LICENSE` → `IDENTITY_DL`, `FORM_1040` → `TAX_RETURN_1040_CURRENT`); `_CATEGORY_MAP` renamed `compliance` → `vendor` and `loan` → `loan_terms` to align with the missing-documents catalog. Two new entity Redis caches: `asset:{applicant_id}` (4h TTL — total_liquid_assets / total_retirement / gift_funds / asset_doc_count) and `identity:{applicant_id}` (24h TTL — dl_verified / ssn_verified / ofac_clear / identity_complete). Both are write-through from `_run_assembly`. The missing-documents catalog now carries 15 required slots (with `alternates` for W2_CURRENT∥W2_PRIOR / AUS_DU∥LP / HOI_BINDER∥HOI_DECLARATIONS) + 9 conditional slots (each with the `reason` clause that triggers it) + `total_expected` / `total_received` / `completeness_pct`.
 - **23 doc-type extractors in the indexer dispatch.** 8 original (W2 / paystub / bank / credit / appraisal / HOI / flood / tax) + 15 new (`income_extractors.py`: IRS / 1040 / Schedule C / Schedule E / 1099 / K-1; `asset_extractors.py`: retirement / brokerage / gift_letter; extended `property/extractors.py`: AVM / 1004MC / purchase_agreement; `loan_extractors.py`: URLA_1003 / rate_lock / offer_letter). All share `_utils.py` helpers (`safe_text`, `money_to_float`, `find_labeled` / `find_money` / `find_int`, `fraction_populated`). Every extractor honours the contract: `({}, 0.5)` on any failure, `base_conf × fraction_populated` on success. 38 dispatch entries cover canonical + alias names. Confidence ceilings: IRS=0.99, URLA=0.95, 1099=0.93, K-1/Schedule C/E/1040/property tax=0.90, retirement/brokerage=0.92, AVM=0.87, gift_letter=0.88, offer_letter=0.82.
 - **Tier-2 cross-doc graph.** `COMPARISON_MAP` extended with new field tuples on existing entries (`box1_wages↔wages_salaries`, `wages_line1`, `avm_value`, `ending_balance`, `schedule_c_income / e_income`, `nonemployee_compensation↔other_income`) and 7 entirely new pairs (URLA↔W2, URLA↔purchase, RATE_LOCK↔URLA, OFFER↔W2/paystub/VOE, K1↔1040, 1004MC↔appraisal, retirement self-pair). New logical field `monthly_income_stated_annual` annualizes URLA monthly stated income before W2 comparison. Per-pair `FIELD_CONFLICT_THRESHOLDS` for the new pairs (URLA stated income 10%, OFFER 15%, RATE_LOCK 5%, 1004MC 20%).
@@ -65,6 +66,8 @@ Redis port is **6380**.
 Latest commits (top of `main`):
 
 ```
+49efe02  fix(api,income): accept any JSON value for extracted_fields + None/string-tolerant income coercion
+4f3e7df  docs: refresh context.md + PRD with session 9's Tier-2 polish (false contradicts / extraction tracking / LTV+DTI+title)
 67ed00f  fix(context): wire LTV, PITI/DTI computation + title_clear so 3 readiness flags fire
 7b7681f  feat(extraction): track extraction_method per document — deterministic / caller_supplied / ai_vision / none
 074b772  fix(reconciler): cross-applicant comparison allow-list — kill primary↔co-borrower false contradicts
@@ -385,6 +388,65 @@ Errors:
   past the highest stored id; SSN + source-id indexes rebuilt.
 - ✅ **Phase A schema applied to RDS prod**. `raw_ingestion` table + 4 indexes
   live; verified via `scripts/watch_pipeline.py --live`.
+
+### Resolved this session (chaos hardening — accept any JSON value, never crash on bad input)
+
+One commit (`49efe02`). Theme: prove the indexing pipeline survives
+real-world LOS exports where field values arrive as
+`box1_wages="one hundred ten thousand"`, accept the document, and let
+downstream gracefully skip the unparseable field.
+
+- ✅ **`api/schemas.py` — `Optional[Any]` on every numeric/bool field.**
+  `DocumentSchema` had `Optional[float]` / `Optional[int]` /
+  `Optional[bool]` on `box1_wages`, `monthly_benefit`, `balance`,
+  `tax_year`, etc. Pydantic 422'd unparseable values like
+  `"one hundred ten thousand"`, silently dropping the entire document
+  (no `document_index` row, no graph node, no completeness credit).
+  Strictly worse than accepting it. Relaxed all numeric/bool fields
+  to `Optional[Any]` so the API boundary accepts whatever JSON value
+  came in. The doc still lands in `document_index` with the raw
+  value; assemblers downstream best-effort coerce.
+
+- ✅ **`core/income/rules.py` — new `_f()` helper that NEVER raises.**
+  Once the API started accepting unparseable strings, downstream
+  `float(d.get(k) or 0)` raised `ValueError` (500 Internal Server
+  Error). The earlier `or 0` fix only handled `None` — strings that
+  can't be coerced still raised. New module-level `_f()` tolerates
+  None, bool, currency strings (`"$92,400.00"`, `"92,400"`), AND
+  unparseable values (`"one hundred ten thousand"`) — returns
+  `0.0` for the latter. Replaced all 11 `float(d.get(k) or 0)`
+  patterns with `_f(d.get(k))`. The bad field is silently skipped;
+  the doc is still tracked, counted in completeness, and visible in
+  the graph.
+
+- ✅ **Chaos test infrastructure now tracked in git.**
+  `scripts/feed_chaos_loans.py` (5 scenarios: self-employed,
+  co-borrower, property disaster, data-quality chaos, stale/expired)
+  + `scripts/generate_chaos_loans.py` + `scripts/chaos_loan_files/`
+  (5 manifests + 73 synthetic PDFs). The data-quality scenario is
+  the one that triggered both fixes. `feed_chaos_loans.py` also
+  carries a script-side fix: `check_component()` now auto-unwraps
+  the standard `{"source": ..., "data": {...}}` envelope so the
+  check lambdas don't have to know about it (same response-shape
+  parsing bug that bit `stress_test_indexing.py` earlier).
+
+- ⚠️ **Same response-shape parsing bug class keeps showing up.** The
+  chaos test had it; `stress_test_indexing.py` had it (commit
+  `5361e8b`); the user-facing /context endpoint exposes the
+  envelope. A general httpx-style helper that auto-unwraps the
+  envelope would prevent the next test script from hitting it
+  again. Logged as a follow-up.
+
+Live verification (3 deterministic runs of `feed_chaos_loans.py`):
+  Before: 1 422 (W2 with unparseable wages) + 4 scenarios DEGRADED
+          on context/graph (script-side parse bug). VERDICT: RESILIENT.
+  After:  **69/69 uploads succeed, 0 failed. All 5 scenarios report
+          5–6 SURVIVED out of 7 components. VERDICT: ROBUST — no
+          crashes, no upload failures.**
+
+Regression checks all green: `pytest 329 passed`, `simulate_local`
+unchanged, `feed_synthetic_loan.py` OVERALL PASS 16/16 18/19 flags,
+`stress_test_indexing.py` 23/23.
 
 ### Resolved this session (Tier-2 polish — false contradicts, extraction tracking, LTV/DTI/title)
 
