@@ -762,6 +762,12 @@ class AggregationService:
                     len(extracted_fields) if isinstance(extracted_fields, dict) else 0
                 ),
             )
+            # Always pass the cross-applicant docs through. The
+            # reconciler's _CROSS_APPLICANT_PAIRS allow-list (in
+            # core/graph/reconciler.py) controls which doc-type pairs
+            # are allowed to compare across borrowers; everything else
+            # is silently skipped when the two docs belong to
+            # different applicant_ids.
             also_compare_with = (
                 other_docs_for_co if doc_applicant == co_applicant_id
                 else other_docs_for_primary

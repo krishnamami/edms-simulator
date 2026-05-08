@@ -374,6 +374,26 @@ FIELD_CONFLICT_THRESHOLDS: dict[tuple, float] = {
 }
 
 
+# Cross-applicant comparison allow-list. By default the reconciler
+# skips any pair where the two docs belong to different
+# ``applicant_id``s (a primary-vs-co-borrower pair) — most COMPARISON_MAP
+# entries describe per-borrower data (W2 wages, IRS wages, URLA stated
+# income) and a cross-borrower comparison would compare apples to
+# oranges (primary's $125k IRS against co-borrower's $85k W2 = false
+# contradicts). The pairs below are the *joint* comparisons that
+# legitimately fire across borrowers — currently just the same-type W2
+# pairs (whose only field tuple in COMPARISON_MAP is ``tax_year``, so
+# the comparison surfaces calendar-year mismatches across the joint
+# application without dragging individual wages into it).
+#
+# Each entry is a frozenset of two doc_type strings. Order-independent.
+_CROSS_APPLICANT_PAIRS: set[frozenset[str]] = {
+    frozenset({"W2_CURRENT", "W2_CURRENT"}),
+    frozenset({"W2_PRIOR",   "W2_PRIOR"}),
+    frozenset({"PAYSTUB_CURRENT", "PAYSTUB_CURRENT"}),
+}
+
+
 class DocumentReconciler:
     def __init__(self, postgres_store):
         self.postgres_store = postgres_store
@@ -400,8 +420,22 @@ class DocumentReconciler:
             seen.add(doc_id)
             unique.append(d)
 
+        new_aid = new_doc.get("applicant_id") or applicant_id
+        new_type = new_doc.get("document_type") or ""
         relationships: list[DocumentRelationship] = []
         for existing_doc in unique:
+            other_aid = existing_doc.get("applicant_id")
+            if other_aid and other_aid != new_aid:
+                # Cross-applicant pair — only allowed for joint
+                # comparisons in _CROSS_APPLICANT_PAIRS. Otherwise
+                # we'd compare e.g. primary's IRS wages against
+                # co-borrower's W2 wages and emit a false-positive
+                # contradicts edge for two different people.
+                pair = frozenset({
+                    new_type, existing_doc.get("document_type") or "",
+                })
+                if pair not in _CROSS_APPLICANT_PAIRS:
+                    continue
             relationships.extend(self._compare_pair(applicant_id, new_doc, existing_doc))
         for rel in relationships:
             await self.postgres_store.save_relationship(rel.model_dump())
