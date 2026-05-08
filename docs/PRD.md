@@ -39,8 +39,9 @@ parties.
 | Document generation | reportlab-rendered W2, paystub, bank statement, credit report; Pillow-rendered driver's license JPG; `package_generator` assembles full doc sets. |
 | Document extraction | PyMuPDF text extractor with type-detection + confidence scoring. Claude vision extractor stubbed for plug-in. |
 | Confidence ranking | `SOURCE_CONFIDENCE_RANKING` (IRS=0.99 … VERBAL=0.50). `ConfidenceResolver` picks the highest-confidence value across sources and flags >10% numeric divergence as a conflict. |
-| Caching | Redis (TTL-keyed) for status / income / credit / app-lookup. |
+| Caching | Redis (TTL-keyed, **fully async via `redis.asyncio`**) for status / income / credit / app-lookup / context / property / graph. |
 | Persistence | Aurora-Postgres (asyncpg pool). FK-safe write order, JSONB columns, idempotent upserts. |
+| Concurrency safety | Per-applicant assembly lock (`assembly_lock:{applicant_id}`, 30s TTL) serializes `_run_assembly` for the same applicant; bailed contenders persist their docs first so the holder's inner-merge picks them up. `BatchIndexer` processes distinct applicants in parallel under `Semaphore(10)`. Joint-application doc-merge fans out the primary + co-borrower PG fetches via `asyncio.gather`. |
 | API | FastAPI app, `X-API-Key` auth, `/health` + `/ready`, structured-log middleware, all `/ingest/*` and `/loans*` endpoints. |
 | Resilience | Anthropic upstream errors map to HTTP 502 with detail; email body fallback preserves attachment processing. |
 | Walkthrough | `scripts/simulate_local.py` runs all 7 ingestion-+aggregation steps end-to-end. |
@@ -95,8 +96,9 @@ parties.
 The simulator is considered "running correctly" when:
 
 1. `docker compose up -d postgres redis` brings both services healthy.
-2. `python -m pytest tests/ -q` reports `122 passed, 2 skipped` (live tests
-   skipped without API key) on a fresh checkout.
+2. `python -m pytest tests/ --ignore=tests/integration -q` reports
+   `271 passed, 2 skipped` (live tests skipped without API key) on a
+   fresh checkout. Integration + smoke add 11 more for `282 green`.
 3. `python scripts/simulate_local.py` exits 0 and produces:
    - 5 documents in `local_storage/demo/` (≈ 51 KB total)
    - HTTP 200 from `/ingest/pdf` for the W2 with `confidence=1.0`

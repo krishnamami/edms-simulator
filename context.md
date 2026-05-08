@@ -36,10 +36,13 @@ Redis port is **6380**.
 
 ## Repo state at end of last session
 
-- Branch: `main`, all committed (push pending). Origin: `https://github.com/krishnamami/edms-simulator`.
-- Tests: **245 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`).
-- `simulate_local.py` still runs end-to-end with exit 0; new `scripts/watch_pipeline.py --full` drives the complete mortgage scenario (borrower + property + AUS + context). New `scripts/simulate_s3_edms.py` exercises the incremental indexer.
-- **Production ECS service** still live + DB-backed at `http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com`. The Phases B → indexing changes have **not been deployed to prod yet** — only Phase 0/0.5/A are running there. Local docker-compose has every phase applied.
+- Branch: `main`, all committed and pushed to origin (`https://github.com/krishnamami/edms-simulator`). Last 6 commits = concurrency hardening + async Redis + parallel indexer.
+- Tests: **271 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`). +3 integration + 8 smoke = 282 green.
+- `simulate_local.py` STEPS 1-5 still PASS; STEP 6 has a known pre-existing failure in the identity resolver (returns `match_method='probabilistic'` where the script asserts `'deterministic'` for an SSN-hash match — applicant_id resolution itself is correct). `simulate_s3_edms.py` has a known pre-existing `TypeError` (`generate_paystub() got an unexpected keyword argument 'employee_address'`) — script-side signature drift, unrelated to indexer code. `watch_pipeline.py --full` runs to completion through all 10 steps.
+- **`RedisStore` is now fully async** — uses `redis.asyncio.Redis` (and `fakeredis.aioredis.FakeRedis` under tests). Every method `await`s its underlying client call, so no FastAPI request handler blocks the event loop on a Redis round-trip.
+- **`_run_assembly` is serialized per applicant** via a Redis SET-NX-EX advisory lock (`assembly_lock:{applicant_id}`, 30s crash-safety TTL). Concurrent uploads for the same applicant no longer race; bailed contenders persist their docs to PG before bailing so the holder's inner-merge picks them up.
+- **`BatchIndexer` processes applicants in parallel** under `asyncio.Semaphore(_MAX_CONCURRENT_APPLICANTS=10)`. Cap is intentional — the per-applicant lock guarantees correctness for the *same* applicant, the semaphore caps PG-pool pressure across *different* applicants.
+- **Production ECS service** still live + DB-backed at `http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com`. The Phases B → indexing changes — and now also the concurrency / async-Redis / parallel-indexer hardening — have **not been deployed to prod yet**. Only Phase 0/0.5/A are running there. Local docker-compose has every phase applied.
 - The pipeline now has three full layers in code:
   1. **Borrower** — universal ingestion + raw storage + identity + income/credit assembly + document graph
   2. **Property** — properties / property_profiles + URAR / HOI / flood / tax / title generators + extractors + PITI math
@@ -54,6 +57,13 @@ Redis port is **6380**.
 Latest commits (top of `main`):
 
 ```
+64c56b8  perf(indexing): parallelize per-applicant processing under a semaphore cap
+c9f74c9  perf(redis): switch RedisStore from sync redis.Redis to async redis.asyncio.Redis
+6d4a466  perf(aggregation): parallelize PG fetches in _merge_request_with_indexed_docs
+d79994e  fix(aggregation): per-applicant assembly lock to prevent race on concurrent uploads
+1d693d1  fix(indexing): skip docs already fully indexed by the event-driven path
+f055851  fix(aggregation): invalidate context cache before warming income/credit
+76bee1e  docs: refresh context.md with comprehensive indexing + cleanup of resolved follow-ups
 a6370f4  feat(index): comprehensive indexing + 25-pair graph + Encompass field mapping
 91c1964  fix(persist,context): one profile row per applicant; resilient context invalidation
 6b7c148  fix(api): DocumentSchema strips credit/appraisal fields at the boundary
@@ -81,9 +91,6 @@ ab4b547  fix(ops): apply_schema.py strips comments before splitting on ';'
 ab27bf5  fix(los): connectors must compute ssn_hash so applicants don't collide
 047aa6d  fix: hydrate XRefStore from Postgres at startup
 c5b142a  feat(mismo): Phase 0 — MISMO compatibility + LOS connectors + external IDs
-920a15e  fix: extract decision_os_api_key field from secret instead of injecting whole JSON
-2d7d548  fix: enable SSL for ElastiCache Redis in production
-60c4d68  fix(db): enable SSL on the asyncpg pool when USE_AWS_SECRETS=true
 ```
 
 (Earlier history — CFN bootstrap, Aurora→RDS pivot, CI fixes, original ingestion phases — preserved in `git log` from `123f5c5` back.)
@@ -360,6 +367,107 @@ Errors:
 - ✅ **Phase A schema applied to RDS prod**. `raw_ingestion` table + 4 indexes
   live; verified via `scripts/watch_pipeline.py --live`.
 
+### Resolved this session (concurrency hardening + async Redis + parallel indexer)
+
+Six commits, all on `main`, pushed to origin. Theme: under concurrent load the
+old code blocked the asyncio event loop on every Redis call, didn't serialize
+concurrent assemblies for the same applicant, and processed batch-indexer
+groups one at a time. All three are now fixed and verified live.
+
+- ✅ **Context cache invalidate moved before income/credit SETEX** (`f055851`).
+  The tail of `_run_assembly` used to do `set_income_profile` →
+  `set_credit_profile` → `invalidate_context` (with a bare `except: pass` on
+  the DELETE). If the DELETE failed, Redis ended up with fresh
+  `income:{aid}` + `credit:{aid}` sitting beside a stale
+  `context:{application_id}` blob still embedding the old income. Reordered
+  to `invalidate_context` (DELETE) → `set_income_profile` (SETEX) →
+  `set_credit_profile` (SETEX); failure is logged via structlog instead of
+  swallowed. Worst case is now "no context cache" (forces PG read-through)
+  instead of "stale cache with mixed-fresh data".
+
+- ✅ **BatchIndexer skips docs already fully indexed by the event-driven path**
+  (`1d693d1`). The pre-existing `skip_clobber` only fired when the extractor
+  returned empty fields. Now `_process_applicant` does the
+  `pg.get_document(doc_id)` lookup *before* `s3.get_raw` and short-circuits
+  with `batch_index_skip_already_indexed` when the row already has
+  `status='indexed'` and non-empty `extracted_fields` — i.e. the
+  `/documents/upload` or `/ingest/*` handler already processed it. New
+  `stats["skipped_already_indexed"]` distinguishes these from unknown-LOS
+  skips. `_process_applicant` now returns a counts dict
+  (`applicant_known`, `processed`, `skipped_already_indexed`) instead of a
+  bool. Verified live: second `/indexing/run` against the same file shows
+  `processed=0, skipped_already_indexed=1`, ~4× faster than the first run.
+
+- ✅ **Per-applicant assembly lock** (`d79994e`). Two near-simultaneous
+  `/documents/upload` calls for the same applicant each ran
+  `_merge_request_with_indexed_docs` and `_run_assembly` against their own
+  snapshot of `document_index`; the last `set_income_profile` to Redis won —
+  and could be the one computed from an incomplete doc set. Added
+  `RedisStore.try_acquire_assembly_lock(applicant_id)` /
+  `release_assembly_lock(applicant_id)` (SET NX EX with 30s crash-safety TTL,
+  plain DEL release). `_run_assembly` now (a) persists incoming docs to PG
+  *before* the lock attempt so contention-bailed requests don't drop their
+  data, (b) tries the lock with one 0.5s retry, (c) on still-contended,
+  logs `assembly_lock_contention` and returns (the holder's inner-merge
+  picks up our docs), (d) on acquire, re-reads the cumulative doc set from
+  PG inside the lock and wraps the rest in a try/finally that releases.
+  Verified live with 8 concurrent `/documents/upload` calls for the same
+  applicant: 8/8 docs landed in `document_index`, 7 assemblies completed
+  serially, 1 bailed on contention, and the final cached income profile
+  listed all 8 in `documents_used`.
+
+- ✅ **`_merge_request_with_indexed_docs` parallelized** (`6d4a466`). The
+  inner `_load(aid)` ran twice sequentially — primary then co-borrower —
+  doubling PG round-trips on every joint-application doc upload. `_load`
+  now returns the row list (no longer mutates a closure dict, returns `[]`
+  on `aid=None` or PG failure) so the two calls run concurrently via
+  `asyncio.gather`. The dict-build loop iterates `primary_rows + co_rows`
+  once afterward, preserving the existing primary-then-co ordering for
+  doc_id collisions.
+
+- ✅ **`RedisStore` is now async** (`c9f74c9`). The sync `redis.Redis`
+  client blocked the asyncio event loop on every `setex/get/del`,
+  serializing concurrent FastAPI request handling behind Redis round-trips
+  — the entire benefit of async was lost under load. `_create_client()`
+  now returns `redis.asyncio.Redis` (or `fakeredis.aioredis.FakeRedis` for
+  `USE_FAKE_REDIS=true`); every `RedisStore` method is `async def` and
+  `await`s the underlying client call, including the assembly-lock
+  helpers. `await` was added to **every** caller across
+  `core/aggregation/service.py`, `core/context/assembler.py`,
+  `core/indexing/batch_indexer.py`, `api/routes.py` (~25 sites including
+  the Phase F observability + context endpoints), and
+  `scripts/smoke_aggregation.py`. `tests/core/storage/test_redis_store.py`
+  rewritten as `@pytest.mark.asyncio` async tests; `await` added to redis
+  calls in five other test files. Drive-by: hoisted two duplicate
+  `key_state(f"context:...")` calls in pipeline-state into one `await`
+  (was 2 round-trips, now 1). Verified live: `/ready` returns
+  `redis: true` (real async ping); 20 concurrent income-profile reads
+  handle cleanly.
+
+- ✅ **`BatchIndexer` per-applicant loop parallelized** (`64c56b8`). The
+  serial `for los_id, docs in groups.items()` would have done 1500 serial
+  PG saves + 500 serial assemblies + 500 serial Redis writes for a
+  500-applicant batch. Replaced with `asyncio.gather` of `_process_with_sem`
+  tasks bounded by `asyncio.Semaphore(_MAX_CONCURRENT_APPLICANTS=10)`.
+  Each task wraps `_process_applicant` in a try/except and returns
+  `(los_id, result, exc)` so the gather itself never raises — exceptions
+  surface in the tuple and roll up into `stats["errors"]` exactly as
+  before. Stats accumulation runs post-gather, preserving the dict-return
+  shape from the previous "skip already indexed" change. The cap of 10 is
+  intentional: the per-applicant assembly lock guarantees correctness for
+  the *same* applicant; the semaphore caps how many *different* applicants
+  the indexer works on at once so a 500-applicant batch doesn't open 500
+  PG connections. Verified live with a 7-applicant batch: 6
+  `batch_index_processing_applicant` lines fired before any
+  `batch_index_doc_indexed` completion log — true parallel execution.
+
+Test count unchanged at 271 unit (no new tests this session — the assembly
+lock was verified by a manual 8-way concurrent stress test, and the
+indexer parallelism by inspecting log timestamp interleave on a 7-LOS
+batch). Existing tests cover the new contracts because the public
+behavior of `_run_assembly` and `BatchIndexer.run()` didn't change shape —
+only their internal execution timing.
+
 ### Resolved this session (comprehensive indexing + 25-pair graph + Encompass mapping)
 
 Commit `a6370f4`. Builds a complete attribute index for every meaningful mortgage doc type, expands the document graph to 25+ comparison pairs across income/employment/property/credit/asset/vendor layers, and adds a per-LOS field-ID translation layer.
@@ -404,9 +512,9 @@ Verified end-to-end against prod: `income:APL-00003-P qualifying_monthly: $12,38
 - ✅ **Incremental indexer** — watermark + S3Scanner + BatchIndexer + AsyncIOScheduler. `simulate_s3_edms.py` validates the skip-unchanged-applicant property.
 - ✅ **FakePostgresStore.save_document upserts on document_id** — caught by the indexer test where `_run_assembly` re-saves docs already persisted by the indexer; previously appended duplicates that production's `ON CONFLICT DO UPDATE` would have collapsed.
 
-### Production deploy of Phases B → indexer (NOT YET DEPLOYED)
+### Production deploy of Phases B → indexer + concurrency hardening (NOT YET DEPLOYED)
 
-The local docker-compose has every phase applied. Production ECS still runs Phase 0/0.5/A.
+The local docker-compose has every phase applied. Production ECS still runs Phase 0/0.5/A. The async-Redis + per-applicant lock + parallel-indexer commits from this session carry no schema or dependency changes (`redis.asyncio` ships in `redis-py >= 4.2` already in `requirements.txt`; `fakeredis` is dev-only), so they ride along with the Phase B → indexer deploy without adding prerequisites.
 
 1. **Apply schema deltas to prod RDS.** New tables since the last prod apply: `properties`, `property_profiles`, `webhooks`, `webhook_deliveries`, `context_versions`, `indexing_watermarks`, `indexing_runs`. Plus `applications.property_id` ALTER. Use the same `scripts/apply_schema.py` ECS one-off task pattern that landed Phase A.
 2. **Push image with `apscheduler` deps.** `requirements.txt` gained `APScheduler==3.10.4` + `pytz` + `tzdata` + `tzlocal`. Re-pin via `pip freeze` and rebuild before deploy.
