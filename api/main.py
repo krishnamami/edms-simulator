@@ -130,10 +130,18 @@ async def lifespan(app: FastAPI):
             from core.graph.incremental_builder import IncrementalGraphBuilder
             from core.graph.reconciler import DocumentReconciler
             from core.graph.snapshot_scheduler import SnapshotScheduler
-            from core.scheduler.engine import ScheduleEngine
+            from core.scheduler.engine import ScheduleEngine, _resolve_env_vars
 
             with open(cfg_path, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
+                raw_cfg = yaml.safe_load(f) or {}
+            # IMPORTANT: expand ``${VAR:-default}`` patterns BEFORE
+            # constructing the connector — otherwise the literal
+            # template string lands in S3EDMSConnector.source, which
+            # treats anything not starting with ``s3://`` as a local
+            # path and silently returns 0 docs. The engine separately
+            # resolves env vars when ``_load_config`` runs, but the
+            # connector is constructed here ahead of the engine.
+            cfg = _resolve_env_vars(raw_cfg)
             conn_cfg = (cfg.get("schedule", {}) or {}).get("connector", {}) or {}
             connector = S3EDMSConnector(
                 source=conn_cfg.get("source", "local_storage/s3_simulation"),
