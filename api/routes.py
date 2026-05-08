@@ -425,6 +425,108 @@ async def get_graph_watermark(request: Request):
     }
 
 
+# ---------------------------------------------------------------------------
+# Config-driven scheduler — status / manual trigger / hot-reload
+# ---------------------------------------------------------------------------
+
+
+def _require_engine(request: Request):
+    engine = getattr(request.app.state, "schedule_engine", None)
+    if engine is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Schedule engine not configured. Place "
+                "config/schedule.yaml on the container or set "
+                "SCHEDULE_CONFIG_PATH; ENABLE_SCHEDULE_ENGINE=true "
+                "additionally enables the polling loop."
+            ),
+        )
+    return engine
+
+
+@router.get(
+    "/scheduler/status",
+    dependencies=[Depends(verify_api_key)],
+    summary="Scheduler config + last-run / next-fire snapshot",
+    description=(
+        "Returns the parsed YAML config plus, for every build + "
+        "snapshot job, the last successful run time and the next "
+        "scheduled fire time (computed from the cron expression). "
+        "Returns 503 when no schedule.yaml has been loaded."
+    ),
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        503: {"description": "Schedule engine not configured."},
+    },
+)
+async def scheduler_status(request: Request):
+    engine = _require_engine(request)
+    out = engine.status()
+    out["loop_running"] = bool(getattr(request.app.state, "schedule_engine_task", None))
+    return out
+
+
+from pydantic import BaseModel as _BaseModel, Field as _Field  # noqa: E402
+
+class _SchedulerTriggerBody(_BaseModel):
+    job: str = _Field(..., min_length=1, max_length=100,
+                      description="Job name from schedule.yaml (e.g. `morning_build`, `eod_snapshot`).")
+
+
+@router.post(
+    "/scheduler/trigger",
+    dependencies=[Depends(verify_api_key)],
+    summary="Manually fire a scheduled job",
+    description=(
+        "Bypasses the cron-due check and runs the named build or "
+        "snapshot immediately. Useful for ad-hoc backfills + smoke "
+        "testing the wiring without waiting on the next cron tick."
+    ),
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        404: {"description": "Job name not found in schedule.yaml."},
+        503: {"description": "Schedule engine not configured."},
+    },
+)
+async def scheduler_trigger(request: Request, body: _SchedulerTriggerBody):
+    engine = _require_engine(request)
+    result = await engine.trigger_job(body.job)
+    if isinstance(result, dict) and result.get("error", "").startswith("unknown job"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return {"job": body.job, "result": result}
+
+
+@router.post(
+    "/scheduler/reload",
+    dependencies=[Depends(verify_api_key)],
+    summary="Re-read schedule.yaml without restarting the container",
+    description=(
+        "Re-loads the YAML config in place. Returns the new status "
+        "block so the operator can confirm the new cron expressions / "
+        "feature flags landed. Existing in-flight jobs continue under "
+        "the old config; the next polling tick uses the reloaded one."
+    ),
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        503: {"description": "Schedule engine not configured."},
+    },
+)
+async def scheduler_reload(request: Request):
+    engine = _require_engine(request)
+    try:
+        engine.reload()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to reload schedule.yaml: {exc}",
+        )
+    out = engine.status()
+    out["loop_running"] = bool(getattr(request.app.state, "schedule_engine_task", None))
+    out["reloaded"]     = True
+    return out
+
+
 @router.get(
     "/applicant/{applicant_id}/income-profile",
     response_model=IncomeProfileResponse,

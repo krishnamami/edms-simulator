@@ -1,0 +1,56 @@
+# EDMS scheduler config — read at API startup by core.scheduler.engine.
+#
+# Two job kinds:
+#   - builds:    incremental graph builds; pull new docs from the EDMS
+#                connector, save_document, run reconciler + assembly,
+#                upsert entity_states + record graph_build_runs.
+#   - snapshots: copy live entity_states → entity_snapshots for EOD
+#                lineage replay.
+#
+# Each cron expression fires in the configured timezone. The engine
+# polls every poll_interval seconds; a job is "due" when the previous
+# cron fire happened within poll_interval AND the engine hasn't yet
+# recorded a run for that fire — so a 5-min poll catches every cron
+# tick exactly once.
+#
+# Env-var overrides:
+#   SCHEDULE_CONFIG_PATH=config/schedule.yaml  (this file)
+#   SCHEDULE_ENABLED=true|false                (overrides schedule.enabled)
+#   ENABLE_SCHEDULE_ENGINE=true|false          (gates the asyncio task
+#                                               itself — default false
+#                                               so unit tests don't
+#                                               accidentally spin one up)
+
+schedule:
+  timezone: "US/Eastern"
+  poll_interval: 300        # 5 minutes between cron checks
+
+  enabled: true             # master switch — false disables all scheduled runs
+  snapshot_enabled: true    # false skips snapshots but keeps builds running
+
+  builds:
+    - name: "morning_build"
+      cron: "0 9 * * *"     # 9:00 AM daily
+      description: "Morning pull — catches overnight doc arrivals"
+
+    - name: "afternoon_build"
+      cron: "0 14 * * *"    # 2:00 PM daily
+      description: "Afternoon pull — catches morning uploads"
+
+    - name: "evening_build"
+      cron: "0 17 * * *"    # 5:00 PM daily
+      description: "End of day pull — final catch before snapshot"
+
+  snapshots:
+    - name: "eod_snapshot"
+      cron: "0 18 * * *"    # 6:00 PM daily (after the last build)
+      description: "End of business day entity-state freeze"
+
+  connector:
+    type: "s3"                                   # s3 (local fs or s3://) — placeholder for future api/EDMS connector
+    source: "local_storage/s3_simulation"        # local path; flip to s3://edms-simulator-dev/s3_simulation in prod
+
+  builder:
+    max_docs_per_build: 500    # safety cap per build run (advisory; future use)
+    concurrent_entities: 10    # parallel entity processing (advisory; future use)
+    tenant_id: "default"

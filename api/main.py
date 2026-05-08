@@ -4,6 +4,7 @@ import os
 from contextlib import asynccontextmanager
 
 import structlog
+import yaml
 from fastapi import FastAPI
 
 structlog.configure(
@@ -110,6 +111,72 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             logging.warning("webhook_worker_start_failed: %s", exc)
 
+    # Config-driven cron scheduler — reads config/schedule.yaml +
+    # fires builds (IncrementalGraphBuilder) and snapshots
+    # (SnapshotScheduler) on cron. The ENGINE itself is always
+    # constructed when the YAML exists so /scheduler/status,
+    # /scheduler/trigger, /scheduler/reload all work in any
+    # deployment; the polling LOOP only spawns when
+    # ENABLE_SCHEDULE_ENGINE=true (prod) so unit tests + local dev
+    # never accidentally fire scheduled builds.
+    app.state.schedule_engine      = None
+    app.state.schedule_engine_task = None
+    cfg_path = os.getenv("SCHEDULE_CONFIG_PATH", "config/schedule.yaml")
+    if os.path.exists(cfg_path):
+        try:
+            import asyncio as _asyncio
+
+            from core.connectors.s3_connector import S3EDMSConnector
+            from core.graph.incremental_builder import IncrementalGraphBuilder
+            from core.graph.reconciler import DocumentReconciler
+            from core.graph.snapshot_scheduler import SnapshotScheduler
+            from core.scheduler.engine import ScheduleEngine
+
+            with open(cfg_path, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+            conn_cfg = (cfg.get("schedule", {}) or {}).get("connector", {}) or {}
+            connector = S3EDMSConnector(
+                source=conn_cfg.get("source", "local_storage/s3_simulation"),
+                postgres_store=app.state.postgres_store,
+            )
+            reconciler = DocumentReconciler(
+                postgres_store=app.state.postgres_store,
+            )
+            builder = IncrementalGraphBuilder(
+                connector=connector,
+                postgres_store=app.state.postgres_store,
+                redis_store=app.state.redis_store,
+                reconciler=reconciler,
+                aggregation_service=app.state.aggregation_service,
+            )
+            snap = SnapshotScheduler(
+                postgres_store=app.state.postgres_store,
+            )
+            engine = ScheduleEngine(
+                config_path=cfg_path,
+                builder=builder,
+                snapshot_scheduler=snap,
+                connector=connector,
+            )
+            app.state.schedule_engine = engine
+
+            if os.getenv("ENABLE_SCHEDULE_ENGINE", "false").lower() == "true":
+                app.state.schedule_engine_task = _asyncio.create_task(
+                    engine.run_loop(), name="schedule_engine_loop",
+                )
+                logging.info(
+                    "schedule_engine_loop_started",
+                    extra={"config_path": cfg_path},
+                )
+            else:
+                logging.info(
+                    "schedule_engine_constructed_no_loop",
+                    extra={"config_path": cfg_path,
+                           "reason": "ENABLE_SCHEDULE_ENGINE!=true"},
+                )
+        except Exception as exc:
+            logging.warning("schedule_engine_init_failed: %s", exc)
+
     # Incremental indexer background scheduler. Off by default; flip on
     # in production via ENABLE_SCHEDULER=true. Avoids spurious S3 calls
     # in local development and keeps tests deterministic.
@@ -162,6 +229,18 @@ async def lifespan(app: FastAPI):
             logging.warning("scheduler_start_failed: %s", exc)
 
     yield
+    # Signal the schedule engine to exit its loop before tearing the
+    # other long-running tasks down — that way an in-flight build sees
+    # the same stores its tick started against.
+    try:
+        engine = getattr(app.state, "schedule_engine", None)
+        engine_task = getattr(app.state, "schedule_engine_task", None)
+        if engine is not None:
+            engine.stop()
+        if engine_task is not None:
+            engine_task.cancel()
+    except Exception:
+        pass
     # Signal the webhook worker to drain its current tick and exit
     # cleanly so we don't leave half-delivered batches on shutdown.
     try:
