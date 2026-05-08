@@ -484,6 +484,60 @@ def generate(out_dir: Path, start_date: date, num_days: int, clean: bool) -> dic
     return {"total": written, "by_loan": by_loan, "out": str(out_dir)}
 
 
+def _parse_s3_dest(dest: str) -> tuple[str, str]:
+    """``s3://bucket/prefix[/]`` → ``(bucket, "prefix")`` (no trailing
+    slash)."""
+    raw = dest[len("s3://"):].lstrip("/")
+    parts = raw.split("/", 1)
+    bucket = parts[0]
+    prefix = parts[1].strip("/") if len(parts) > 1 else ""
+    return bucket, prefix
+
+
+def upload_to_s3(local_dir: Path, dest: str, dry_run: bool = False) -> dict:
+    """Walk every ``.json`` under ``local_dir`` and PUT it under
+    ``s3://bucket/prefix/<relative-path>``. Mirrors the date-folder
+    layout the connector expects so a single
+    ``generate_s3_simulation.py --s3 s3://edms-simulator-loans/s3_simulation``
+    populates the production bucket exactly the same way the local
+    backtest harness uses it."""
+    import boto3  # imported lazily — local-only runs don't need it.
+
+    bucket, prefix = _parse_s3_dest(dest)
+    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION", "us-east-1"))
+
+    uploaded = 0
+    bytes_total = 0
+    for root, _dirs, files in os.walk(local_dir):
+        for fn in files:
+            if not fn.endswith(".json"):
+                continue
+            path = Path(root) / fn
+            rel = path.relative_to(local_dir).as_posix()
+            key = f"{prefix}/{rel}" if prefix else rel
+            size = path.stat().st_size
+            if dry_run:
+                print(f"  [dry-run] would put: s3://{bucket}/{key} ({size} B)")
+            else:
+                with path.open("rb") as f:
+                    s3.put_object(
+                        Bucket=bucket,
+                        Key=key,
+                        Body=f.read(),
+                        ContentType="application/json",
+                    )
+            uploaded += 1
+            bytes_total += size
+
+    return {
+        "uploaded": uploaded,
+        "bucket":   bucket,
+        "prefix":   prefix,
+        "bytes":    bytes_total,
+        "dry_run":  dry_run,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out",   default=DEFAULT_OUT)
@@ -491,14 +545,36 @@ def main():
     ap.add_argument("--days",  type=int, default=DEFAULT_NUM_DAYS)
     ap.add_argument("--clean", action="store_true",
                     help="rm -rf the output dir before writing")
+    ap.add_argument("--s3", default=None,
+                    help="after generating locally, upload to this s3:// URL "
+                         "(e.g. s3://edms-simulator-loans/s3_simulation)")
+    ap.add_argument("--s3-only", action="store_true",
+                    help="skip local generation; upload an existing local "
+                         "tree (--out) to --s3")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print S3 PUTs without executing them")
     args = ap.parse_args()
 
     start = datetime.fromisoformat(args.start).date()
     out   = Path(args.out)
-    summary = generate(out, start, args.days, clean=args.clean)
-    print(f"Wrote {summary['total']} docs to {summary['out']}")
-    for los_id, n in summary["by_loan"].items():
-        print(f"  {los_id}: {n} docs")
+
+    if not args.s3_only:
+        summary = generate(out, start, args.days, clean=args.clean)
+        print(f"Wrote {summary['total']} docs to {summary['out']}")
+        for los_id, n in summary["by_loan"].items():
+            print(f"  {los_id}: {n} docs")
+
+    if args.s3:
+        if not args.s3.startswith("s3://"):
+            print(f"ERROR: --s3 must be an s3:// URL, got {args.s3!r}",
+                  file=sys.stderr)
+            sys.exit(2)
+        print(f"\nUploading to {args.s3} {'(dry-run) ' if args.dry_run else ''}…")
+        s3_summary = upload_to_s3(out, args.s3, dry_run=args.dry_run)
+        verb = "would upload" if args.dry_run else "uploaded"
+        print(f"  {verb} {s3_summary['uploaded']} files "
+              f"({s3_summary['bytes']:,} B) → "
+              f"s3://{s3_summary['bucket']}/{s3_summary['prefix']}/")
 
 
 if __name__ == "__main__":

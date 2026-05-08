@@ -239,26 +239,26 @@ class S3EDMSConnector(BaseEDMSConnector):
                 folder_accepted += 1
 
             logger.info(
-                "connector_folder_scanned",
-                extra={"folder":   str(folder_path),
-                       "date":     folder_date.isoformat(),
-                       "files":    folder_files,
-                       "accepted": folder_accepted},
+                f"connector_folder_scanned date={folder_date.isoformat()} "
+                f"files={folder_files} accepted={folder_accepted} "
+                f"folder={folder_path}"
             )
 
         docs.sort(key=lambda d: (d.get("received_at"), d.get("document_id")))
+        # Embed the funnel stats directly in the message string so the
+        # default stdlib formatter (used in the production container)
+        # surfaces them in CloudWatch — ``extra={}`` keys are dropped
+        # by the default formatter and won't show up in log output.
         logger.info(
-            "connector_pull_complete",
-            extra={
-                "folders_total":   folder_count,
-                "folders_in_win":  in_window,
-                "files_total":     total_files,
-                "read_failed":     read_failed,
-                "no_received_at":  no_received_at,
-                "filtered_pre_wm": filtered_pre,
-                "filtered_post":   filtered_post,
-                "accepted":        len(docs),
-            },
+            "connector_pull_complete "
+            f"folders_total={folder_count} folders_in_win={in_window} "
+            f"files_total={total_files} read_failed={read_failed} "
+            f"no_received_at={no_received_at} "
+            f"filtered_pre_wm={filtered_pre} filtered_post={filtered_post} "
+            f"accepted={len(docs)} "
+            f"bucket={getattr(self, '_bucket', None)} "
+            f"prefix={getattr(self, '_prefix', None)} "
+            f"watermark={wm.isoformat()}"
         )
         return docs
 
@@ -325,12 +325,9 @@ class S3EDMSConnector(BaseEDMSConnector):
                     continue
                 yield d, p  # full S3 prefix incl. trailing slash
         logger.info(
-            "s3_list_date_folders_complete",
-            extra={"bucket":          self._bucket,
-                   "prefix":          base,
-                   "pages":           page_count,
-                   "common_prefixes": common_prefix_count,
-                   "date_folders":    len(seen)},
+            f"s3_list_date_folders_complete bucket={self._bucket} "
+            f"prefix={base!r} pages={page_count} "
+            f"common_prefixes={common_prefix_count} date_folders={len(seen)}"
         )
 
     def _iter_files(self, folder_path: Any) -> Iterable[Any]:
