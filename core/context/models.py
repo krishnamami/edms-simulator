@@ -54,15 +54,27 @@ class ReadinessFlags(BaseModel):
     identity_verified:    bool = False
     employment_verified:  bool = False
     assets_verified:      bool = False
+    # Tier-2: full identity tri-check (DL + SSN + OFAC) — stricter than
+    # ``identity_verified`` (which fires on any one identity doc).
+    identity_complete:    bool = False
+    tax_docs_received:    bool = False
     # Property layer
     appraisal_complete:   bool = False
     title_clear:          bool = False
+    title_received:       bool = False  # TITLE_COMMITMENT present
     insurance_bound:      bool = False
     flood_cert_received:  bool = False
     # Application layer
     dti_calculable:       bool = False
     ltv_calculable:       bool = False
     aus_ready:            bool = False
+    # Tier-2: loan-terms layer
+    loan_application_complete:  bool = False  # URLA_1003 present
+    purchase_agreement_received: bool = False
+    rate_locked:               bool = False  # RATE_LOCK + lock_expiry > today
+    # Cross-doc fraud signal — flips False if any contradicts edge with
+    # delta > the per-pair threshold exists in the graph.
+    no_critical_conflicts: bool = True
     # What's still missing
     missing_items:        list[str] = []
 
@@ -128,6 +140,24 @@ class FraudSlice(BaseModel):
     assembled_at:        str = ""
 
 
+class BorrowerAggregation(BaseModel):
+    """Tier-2 nested view of a single borrower's whole-file picture.
+
+    Folds together the income / credit / asset / identity caches written
+    through by the assembly pipeline, plus the running document_count.
+    Coexists with ``ApplicationContext.primary`` and ``.co_borrower``
+    (BorrowerSnapshot) — those stay for backwards compatibility; this
+    new aggregation is the cleaner Decision-OS-facing shape.
+    """
+    applicant_id:        str
+    income:              dict = {}
+    credit:              dict = {}
+    assets:              dict = {}
+    identity:            dict = {}
+    document_count:      int = 0
+    qualifying_monthly:  float = 0.0
+
+
 class ApplicationContext(BaseModel):
     application_id:              str
     los_id:                      str
@@ -146,5 +176,14 @@ class ApplicationContext(BaseModel):
     vendor_checks:               dict = {}
     readiness:                   ReadinessFlags
     graph_summary:               dict = {}
+    # Tier-2 additions — coexist with the legacy primary / co_borrower
+    # snapshots above. ``borrower`` is the nested aggregation,
+    # ``loan_terms`` is the URLA / rate-lock / purchase view,
+    # ``conflicts`` surfaces the top contradicts edges so a Decision OS
+    # consumer can read fraud signals without a separate API call.
+    borrower:                    Optional[BorrowerAggregation] = None
+    co_borrower_aggregation:     Optional[BorrowerAggregation] = None
+    loan_terms:                  dict = {}
+    conflicts:                   dict = {"count": 0, "critical": []}
     assembled_at:                str = ""
     requires_review:             bool = False

@@ -46,9 +46,14 @@ COMPARISON_MAP: dict[tuple, list[tuple]] = {
     # ── INCOME CROSS-CHECKS ──────────────────────────────────────────────
 
     # W2 vs IRS Transcript — most critical edge. Transcript is IRS ground
-    # truth; any difference > 5% is a fraud flag.
+    # truth; any difference > 5% is a fraud flag. Two field tuples on
+    # ``wages`` because the IRS extractor in this repo emits
+    # ``wages_salaries`` while older / external extractors emit
+    # ``wages_tips_compensation`` — both should agree, both fire when
+    # both are present.
     ("W2_CURRENT", "IRS_TRANSCRIPT"): [
         ("box1_wages",    "wages_tips_compensation", 1.0),
+        ("box1_wages",    "wages_salaries",          1.0),
         ("employer_name", "employer_name",           0.7),
         ("tax_year",      "tax_year",                0.5),
     ],
@@ -73,9 +78,12 @@ COMPARISON_MAP: dict[tuple, list[tuple]] = {
         ("box1_wages",    "box1_wages",    0.6),
     ],
 
-    # W2 vs Tax Return — wages reconcile to 1040.
+    # W2 vs Tax Return — wages reconcile to 1040. ``wages_line1`` is the
+    # 1040 extractor's name for line 1 wages; ``wages_salaries`` is the
+    # legacy alias.
     ("W2_CURRENT", "TAX_RETURN_1040_CURRENT"): [
         ("box1_wages", "wages_salaries", 0.9),
+        ("box1_wages", "wages_line1",    0.9),
         ("tax_year",   "tax_year",       0.5),
     ],
     ("W2_PRIOR", "TAX_RETURN_1040_PRIOR"): [
@@ -105,20 +113,33 @@ COMPARISON_MAP: dict[tuple, list[tuple]] = {
         ("tax_year",                "tax_year",       0.5),
     ],
 
-    # Schedule C / E flow into 1040.
+    # Schedule C / E flow into 1040. Field-name pairs cover both the
+    # legacy field names (business_income / rental_income) and the
+    # current extractors' names (schedule_c_income / schedule_e_income,
+    # net_profit / net_rental_income).
     ("SCHEDULE_C", "TAX_RETURN_1040_CURRENT"): [
-        ("net_profit", "business_income", 0.9),
-        ("tax_year",   "tax_year",        0.5),
+        ("net_profit", "business_income",    0.9),
+        ("net_profit", "schedule_c_income",  1.0),
+        ("tax_year",   "tax_year",           0.5),
     ],
     ("SCHEDULE_E", "TAX_RETURN_1040_CURRENT"): [
-        ("net_income", "rental_income", 0.9),
-        ("tax_year",   "tax_year",      0.5),
+        ("net_income",         "rental_income",       0.9),
+        ("net_rental_income",  "schedule_e_income",   1.0),
+        ("tax_year",           "tax_year",            0.5),
     ],
 
-    # 1099 vs Tax Return.
+    # 1099 vs Tax Return — both legacy and current extractor field names.
     ("1099_NEC", "TAX_RETURN_1040_CURRENT"): [
-        ("amount_1099", "self_employment_income", 0.8),
-        ("tax_year",    "tax_year",               0.5),
+        ("amount_1099",                "self_employment_income", 0.8),
+        ("nonemployee_compensation",   "other_income",           0.7),
+        ("tax_year",                   "tax_year",               0.5),
+    ],
+
+    # K-1 vs Tax Return — partnership / S-corp pass-through income.
+    ("K1_PARTNERSHIP", "TAX_RETURN_1040_CURRENT"): [
+        ("ordinary_income", "ordinary_income",   0.9),
+        ("ordinary_income", "schedule_e_income", 0.6),  # falls into Sch E line
+        ("tax_year",        "tax_year",          0.5),
     ],
 
     # Cross-borrower W2 (joint application). Different borrowers, same
@@ -151,9 +172,19 @@ COMPARISON_MAP: dict[tuple, list[tuple]] = {
         ("appraised_value", "purchase_price", 1.0),
     ],
 
-    # Appraisal vs AVM — automated validation.
+    # Appraisal vs AVM — automated validation. Two field tuples on the
+    # AVM side because vendors disagree on the name (``estimated_value``
+    # vs ``avm_value``).
     ("APPRAISAL_URAR", "AVM_REPORT"): [
         ("appraised_value", "estimated_value", 0.8),
+        ("appraised_value", "avm_value",       0.8),
+    ],
+
+    # Appraisal vs market-conditions addendum (1004MC). Wide tolerance
+    # — median sale price for the neighborhood is rarely close to the
+    # subject's appraisal but should be in the same order of magnitude.
+    ("APPRAISAL_URAR", "FORM_1004MC"): [
+        ("appraised_value", "median_sale_price", 0.5),
     ],
 
     # Appraisal vs property tax — assessed is typically 60-85% of market.
@@ -232,9 +263,17 @@ COMPARISON_MAP: dict[tuple, list[tuple]] = {
     ],
 
     # Gift letter vs bank — gift should be visible as a large deposit.
+    # Two tuples: legacy compares to a ``large_deposits`` field; current
+    # extractor surfaces ``ending_balance`` instead so the gift should
+    # be a meaningful fraction of the closing balance.
     ("GIFT_LETTER", "BANK_STATEMENT_M1"): [
         ("gift_amount", "large_deposits", 0.8),
+        ("gift_amount", "ending_balance", 0.5),
     ],
+
+    # Self-pair: two retirement statements from different periods don't
+    # have a meaningful comparison via this map. Skip silently.
+    ("ASSET_STATEMENT_RETIREMENT", "ASSET_STATEMENT_RETIREMENT"): [],
 
     # ── VENDOR-RETURN CROSS-CHECKS ──────────────────────────────────────
 
@@ -246,6 +285,45 @@ COMPARISON_MAP: dict[tuple, list[tuple]] = {
     # Fraud report vs identity.
     ("FRAUD_REPORT", "IDENTITY_DL"): [
         ("kyc_pass", "full_name", 0.6),
+    ],
+
+    # ── LOAN TERMS / EMPLOYMENT CROSS-CHECKS ────────────────────────────
+
+    # URLA stated income vs documented W2. URLA stores monthly stated;
+    # ``monthly_income_stated_annual`` is the logical field that
+    # annualises before comparison (handled in
+    # ``_extract_compare_value``). A wide gap is the classic
+    # stated-income fraud signal.
+    ("URLA_1003", "W2_CURRENT"): [
+        ("monthly_income_stated_annual", "box1_wages", 1.0),
+    ],
+
+    # URLA loan amount vs purchase price — sanity check on stated LTV.
+    ("URLA_1003", "PURCHASE_AGREEMENT"): [
+        ("loan_amount", "purchase_price", 0.7),
+    ],
+
+    # Rate lock vs URLA — locked rate must match what the application
+    # promised the borrower.
+    ("RATE_LOCK", "URLA_1003"): [
+        ("locked_rate", "interest_rate", 1.0),
+    ],
+
+    # Offer letter vs W2 — new-job income source. Tolerance is wider
+    # because a job change usually changes comp.
+    ("OFFER_LETTER", "W2_CURRENT"): [
+        ("base_salary", "box1_wages", 0.8),
+    ],
+
+    # Offer letter vs paystub — stub annualised vs offered base salary.
+    ("OFFER_LETTER", "PAYSTUB_CURRENT"): [
+        ("base_salary", "annualized_ytd", 0.7),
+    ],
+
+    # Offer letter vs Work Number VOE — both should report the same
+    # base compensation for a new hire.
+    ("OFFER_LETTER", "VOE_TWN"): [
+        ("base_salary", "base_pay_annual", 0.8),
     ],
 
     # ── SAME-TYPE PAIRS — explicit empty (no meaningful comparison) ─────
@@ -270,12 +348,29 @@ FIELD_CONFLICT_THRESHOLDS: dict[tuple, float] = {
     ("APPRAISAL_URAR", "AVM_REPORT",              "appraised_value"): 0.15,
     ("APPRAISAL_URAR", "PROPERTY_TAX_BILL",       "appraised_value"): 0.40,
     ("APPRAISAL_URAR", "PROPERTY_TAX_TRANSCRIPT", "appraised_value"): 0.40,
+    # 1004MC's median sale price is the *neighborhood* median — keep a
+    # wide gate so a healthy comp doesn't trip a contradicts.
+    ("APPRAISAL_URAR", "FORM_1004MC",             "appraised_value"): 0.20,
 
     # Tax figures — very tight.
     ("IRS_TRANSCRIPT", "TAX_RETURN_1040_CURRENT", "agi"): 0.02,
 
     # Insurance premiums — moderate.
     ("HOI_BINDER", "HOI_DECLARATIONS", "annual_premium"): 0.05,
+
+    # ── Tier-2 additions ────────────────────────────────────────────────
+
+    # Stated vs documented income (URLA section 1c vs W2 box1) — fraud
+    # signal at >10%.
+    ("URLA_1003", "W2_CURRENT", "monthly_income_stated_annual"): 0.10,
+
+    # Offer-letter base salary vs W2 box1 — wider, since a new job
+    # often comes with comp changes.
+    ("OFFER_LETTER", "W2_CURRENT", "base_salary"): 0.15,
+
+    # Rate lock locked_rate vs URLA stated interest_rate — must match
+    # exactly in basis points; even 0.05 is generous.
+    ("RATE_LOCK", "URLA_1003", "locked_rate"): 0.05,
 }
 
 
@@ -419,7 +514,12 @@ class DocumentReconciler:
         ``annualized_ytd`` is dual-shape: callers may supply it directly
         (already annualised) OR provide ``ytd_gross`` + optional
         ``pay_period_end`` and let us annualise. If both are present the
-        explicit value wins."""
+        explicit value wins.
+
+        ``monthly_income_stated_annual`` is a logical field for URLA-vs-W2
+        comparisons: URLA stores monthly stated income, W2 stores annual
+        wages — multiply the URLA value by 12 before comparison.
+        """
         if field_name == "annualized_ytd":
             direct = fields.get("annualized_ytd")
             if direct is not None:
@@ -427,6 +527,9 @@ class DocumentReconciler:
             return cls._annualize_ytd(
                 fields.get("ytd_gross"), fields.get("pay_period_end"),
             )
+        if field_name == "monthly_income_stated_annual":
+            monthly = cls._normalise_value(fields.get("monthly_income_stated"))
+            return monthly * 12 if monthly is not None else None
         return fields.get(field_name)
 
     def _make_relationship(

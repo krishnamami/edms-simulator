@@ -11,6 +11,7 @@ from typing import Optional
 
 from core.context.models import (
     ApplicationContext,
+    BorrowerAggregation,
     BorrowerSnapshot,
     PropertySnapshot,
     ReadinessFlags,
@@ -122,6 +123,44 @@ class ContextAssembler:
             logger.warning("graph_summary_failed", extra={"error": str(exc)})
             graph_summary = {}
 
+        # Tier-2: pull the asset / identity entity summaries written
+        # through by AggregationService._aggregate_and_cache_assets /
+        # _aggregate_and_cache_identity. Use Redis as the primary cache
+        # and fall through to recomputing from document_index if missing.
+        primary_assets   = await self._read_asset_summary(applicant_id)
+        primary_identity = await self._read_identity_summary(applicant_id)
+
+        # Loan-terms section — merged view of URLA / RATE_LOCK /
+        # PURCHASE_AGREEMENT docs plus the application row's own
+        # loan_amount / loan_purpose. Derived on every assembly because
+        # these docs change (rate-lock especially) frequently.
+        loan_terms = await self._build_loan_terms(applicant_id, app)
+
+        # Conflicts block — pulls the top contradicts edges from the
+        # graph so a Decision OS reader doesn't need a separate
+        # /applicant/{id}/conflicts call. Empty list when nothing
+        # contradicts.
+        conflicts = await self._build_conflicts(applicant_id)
+
+        # Build the new nested BorrowerAggregation alongside the legacy
+        # primary / co_borrower BorrowerSnapshot. Coexists for
+        # backwards compatibility — readers that want the new shape use
+        # ``borrower``; existing readers keep using ``primary``.
+        borrower_agg = self._build_borrower_aggregation(
+            applicant_id, primary, primary_income, primary_assets,
+            primary_identity,
+        )
+        co_borrower_agg = None
+        if co_applicant_id and co_borrower:
+            co_assets   = await self._read_asset_summary(co_applicant_id)
+            co_identity = await self._read_identity_summary(co_applicant_id)
+            # Co-borrower's income lives on the SAME income profile dict
+            # under the ``co_borrower`` section.
+            co_borrower_agg = self._build_borrower_aggregation(
+                co_applicant_id, co_borrower, primary_income, co_assets,
+                co_identity, role="co_borrower",
+            )
+
         requires_review = bool(
             readiness.missing_items
             or primary.income_requires_review
@@ -129,6 +168,20 @@ class ContextAssembler:
             or (property_snapshot
                 and property_snapshot.condition_rating in ("C5", "C6"))
             or (graph_summary or {}).get("conflict_count", 0) > 0
+            or conflicts.get("count", 0) > 0
+        )
+
+        # Refresh readiness now that we have the new data sources to
+        # power the Tier-2 flags (assets_verified, identity_complete,
+        # title_received, tax_docs_received, etc.).
+        readiness = self._calculate_readiness(
+            primary, co_borrower, property_snapshot,
+            vendor_checks, front_dti, ltv,
+            assets=primary_assets,
+            identity=primary_identity,
+            loan_terms=loan_terms,
+            conflicts=conflicts,
+            applicant_docs=await self._fetch_doc_types(applicant_id),
         )
 
         ctx = ApplicationContext(
@@ -149,6 +202,10 @@ class ContextAssembler:
             vendor_checks=vendor_checks,
             readiness=readiness,
             graph_summary=graph_summary or {},
+            borrower=borrower_agg,
+            co_borrower_aggregation=co_borrower_agg,
+            loan_terms=loan_terms,
+            conflicts=conflicts,
             assembled_at=datetime.utcnow().isoformat(),
             requires_review=requires_review,
         )
@@ -401,6 +458,14 @@ class ContextAssembler:
         vendor_checks: dict,
         front_dti: Optional[float],
         ltv: Optional[float],
+        # Tier-2: optional aggregations powering the new readiness flags.
+        # Default to ``None`` / empty so old call sites (and tests that
+        # call this helper directly) keep working.
+        assets: Optional[dict] = None,
+        identity: Optional[dict] = None,
+        loan_terms: Optional[dict] = None,
+        conflicts: Optional[dict] = None,
+        applicant_docs: Optional[set] = None,
     ) -> ReadinessFlags:
         missing: list[str] = []
         flags = ReadinessFlags()
@@ -467,5 +532,242 @@ class ContextAssembler:
         if vendor_checks.get("fraud_requires_review"):
             missing.append("fraud_review_required")
 
+        # ── Tier-2 readiness flags ──────────────────────────────────────
+        assets   = assets or {}
+        identity = identity or {}
+        loan_terms = loan_terms or {}
+        conflicts  = conflicts or {}
+        doc_types  = applicant_docs or set()
+
+        # assets_verified: any liquid assets recorded AND at least 1
+        # bank statement in the doc set.
+        flags.assets_verified = (
+            (assets.get("total_liquid_assets") or 0) > 0
+            and any(t.startswith("BANK_STATEMENT_") for t in doc_types)
+        )
+        if not flags.assets_verified:
+            missing.append("bank_statement")
+
+        # identity_complete: full DL + SSN + OFAC tri-check (stricter
+        # than identity_verified above, which fires on any single
+        # identity doc).
+        flags.identity_complete = bool(identity.get("identity_complete"))
+        if not flags.identity_complete:
+            missing.append("identity_complete")
+
+        # title_received: TITLE_COMMITMENT or TITLE_INSURANCE in the
+        # property layer.
+        flags.title_received = bool(
+            "TITLE_COMMITMENT" in doc_types or "TITLE_INSURANCE" in doc_types
+        )
+        if not flags.title_received:
+            missing.append("title_commitment")
+
+        # tax_docs_received: W2 always; 1040 only if self-employed
+        # (Schedule C / E / F or 1099 income present in the doc set).
+        has_w2 = "W2_CURRENT" in doc_types or "W2_PRIOR" in doc_types
+        is_self_employed = any(
+            t in doc_types
+            for t in ("SCHEDULE_C", "SCHEDULE_E", "SCHEDULE_F", "1099_NEC")
+        )
+        has_1040 = (
+            "TAX_RETURN_1040_CURRENT" in doc_types
+            or "TAX_RETURN_1040_PRIOR" in doc_types
+        )
+        flags.tax_docs_received = has_w2 and (has_1040 or not is_self_employed)
+        if not flags.tax_docs_received:
+            missing.append("tax_documents")
+
+        # Loan-terms layer flags.
+        flags.loan_application_complete  = "URLA_1003" in doc_types
+        flags.purchase_agreement_received = "PURCHASE_AGREEMENT" in doc_types
+        if not flags.loan_application_complete:
+            missing.append("urla_1003")
+        if not flags.purchase_agreement_received:
+            missing.append("purchase_agreement")
+
+        # rate_locked: a RATE_LOCK doc with lock_expiry > today.
+        from datetime import date as _date
+        rate_lock = loan_terms.get("rate_lock") or {}
+        expiry = rate_lock.get("lock_expiry")
+        if expiry:
+            try:
+                # Best-effort date parsing — accept ISO-8601 substrings.
+                exp_date = _date.fromisoformat(str(expiry)[:10])
+                flags.rate_locked = exp_date >= _date.today()
+            except (ValueError, TypeError):
+                flags.rate_locked = "RATE_LOCK" in doc_types
+        else:
+            flags.rate_locked = False
+
+        # no_critical_conflicts: zero contradicts edges where the
+        # delta exceeded the per-pair threshold (the only edges that
+        # land in conflicts.critical).
+        flags.no_critical_conflicts = len(
+            (conflicts.get("critical") or [])
+        ) == 0
+
         flags.missing_items = missing
         return flags
+
+    # ------------------------------------------------------------------
+    # Tier-2 helpers — Redis read-throughs + per-applicant aggregations.
+    # Each falls back to "" / {} on cache miss; callers downstream
+    # tolerate empty dicts.
+
+    async def _read_asset_summary(self, applicant_id: str) -> dict:
+        try:
+            return await self.redis.get_asset_summary(applicant_id) or {}
+        except Exception as exc:
+            logger.warning(
+                "asset_summary_read_failed",
+                extra={"applicant_id": applicant_id, "error": str(exc)},
+            )
+            return {}
+
+    async def _read_identity_summary(self, applicant_id: str) -> dict:
+        try:
+            return await self.redis.get_identity_summary(applicant_id) or {}
+        except Exception as exc:
+            logger.warning(
+                "identity_summary_read_failed",
+                extra={"applicant_id": applicant_id, "error": str(exc)},
+            )
+            return {}
+
+    async def _fetch_doc_types(self, applicant_id: str) -> set:
+        """Set of canonical document_type strings the applicant has on
+        file. Used for readiness flags that gate on doc presence."""
+        try:
+            docs = await self.pg.get_documents_for_applicant(applicant_id)
+        except Exception:
+            return set()
+        return {d.get("document_type") for d in docs if d.get("document_type")}
+
+    async def _build_loan_terms(self, applicant_id: str, app: dict) -> dict:
+        """Merge URLA / RATE_LOCK / PURCHASE_AGREEMENT extracted_fields
+        into a single loan_terms dict for the context payload. The app
+        row's loan_amount / loan_purpose serve as the floor so callers
+        get something sensible even before the URLA lands.
+        """
+        out: dict = {
+            "loan_amount":   float(app["loan_amount"]) if app.get("loan_amount") else None,
+            "interest_rate": app.get("interest_rate"),
+            "loan_purpose":  app.get("loan_purpose"),
+        }
+        try:
+            docs = await self.pg.get_documents_for_applicant(applicant_id)
+        except Exception:
+            return out
+
+        # Pick the most-recent matching doc per type — get_documents_for_applicant
+        # returns ordered DESC by received_at so first hit per type wins.
+        seen: set = set()
+        urla = rate_lock = purchase = None
+        for d in docs:
+            t = d.get("document_type")
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            if t == "URLA_1003" and urla is None:
+                urla = d.get("extracted_fields") or {}
+            elif t == "RATE_LOCK" and rate_lock is None:
+                rate_lock = d.get("extracted_fields") or {}
+            elif t == "PURCHASE_AGREEMENT" and purchase is None:
+                purchase = d.get("extracted_fields") or {}
+
+        if urla:
+            for k in (
+                "loan_amount", "loan_purpose", "interest_rate",
+                "loan_term_months", "monthly_income_stated",
+            ):
+                if urla.get(k) is not None:
+                    out[k] = urla[k]
+        if rate_lock:
+            out["rate_lock"] = {
+                "locked_rate": rate_lock.get("locked_rate"),
+                "lock_expiry": rate_lock.get("lock_expiry"),
+                "lock_days":   rate_lock.get("lock_days"),
+                "loan_program": rate_lock.get("loan_program"),
+            }
+        if purchase:
+            out["purchase_price"]      = purchase.get("purchase_price")
+            out["earnest_money"]       = purchase.get("earnest_money")
+            out["closing_date"]        = purchase.get("closing_date")
+            out["seller_concessions"]  = purchase.get("seller_concessions")
+
+        return out
+
+    async def _build_conflicts(self, applicant_id: str) -> dict:
+        """Return the top contradicts edges for an applicant in a shape
+        Decision OS can render directly: ``{"count": N, "critical": [...]}``.
+        Each critical entry is ``{"pair", "field", "values", "delta_pct"}``.
+        """
+        out = {"count": 0, "critical": []}
+        try:
+            rels = await self.pg.get_relationships_for_applicant(applicant_id)
+        except Exception:
+            return out
+
+        critical: list[dict] = []
+        for r in rels:
+            if r.get("relationship_type") != "contradicts":
+                continue
+            critical.append({
+                "pair": (
+                    f"{r.get('source_doc_type', '')}↔"
+                    f"{r.get('target_doc_type', '')}"
+                ),
+                "field":     r.get("field_name"),
+                "values":    [r.get("source_value"), r.get("target_value")],
+                "delta_pct": r.get("delta_pct"),
+            })
+        # Cap at 10 — context payload stays bounded; the full graph is
+        # available via the dedicated /applicant/{id}/conflicts endpoint.
+        out["count"]    = len(critical)
+        out["critical"] = critical[:10]
+        return out
+
+    @staticmethod
+    def _build_borrower_aggregation(
+        applicant_id: str,
+        snapshot: BorrowerSnapshot,
+        primary_income: Optional[dict],
+        assets: dict,
+        identity: dict,
+        role: str = "primary",
+    ) -> BorrowerAggregation:
+        """Pack the per-borrower entity caches into the new
+        BorrowerAggregation shape. ``role`` controls whether we read
+        ``primary_borrower`` or ``co_borrower`` out of the shared
+        IncomeProfile dict."""
+        income_section: dict = {}
+        if primary_income:
+            section_key = (
+                "co_borrower" if role == "co_borrower" else "primary_borrower"
+            )
+            income_section = primary_income.get(section_key) or {}
+
+        # Document count: assets + identity + the income/credit docs
+        # listed under the borrower snapshot's income_sources. Best-
+        # effort — exact counts come from /applicant/{id}/graph/summary.
+        doc_count = (
+            (assets.get("asset_doc_count") or 0)
+            + (identity.get("identity_doc_count") or 0)
+            + len(snapshot.income_sources or [])
+        )
+
+        return BorrowerAggregation(
+            applicant_id=applicant_id,
+            income=income_section,
+            credit={
+                "mid_score":           snapshot.mid_score,
+                "credit_band":         snapshot.credit_band,
+                "monthly_obligations": snapshot.monthly_obligations,
+                "derogatory_marks":    snapshot.derogatory_marks,
+            },
+            assets=assets,
+            identity=identity,
+            document_count=doc_count,
+            qualifying_monthly=snapshot.qualifying_monthly,
+        )
