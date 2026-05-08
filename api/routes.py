@@ -111,21 +111,64 @@ class AuthContext:
         self.name = name
 
 
-def _legacy_env_key() -> Optional[str]:
-    """Fallback static key for tests + bootstrap. Tests set ``API_KEY``
-    directly via conftest; production reads from Secrets Manager when
-    the env-var is empty. Either way, a match grants the 'default'
-    tenant with admin scope so 329 existing tests + dev workflows
-    keep working without seeding ``api_keys`` first."""
-    expected = os.getenv("API_KEY")
-    if expected:
-        return expected
+def _expected_static_keys() -> set[str]:
+    """Every valid static API key derivable from the environment.
+
+    Pulls from three sources, deduped:
+
+    1. ``os.getenv("API_KEY")`` — the literal env value. Tests set this
+       directly via conftest; ECS task definitions can inject it via
+       ``valueFrom: secretsmanager:...:decision_os_api_key::`` (only
+       the field value lands in the env).
+
+    2. If the env var looks like a JSON blob (``valueFrom`` was wired
+       *without* the JSON-key suffix, so ECS injects the whole secret),
+       parse it and pull ``decision_os_api_key`` / ``api_key``. This
+       handles the half-configured task-definition case that breaks
+       a literal ``$API_KEY`` comparison.
+
+    3. ``get_secrets().get_secret("edms/api/keys")["decision_os_api_key"]``
+       — direct Secrets Manager fallback when ``API_KEY`` isn't set
+       at all (legacy bootstrap path).
+
+    Any of these matching grants the 'default' tenant with admin scope.
+    The ``api_keys`` table is the multi-tenant path, evaluated AFTER
+    the static set so a per-tenant key in PG can override the static
+    behavior if needed.
+    """
+    keys: set[str] = set()
+    raw = (os.getenv("API_KEY") or "").strip()
+    if raw:
+        keys.add(raw)
+        if raw.startswith("{") and raw.endswith("}"):
+            try:
+                blob = json.loads(raw)
+                if isinstance(blob, dict):
+                    for field in ("decision_os_api_key", "api_key"):
+                        val = blob.get(field)
+                        if val:
+                            keys.add(str(val).strip())
+            except Exception:
+                pass
     try:
         from core.storage.secrets import get_secrets
-        keys = get_secrets().get_secret("edms/api/keys")
-        return keys.get("decision_os_api_key") if isinstance(keys, dict) else None
+        secret = get_secrets().get_secret("edms/api/keys")
+        if isinstance(secret, dict):
+            val = secret.get("decision_os_api_key")
+            if val:
+                keys.add(str(val).strip())
     except Exception:
-        return None
+        pass
+    return keys
+
+
+def _legacy_env_key() -> Optional[str]:
+    """Backwards-compat shim — returns the first static key in
+    insertion order, or ``None``. Kept so older callers + tests that
+    expected a single string still work; new code should call
+    :func:`_expected_static_keys`."""
+    keys = _expected_static_keys()
+    return next(iter(keys), None)
 
 
 async def _lookup_api_key(request: Request, key: str) -> Optional[dict]:
@@ -178,45 +221,59 @@ async def verify_api_key(
 ) -> AuthContext:
     """Resolve the inbound ``X-API-Key`` to a tenant + scopes.
 
-    Resolution order:
-      1. Postgres ``api_keys`` table (cached in Redis 5 min).
-      2. Legacy static env-var fallback (``API_KEY`` / Secrets Manager).
-         Matches grant the 'default' tenant with admin scope.
+    Resolution order — env-var FAST PATH first, DB lookup second:
 
-    Either path attaches ``tenant_id`` + ``scopes`` + ``api_key`` to
-    ``request.state`` so downstream code can read them via
+      1. Static env / Secrets Manager match (``API_KEY`` literal,
+         ``API_KEY`` JSON-blob field, or ``edms/api/keys`` direct
+         lookup — see :func:`_expected_static_keys`). Matches grant
+         the 'default' tenant with admin scope. This path requires
+         no DB row, so the production key from Secrets Manager keeps
+         working even when ``api_keys`` hasn't been seeded.
+
+      2. Postgres ``api_keys`` table (cached in Redis 5 min) — the
+         multi-tenant path used by per-tenant client keys provisioned
+         via ``POST /admin/api-keys``.
+
+    A successful match attaches ``tenant_id`` + ``scopes`` + ``api_key``
+    to ``request.state`` so downstream code reads them via
     ``request.state.tenant_id``. ``last_used_at`` is bumped best-effort
-    after a successful DB-backed match (non-blocking).
+    after a DB-backed match (non-blocking).
     """
     if not x_api_key:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-    record = await _lookup_api_key(request, x_api_key)
-    if record:
-        ctx = AuthContext(
-            tenant_id=record["tenant_id"],
-            scopes={s.strip() for s in (record.get("scopes") or "").split(",") if s.strip()},
-            api_key=x_api_key,
-            name=record.get("name"),
-        )
-        # Best-effort last-used touch — never blocks the request and
-        # silently swallows pool-not-ready errors in tests.
-        pg = getattr(request.app.state, "postgres_store", None)
-        if pg is not None and hasattr(pg, "touch_api_key"):
-            try:
-                await pg.touch_api_key(x_api_key)
-            except Exception:
-                pass
-    else:
-        legacy = _legacy_env_key()
-        if not legacy or x_api_key != legacy:
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    ctx: Optional[AuthContext] = None
+
+    # ── 1. Static env / Secrets Manager fast path ─────────────────
+    if x_api_key in _expected_static_keys():
         ctx = AuthContext(
             tenant_id=DEFAULT_TENANT_ID,
             scopes={"read", "write", "admin"},
             api_key=x_api_key,
-            name="legacy_env",
+            name="static_env",
         )
+
+    # ── 2. Multi-tenant DB lookup ─────────────────────────────────
+    if ctx is None:
+        record = await _lookup_api_key(request, x_api_key)
+        if record:
+            ctx = AuthContext(
+                tenant_id=record["tenant_id"],
+                scopes={s.strip() for s in (record.get("scopes") or "").split(",") if s.strip()},
+                api_key=x_api_key,
+                name=record.get("name"),
+            )
+            # Best-effort last-used touch — never blocks the request
+            # and silently swallows pool-not-ready errors in tests.
+            pg = getattr(request.app.state, "postgres_store", None)
+            if pg is not None and hasattr(pg, "touch_api_key"):
+                try:
+                    await pg.touch_api_key(x_api_key)
+                except Exception:
+                    pass
+
+    if ctx is None:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
     request.state.tenant_id = ctx.tenant_id
     request.state.scopes    = ctx.scopes
