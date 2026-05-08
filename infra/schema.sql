@@ -86,10 +86,25 @@ CREATE TABLE IF NOT EXISTS document_index (
     expiry_date       DATE,
     is_current        BOOLEAN NOT NULL DEFAULT TRUE,
     extracted_fields  JSONB,
-    confidence_score  FLOAT
+    confidence_score  FLOAT,
+    -- How the extracted_fields were populated. One of:
+    --   'deterministic'  — pymupdf / income / asset / loan / property
+    --                      extractor parsed structured fields from the PDF
+    --   'caller_supplied' — LOS / API caller sent structured fields directly
+    --                      (most production traffic — authoritative source)
+    --   'ai_vision'       — Claude Vision fallback extracted from the image
+    --                      (lower confidence, used when deterministic returns empty)
+    --   'none'            — no fields recovered (placeholder row)
+    -- Priority for upsert: deterministic > caller_supplied > ai_vision > none.
+    extraction_method VARCHAR DEFAULT 'none'
 );
 CREATE INDEX IF NOT EXISTS idx_doc_applicant ON document_index(applicant_id)
     WHERE is_current=TRUE;
+-- Backfill the new column on pre-existing tables. Idempotent — DO NOTHING
+-- if the column already exists (which is the case after a fresh CREATE
+-- TABLE above). Ops applies this against prod after merging.
+ALTER TABLE document_index
+    ADD COLUMN IF NOT EXISTS extraction_method VARCHAR DEFAULT 'none';
 
 -- Document knowledge graph
 CREATE TABLE IF NOT EXISTS document_relationships (

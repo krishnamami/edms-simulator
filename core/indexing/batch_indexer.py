@@ -294,6 +294,7 @@ class BatchIndexer:
                 "is_current":       True,
                 "extracted_fields": merged_fields,
                 "confidence_score": extracted["confidence"],
+                "extraction_method": extracted.get("extraction_method", "none"),
             }
             try:
                 await self.pg.save_document(doc_record)
@@ -489,7 +490,11 @@ class BatchIndexer:
                 )
 
         if det_fields:
-            return {"fields": det_fields, "confidence": det_conf}
+            return {
+                "fields":            det_fields,
+                "confidence":        det_conf,
+                "extraction_method": "deterministic",
+            }
 
         # Step 2 — Claude Vision fallback. Only fires when the
         # deterministic extractor returned empty (or no extractor
@@ -505,7 +510,11 @@ class BatchIndexer:
                 pdf_bytes, doc_type, doc_category,
             )
             if ai_fields:
-                return {"fields": ai_fields, "confidence": float(ai_conf)}
+                return {
+                    "fields":            ai_fields,
+                    "confidence":        float(ai_conf),
+                    "extraction_method": "ai_vision",
+                }
         except Exception as exc:
             logger.warning(
                 "ai_extraction_failed",
@@ -515,4 +524,8 @@ class BatchIndexer:
         # Step 3 — give up gracefully. Empty fields + 0.5 confidence
         # is the documented "no signal" return; the indexer's
         # anti-clobber path keeps the caller-supplied extracted_fields.
-        return {"fields": {}, "confidence": 0.5}
+        return {
+            "fields":            {},
+            "confidence":        0.5,
+            "extraction_method": "none",
+        }

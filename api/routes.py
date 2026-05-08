@@ -605,13 +605,20 @@ async def get_field_across_documents(
             max_delta_pct = round(spread / peak * 100, 2)
             has_conflict = max_delta_pct > 10.0
 
+    # Surface the extraction_method of the best-source document at the
+    # top level so callers can decide how confident to be without
+    # digging into best_value's row dict. Falls back to "none" when no
+    # best document was found (shouldn't happen given the 404 above
+    # but keeps the contract honest).
+    best_method = (best or {}).get("extraction_method") if isinstance(best, dict) else None
     return {
-        "field_name":     field_name,
-        "applicant_id":   applicant_id,
-        "best_value":     best,
-        "all_sources":    sources,
-        "has_conflict":   has_conflict,
-        "max_delta_pct":  max_delta_pct,
+        "field_name":        field_name,
+        "applicant_id":      applicant_id,
+        "best_value":        best,
+        "extraction_method": best_method or "none",
+        "all_sources":       sources,
+        "has_conflict":      has_conflict,
+        "max_delta_pct":     max_delta_pct,
     }
 
 

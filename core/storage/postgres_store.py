@@ -654,15 +654,26 @@ class PostgresStore:
     # ---------------- documents -----------------
 
     async def save_document(self, doc: dict) -> None:
+        # extraction_method priority on upsert:
+        #   deterministic > caller_supplied > ai_vision > none
+        # The CASE picks the higher-ranked of the existing row's
+        # method and the incoming method. Order: if either side is
+        # ``deterministic``, that wins; otherwise if either is
+        # ``caller_supplied``, that wins; etc. This means a doc first
+        # uploaded with caller_supplied fields then re-extracted by the
+        # batch indexer to ``deterministic`` correctly upgrades; a doc
+        # that AI Vision touched then later landed with caller_supplied
+        # fields correctly downgrades-to-better.
         await db.execute(
             """
             INSERT INTO document_index (
                 document_id, applicant_id, application_id, document_type,
                 document_category, borrower_role, s3_key, status,
-                expiry_date, is_current, extracted_fields, confidence_score
+                expiry_date, is_current, extracted_fields, confidence_score,
+                extraction_method
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
-                $9::date, $10, $11::jsonb, $12
+                $9::date, $10, $11::jsonb, $12, $13
             )
             ON CONFLICT (document_id) DO UPDATE SET
                 applicant_id      = EXCLUDED.applicant_id,
@@ -675,7 +686,19 @@ class PostgresStore:
                 expiry_date       = EXCLUDED.expiry_date,
                 is_current        = EXCLUDED.is_current,
                 extracted_fields  = EXCLUDED.extracted_fields,
-                confidence_score  = EXCLUDED.confidence_score
+                confidence_score  = EXCLUDED.confidence_score,
+                extraction_method = CASE
+                    WHEN document_index.extraction_method = 'deterministic'
+                         OR EXCLUDED.extraction_method = 'deterministic'
+                        THEN 'deterministic'
+                    WHEN document_index.extraction_method = 'caller_supplied'
+                         OR EXCLUDED.extraction_method = 'caller_supplied'
+                        THEN 'caller_supplied'
+                    WHEN document_index.extraction_method = 'ai_vision'
+                         OR EXCLUDED.extraction_method = 'ai_vision'
+                        THEN 'ai_vision'
+                    ELSE 'none'
+                END
             """,
             doc["document_id"],
             doc["applicant_id"],
@@ -689,6 +712,7 @@ class PostgresStore:
             doc.get("is_current", True),
             _to_jsonb(doc.get("extracted_fields")),
             doc.get("confidence_score"),
+            doc.get("extraction_method") or "none",
         )
 
     async def get_document(self, document_id: str) -> Optional[dict]:
@@ -758,6 +782,7 @@ class PostgresStore:
                    document_id,
                    extracted_fields -> $2 AS field_value,
                    confidence_score,
+                   extraction_method,
                    received_at
             FROM document_index
             WHERE applicant_id = $1
@@ -918,13 +943,30 @@ class PostgresStore:
         rels = await self.get_relationships_for_applicant(applicant_id)
         conflicts = [r for r in rels if r["relationship_type"] == "contradicts"]
         confirms  = [r for r in rels if r["relationship_type"] == "confirms"]
+        # Per-applicant extraction-method breakdown so ops can see at a
+        # glance how the doc fields were populated. The four buckets
+        # cover every save_document path:
+        #   deterministic   — pymupdf / income / asset / loan extractor
+        #   caller_supplied — LOS or API caller sent structured fields
+        #   ai_vision       — Claude Vision fallback
+        #   none            — placeholder row with no extracted_fields
+        breakdown = {
+            "deterministic":   0,
+            "caller_supplied": 0,
+            "ai_vision":       0,
+            "none":            0,
+        }
+        for d in docs:
+            method = d.get("extraction_method") or "none"
+            breakdown[method] = breakdown.get(method, 0) + 1
         return {
-            "applicant_id":       applicant_id,
-            "document_count":     len(docs),
-            "relationship_count": len(rels),
-            "confirmation_count": len(confirms),
-            "conflict_count":     len(conflicts),
-            "requires_review":    len(conflicts) > 0,
+            "applicant_id":         applicant_id,
+            "document_count":       len(docs),
+            "relationship_count":   len(rels),
+            "confirmation_count":   len(confirms),
+            "conflict_count":       len(conflicts),
+            "requires_review":      len(conflicts) > 0,
+            "extraction_breakdown": breakdown,
         }
 
     # ---------------- external IDs / LOS integration -----------------

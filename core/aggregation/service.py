@@ -735,6 +735,20 @@ class AggregationService:
                 if doc_type and doc_type != "UNKNOWN" else "income"
             )
 
+            # extraction_method default = "caller_supplied" because the
+            # event-driven /documents/upload + /ingest/* paths route
+            # here with the LOS or API caller's structured fields. The
+            # batch indexer overrides this when it re-extracts via
+            # pymupdf or AI Vision (passing extraction_method
+            # explicitly on the doc dict). save_document's CASE
+            # upsert handles priority — a doc that arrives here as
+            # caller_supplied then later gets a deterministic
+            # extraction from the indexer correctly upgrades.
+            extraction_method = d.get("extraction_method") or "caller_supplied"
+            # Empty extracted_fields → "none" regardless of source.
+            if not extracted_fields:
+                extraction_method = "none"
+
             saved_doc = {
                 "document_id":       d.get("document_id"),
                 "applicant_id":      doc_applicant,
@@ -747,6 +761,7 @@ class AggregationService:
                 "is_current":        True,
                 "extracted_fields":  extracted_fields,
                 "confidence_score":  d.get("confidence_score", 0.95),
+                "extraction_method": extraction_method,
             }
             try:
                 await self.postgres_store.save_document(saved_doc)
