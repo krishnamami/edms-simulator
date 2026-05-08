@@ -213,10 +213,15 @@ class S3EDMSConnector(BaseEDMSConnector):
                     doc = self._read_json(file_path)
                 except Exception as exc:
                     read_failed += 1
+                    # Inline the path + error in the message so the
+                    # production stdlib formatter surfaces it in
+                    # CloudWatch (extra={} is dropped by the default
+                    # formatter).
                     logger.warning(
-                        "connector_doc_read_failed",
-                        extra={"path":  str(file_path),
-                               "error": str(exc)[:200]},
+                        f"connector_doc_read_failed "
+                        f"path={file_path} "
+                        f"error_type={type(exc).__name__} "
+                        f"error={str(exc)[:300]}"
                     )
                     continue
 
