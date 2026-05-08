@@ -162,6 +162,44 @@ class RedisStore:
             return {"present": False, "ttl_seconds": None}
         return {"present": True, "ttl_seconds": ttl if ttl >= 0 else None}
 
+    # ---------------- per-applicant assembly lock -----------------
+    #
+    # Serialize concurrent _run_assembly invocations for one applicant so
+    # two near-simultaneous /documents/upload calls don't each compute
+    # income from a partial doc set and race the last set_income_profile.
+    # SET NX EX acquire + plain DEL release. The 30s TTL is a crash-
+    # safety net: if the holder dies mid-assembly the lock auto-expires
+    # so the next request isn't permanently blocked.
+
+    _LOCK_TTL_SECONDS = 30
+
+    def try_acquire_assembly_lock(
+        self, applicant_id: str, ttl: Optional[int] = None
+    ) -> bool:
+        """Attempt to acquire the per-applicant assembly lock.
+
+        Returns ``True`` on success (lock now held by this caller),
+        ``False`` if another caller already holds it. Returns ``False``
+        on any Redis error rather than raising — callers can decide
+        whether to retry or fall through.
+        """
+        key = f"assembly_lock:{applicant_id}"
+        try:
+            return bool(
+                self._r.set(key, "1", nx=True, ex=ttl or self._LOCK_TTL_SECONDS)
+            )
+        except Exception as e:
+            logger.warning("redis_lock_acquire_failed", extra={"error": str(e)})
+            return False
+
+    def release_assembly_lock(self, applicant_id: str) -> None:
+        """Drop the lock so the next request can acquire it."""
+        key = f"assembly_lock:{applicant_id}"
+        try:
+            self._r.delete(key)
+        except Exception as e:
+            logger.warning("redis_lock_release_failed", extra={"error": str(e)})
+
     # ---------------- document knowledge graph -----------------
 
     def invalidate_income_profile(self, applicant_id: str) -> None:

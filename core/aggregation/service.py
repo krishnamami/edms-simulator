@@ -5,6 +5,7 @@ Three event paths:
   B: DOCUMENT_UPLOADED      -> stale -> re-assemble -> active
   C: IDENTITY_RESOLVED      -> transition to active
 """
+import asyncio
 from datetime import datetime
 from typing import Optional
 
@@ -217,6 +218,10 @@ class AggregationService:
         #     the primary's applicant_id, and co-side income never assembled
         #   - documents was just this request's payload → assembling on a
         #     CREDIT_REPORT alone wiped primary qualifying back to $0
+        # _run_assembly itself merges the request docs with the cumulative
+        # PG state inside its per-applicant lock, so we hand the request
+        # docs through directly and let it do the read once we hold the
+        # lock.
         application_id = p.get("application_id", "")
         co_applicant_id: Optional[str] = None
         loan_data: dict = {}
@@ -233,17 +238,11 @@ class AggregationService:
                 "loan_term_months": app.get("loan_term_months"),
             }
 
-        documents = await self._merge_request_with_indexed_docs(
-            applicant_id=applicant_id,
-            co_applicant_id=co_applicant_id,
-            new_docs=p.get("all_documents", []),
-        )
-
         await self._run_assembly(
             applicant_id=applicant_id,
             application_id=application_id,
             co_applicant_id=co_applicant_id,
-            documents=documents,
+            documents=p.get("all_documents", []),
             loan_data=loan_data,
         )
 
@@ -293,21 +292,12 @@ class AggregationService:
         documents: list,
         loan_data: dict,
     ):
-        primary_docs = [
-            d for d in documents if d.get("borrower_role") == "primary"
-        ]
-        co_docs = [
-            d for d in documents if d.get("borrower_role") == "co_borrower"
-        ]
-
-        # Persist documents into document_index BEFORE running the credit /
-        # income assemblers. The credit assembler reads CREDIT_REPORT field
-        # values out of the Postgres ``extracted_fields`` jsonb column via
-        # ``pg.get_documents_for_applicant`` — if we save after assembly
-        # the just-arrived CREDIT_REPORT isn't visible to the assembler
-        # and it falls back to a synthetic profile (the bug the live demo
-        # was hitting). Reconciliation also runs here, which is fine: the
-        # reconciler skips comparing a doc to itself by document_id.
+        # Persist incoming docs to PG BEFORE we attempt the assembly
+        # lock — that way, even if we bail on contention, our docs are
+        # in document_index and the holder's inner-merge will fold
+        # them in. Otherwise a bailed request loses its docs entirely.
+        # save_document is an idempotent upsert on document_id, so
+        # double-persisting the same doc is safe.
         await self._persist_and_reconcile_documents(
             documents=documents,
             applicant_id=applicant_id,
@@ -315,84 +305,134 @@ class AggregationService:
             application_id=application_id,
         )
 
-        # Credit reads from Postgres directly — see core/credit/assembler.py
-        # for the ``extracted_fields``-only read pattern.
-        primary_credit = await self.credit_assembler.assemble(
-            applicant_id,
-            loan_data,
-            postgres_store=self.postgres_store,
-        )
-        co_credit = (
-            await self.credit_assembler.assemble(
-                co_applicant_id,
+        # Per-applicant advisory lock to serialize concurrent assemblies
+        # (e.g. W2 + paystub uploaded within ms via /documents/upload).
+        # Without this, both threads each read their own snapshot of
+        # document_index and the last set_income_profile to Redis may
+        # have been computed from an incomplete doc set. Lock keys on
+        # applicant_id (not application_id) so co-borrower-only uploads
+        # filed under the primary's applicant_id still serialize.
+        if not self.redis_store.try_acquire_assembly_lock(applicant_id):
+            # Brief wait + one retry. If another assembly is running for
+            # this applicant it'll re-read the full doc set from PG
+            # (now including the docs we persisted above) and compute
+            # the right answer — so giving up is safe.
+            await asyncio.sleep(0.5)
+            if not self.redis_store.try_acquire_assembly_lock(applicant_id):
+                logger.warning(
+                    "assembly_lock_contention",
+                    applicant_id=applicant_id,
+                    application_id=application_id,
+                    co_applicant_id=co_applicant_id,
+                )
+                return
+
+        try:
+            # Re-read the cumulative doc set from PG INSIDE the lock so
+            # we see every doc that was persisted while we were waiting
+            # (including anything from a concurrent request that just
+            # released the lock — or one that bailed after persisting).
+            # The caller's `documents` arg is passed as the new_docs
+            # hint, but since we already persisted above this is mostly
+            # an identity merge — kept for the contract that new_docs
+            # wins on document_id collisions.
+            documents = await self._merge_request_with_indexed_docs(
+                applicant_id=applicant_id,
+                co_applicant_id=co_applicant_id,
+                new_docs=documents,
+            )
+
+            primary_docs = [
+                d for d in documents if d.get("borrower_role") == "primary"
+            ]
+            co_docs = [
+                d for d in documents if d.get("borrower_role") == "co_borrower"
+            ]
+
+            # Credit reads from Postgres directly — see
+            # core/credit/assembler.py for the ``extracted_fields``-only
+            # read pattern.
+            primary_credit = await self.credit_assembler.assemble(
+                applicant_id,
                 loan_data,
                 postgres_store=self.postgres_store,
             )
-            if co_applicant_id
-            else None
-        )
-
-        # Diagnostic: log what the assembler is about to see and what it returns.
-        # If qualifying_monthly is $0, the doc shapes here are usually the cause
-        # (e.g. box1_wages missing or buried under extracted_fields).
-        logger.info(
-            "income_assembly_inputs",
-            applicant_id=applicant_id,
-            application_id=application_id,
-            primary_doc_count=len(primary_docs),
-            co_doc_count=len(co_docs),
-            primary_doc_types=[d.get("document_type") for d in primary_docs],
-            primary_top_level_keys=[
-                sorted(d.keys()) for d in primary_docs
-            ],
-        )
-        profile = self.income_assembler.assemble(
-            primary_docs=primary_docs,
-            co_borrower_docs=co_docs,
-            primary_credit=primary_credit,
-            co_borrower_credit=co_credit,
-            application_id=application_id,
-            applicant_id=applicant_id,
-            co_applicant_id=co_applicant_id,
-        )
-        logger.info(
-            "income_assembly_result",
-            applicant_id=applicant_id,
-            primary_qualifying_monthly=profile.primary_borrower.get("qualifying_monthly"),
-            co_qualifying_monthly=(profile.co_borrower or {}).get("qualifying_monthly") if profile.co_borrower else None,
-            combined_qualifying_monthly=profile.combined_qualifying_monthly,
-            primary_source_types=[
-                s.get("source_type") for s in profile.primary_borrower.get("sources", [])
-            ],
-        )
-        await self.postgres_store.save_income_profile(profile.model_dump())
-        await self.postgres_store.save_credit_profile(primary_credit)
-        if co_credit:
-            await self.postgres_store.save_credit_profile(co_credit)
-
-        # Invalidate the context cache BEFORE warming income / credit so the
-        # worst case is "no cache" (next GET /application/{id}/context reads
-        # through to PG) rather than "fresh income+credit sitting beside a
-        # stale context blob still embedding the old income". Always look up
-        # via applicant_id rather than trusting the caller's application_id
-        # arg: BatchIndexer passes application_id directly, but other callers
-        # (e.g. webhook-driven ingestion) may not have it.
-        # get_application_by_applicant covers both primary and co-applicant.
-        try:
-            app = await self.postgres_store.get_application_by_applicant(
-                applicant_id
+            co_credit = (
+                await self.credit_assembler.assemble(
+                    co_applicant_id,
+                    loan_data,
+                    postgres_store=self.postgres_store,
+                )
+                if co_applicant_id
+                else None
             )
-            if app:
-                self.redis_store.invalidate_context(app["application_id"])
-            elif application_id:
-                self.redis_store.invalidate_context(application_id)
-        except Exception as exc:
-            logger.warning("invalidate_context_failed", error=str(exc))
 
-        self.redis_store.set_income_profile(applicant_id, profile.model_dump())
-        self.redis_store.set_credit_profile(applicant_id, primary_credit)
-        if co_credit:
-            self.redis_store.set_credit_profile(co_applicant_id, co_credit)
+            # Diagnostic: log what the assembler is about to see and what
+            # it returns. If qualifying_monthly is $0, the doc shapes
+            # here are usually the cause (e.g. box1_wages missing or
+            # buried under extracted_fields).
+            logger.info(
+                "income_assembly_inputs",
+                applicant_id=applicant_id,
+                application_id=application_id,
+                primary_doc_count=len(primary_docs),
+                co_doc_count=len(co_docs),
+                primary_doc_types=[d.get("document_type") for d in primary_docs],
+                primary_top_level_keys=[
+                    sorted(d.keys()) for d in primary_docs
+                ],
+            )
+            profile = self.income_assembler.assemble(
+                primary_docs=primary_docs,
+                co_borrower_docs=co_docs,
+                primary_credit=primary_credit,
+                co_borrower_credit=co_credit,
+                application_id=application_id,
+                applicant_id=applicant_id,
+                co_applicant_id=co_applicant_id,
+            )
+            logger.info(
+                "income_assembly_result",
+                applicant_id=applicant_id,
+                primary_qualifying_monthly=profile.primary_borrower.get("qualifying_monthly"),
+                co_qualifying_monthly=(profile.co_borrower or {}).get("qualifying_monthly") if profile.co_borrower else None,
+                combined_qualifying_monthly=profile.combined_qualifying_monthly,
+                primary_source_types=[
+                    s.get("source_type") for s in profile.primary_borrower.get("sources", [])
+                ],
+            )
+            await self.postgres_store.save_income_profile(profile.model_dump())
+            await self.postgres_store.save_credit_profile(primary_credit)
+            if co_credit:
+                await self.postgres_store.save_credit_profile(co_credit)
+
+            # Invalidate the context cache BEFORE warming income /
+            # credit so the worst case is "no cache" (next GET
+            # /application/{id}/context reads through to PG) rather than
+            # "fresh income+credit sitting beside a stale context blob
+            # still embedding the old income". Always look up via
+            # applicant_id rather than trusting the caller's
+            # application_id arg: BatchIndexer passes application_id
+            # directly, but other callers (e.g. webhook-driven
+            # ingestion) may not have it. get_application_by_applicant
+            # covers both primary and co-applicant.
+            try:
+                app = await self.postgres_store.get_application_by_applicant(
+                    applicant_id
+                )
+                if app:
+                    self.redis_store.invalidate_context(app["application_id"])
+                elif application_id:
+                    self.redis_store.invalidate_context(application_id)
+            except Exception as exc:
+                logger.warning("invalidate_context_failed", error=str(exc))
+
+            self.redis_store.set_income_profile(applicant_id, profile.model_dump())
+            self.redis_store.set_credit_profile(applicant_id, primary_credit)
+            if co_credit:
+                self.redis_store.set_credit_profile(co_applicant_id, co_credit)
+        finally:
+            self.redis_store.release_assembly_lock(applicant_id)
 
     async def _merge_request_with_indexed_docs(
         self,
