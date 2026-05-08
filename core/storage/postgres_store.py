@@ -2218,3 +2218,255 @@ class PostgresStore:
                 """
             )
         return [_row_to_dict(r) for r in rows]
+
+    # ---------------- entity_states / snapshots / build_runs (Backtest) -----------------
+    #
+    # The incremental-graph pipeline writes one ``entity_states`` row per
+    # applicant / property and *updates it in place* on every build tick.
+    # ``entity_snapshots`` is the EOD copy keyed (snapshot_date, entity_id)
+    # — Decision-OS lineage replay reads this. ``graph_build_runs``
+    # records every builder execution with the watermark trail.
+
+    async def upsert_entity_state(
+        self,
+        entity_id: str,
+        entity_type: str,
+        application_id: str,
+        state: dict,
+        document_count: int = 0,
+        graph_edge_count: int = 0,
+        conflict_count: int = 0,
+        completeness_pct: float = 0.0,
+        tenant_id: str = "default",
+    ) -> None:
+        await db.execute(
+            """
+            INSERT INTO entity_states (
+                entity_id, entity_type, application_id, tenant_id,
+                state, document_count, graph_edge_count, conflict_count,
+                completeness_pct, last_updated, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, NOW(), NOW()
+            )
+            ON CONFLICT (entity_id) DO UPDATE SET
+                entity_type      = EXCLUDED.entity_type,
+                application_id   = EXCLUDED.application_id,
+                tenant_id        = EXCLUDED.tenant_id,
+                state            = EXCLUDED.state,
+                document_count   = EXCLUDED.document_count,
+                graph_edge_count = EXCLUDED.graph_edge_count,
+                conflict_count   = EXCLUDED.conflict_count,
+                completeness_pct = EXCLUDED.completeness_pct,
+                last_updated     = NOW()
+            """,
+            entity_id, entity_type, application_id, tenant_id,
+            _to_jsonb(state),
+            int(document_count), int(graph_edge_count),
+            int(conflict_count), float(completeness_pct),
+        )
+
+    async def get_entity_state(
+        self, entity_id: str, tenant_id: str = "default",
+    ) -> Optional[dict]:
+        row = await db.fetchrow(
+            """
+            SELECT entity_id, entity_type, application_id, tenant_id,
+                   state, document_count, graph_edge_count, conflict_count,
+                   completeness_pct, last_updated, created_at
+              FROM entity_states
+             WHERE entity_id = $1 AND tenant_id = $2
+            """,
+            entity_id, tenant_id,
+        )
+        return _row_to_dict(row)
+
+    async def get_entity_states_by_date_range(
+        self,
+        date_from,
+        date_to,
+        tenant_id: str = "default",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list:
+        rows = await db.fetch(
+            """
+            SELECT entity_id, entity_type, application_id, tenant_id,
+                   state, document_count, graph_edge_count, conflict_count,
+                   completeness_pct, last_updated, created_at
+              FROM entity_states
+             WHERE last_updated >= $1::timestamptz
+               AND last_updated <  $2::timestamptz
+               AND tenant_id = $3
+             ORDER BY last_updated DESC
+             LIMIT $4 OFFSET $5
+            """,
+            _to_ts(date_from), _to_ts(date_to), tenant_id,
+            int(limit), int(offset),
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def count_entity_states_by_date_range(
+        self, date_from, date_to, tenant_id: str = "default",
+    ) -> int:
+        val = await db.fetchval(
+            """
+            SELECT COUNT(*)
+              FROM entity_states
+             WHERE last_updated >= $1::timestamptz
+               AND last_updated <  $2::timestamptz
+               AND tenant_id = $3
+            """,
+            _to_ts(date_from), _to_ts(date_to), tenant_id,
+        )
+        return int(val or 0)
+
+    async def take_snapshot(
+        self,
+        snapshot_date,
+        tenant_id: str = "default",
+    ) -> int:
+        """Copy every ``entity_states`` row for ``tenant_id`` into
+        ``entity_snapshots`` keyed on ``snapshot_date``. ``ON CONFLICT``
+        re-writes the row so re-running EOD is idempotent — last write
+        within the day wins. Returns the count of entities snapshotted."""
+        val = await db.fetchval(
+            """
+            WITH inserted AS (
+                INSERT INTO entity_snapshots (
+                    snapshot_date, entity_id, entity_type, application_id,
+                    tenant_id, state, document_count, graph_edge_count,
+                    conflict_count, completeness_pct, snapshot_taken_at
+                )
+                SELECT $1::date, entity_id, entity_type, application_id,
+                       tenant_id, state, document_count, graph_edge_count,
+                       conflict_count, completeness_pct, NOW()
+                  FROM entity_states
+                 WHERE tenant_id = $2
+                ON CONFLICT (snapshot_date, entity_id) DO UPDATE SET
+                    entity_type      = EXCLUDED.entity_type,
+                    application_id   = EXCLUDED.application_id,
+                    tenant_id        = EXCLUDED.tenant_id,
+                    state            = EXCLUDED.state,
+                    document_count   = EXCLUDED.document_count,
+                    graph_edge_count = EXCLUDED.graph_edge_count,
+                    conflict_count   = EXCLUDED.conflict_count,
+                    completeness_pct = EXCLUDED.completeness_pct,
+                    snapshot_taken_at = NOW()
+                RETURNING entity_id
+            )
+            SELECT COUNT(*) FROM inserted
+            """,
+            _to_date(snapshot_date), tenant_id,
+        )
+        return int(val or 0)
+
+    async def get_entity_timeline(
+        self, entity_id: str, tenant_id: str = "default",
+    ) -> list:
+        rows = await db.fetch(
+            """
+            SELECT id, snapshot_date, entity_id, entity_type, application_id,
+                   tenant_id, state, document_count, graph_edge_count,
+                   conflict_count, completeness_pct, snapshot_taken_at
+              FROM entity_snapshots
+             WHERE entity_id = $1 AND tenant_id = $2
+             ORDER BY snapshot_date ASC
+            """,
+            entity_id, tenant_id,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def insert_graph_build_run(
+        self,
+        build_date,
+        build_number: int,
+        watermark_from,
+        watermark_to,
+        stats: dict,
+        started_at,
+        completed_at=None,
+        status: str = "completed",
+        error_details: Optional[str] = None,
+        tenant_id: str = "default",
+    ) -> str:
+        new_id = await db.fetchval(
+            """
+            INSERT INTO graph_build_runs (
+                tenant_id, build_date, build_number,
+                watermark_from, watermark_to,
+                documents_pulled, documents_new, documents_skipped,
+                entities_updated, edges_created, duration_ms,
+                status, error_details, started_at, completed_at
+            ) VALUES (
+                $1, $2::date, $3,
+                $4::timestamptz, $5::timestamptz,
+                $6, $7, $8,
+                $9, $10, $11,
+                $12, $13, $14::timestamptz,
+                COALESCE($15::timestamptz, NOW())
+            )
+            RETURNING id
+            """,
+            tenant_id, _to_date(build_date), int(build_number),
+            _to_ts(watermark_from), _to_ts(watermark_to),
+            int(stats.get("documents_pulled") or 0),
+            int(stats.get("documents_new")    or 0),
+            int(stats.get("documents_skipped") or 0),
+            int(stats.get("entities_updated") or 0),
+            int(stats.get("edges_created")    or 0),
+            int(stats.get("duration_ms")      or 0),
+            status, error_details,
+            _to_ts(started_at), _to_ts(completed_at),
+        )
+        return str(new_id)
+
+    async def get_graph_build_runs(
+        self,
+        date_from,
+        date_to,
+        tenant_id: str = "default",
+        limit: int = 100,
+    ) -> list:
+        rows = await db.fetch(
+            """
+            SELECT id, tenant_id, build_date, build_number,
+                   watermark_from, watermark_to,
+                   documents_pulled, documents_new, documents_skipped,
+                   entities_updated, edges_created, duration_ms,
+                   status, error_details, started_at, completed_at
+              FROM graph_build_runs
+             WHERE build_date >= $1::date
+               AND build_date <= $2::date
+               AND tenant_id = $3
+             ORDER BY build_date ASC, build_number ASC
+             LIMIT $4
+            """,
+            _to_date(date_from), _to_date(date_to), tenant_id, int(limit),
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def count_edges_for_entity(
+        self, applicant_id: str, tenant_id: str = "default",
+    ) -> int:
+        val = await db.fetchval(
+            """
+            SELECT COUNT(*) FROM document_relationships
+             WHERE applicant_id = $1 AND tenant_id = $2
+            """,
+            applicant_id, tenant_id,
+        )
+        return int(val or 0)
+
+    async def count_conflicts_for_entity(
+        self, applicant_id: str, tenant_id: str = "default",
+    ) -> int:
+        val = await db.fetchval(
+            """
+            SELECT COUNT(*) FROM document_relationships
+             WHERE applicant_id = $1
+               AND relationship_type = 'contradicts'
+               AND tenant_id = $2
+            """,
+            applicant_id, tenant_id,
+        )
+        return int(val or 0)

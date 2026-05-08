@@ -597,6 +597,90 @@ VALUES ('edms_dev_key', 'default', 'Development Key', 'read,write,admin')
 ON CONFLICT (api_key) DO NOTHING;
 
 -- =====================================================================
+-- Incremental knowledge-graph backtest layer.
+--
+-- The S3 → connector → builder pipeline pulls new docs incrementally
+-- via watermarks, indexes them, runs assemblers + reconciler, and
+-- updates entity_states *in place* (one row per applicant / property).
+-- An EOD scheduler copies the current entity_states into entity_snapshots
+-- so a Decision-OS lineage view can replay how an entity evolved day
+-- by day. graph_build_runs records every builder execution with the
+-- watermark trail for ops + audit.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS entity_states (
+    entity_id          VARCHAR(100) PRIMARY KEY,
+    entity_type        VARCHAR(50) NOT NULL,
+    application_id     VARCHAR(100) NOT NULL,
+    tenant_id          VARCHAR(50) NOT NULL DEFAULT 'default',
+    state              JSONB NOT NULL DEFAULT '{}',
+    document_count     INT  NOT NULL DEFAULT 0,
+    graph_edge_count   INT  NOT NULL DEFAULT 0,
+    conflict_count     INT  NOT NULL DEFAULT 0,
+    completeness_pct   FLOAT NOT NULL DEFAULT 0.0,
+    last_updated       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_entity_states_app
+    ON entity_states(application_id);
+CREATE INDEX IF NOT EXISTS idx_entity_states_updated
+    ON entity_states(last_updated);
+CREATE INDEX IF NOT EXISTS idx_entity_states_tenant
+    ON entity_states(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_entity_states_type
+    ON entity_states(entity_type, tenant_id);
+
+-- One row per (snapshot_date, entity_id) — EOD copy of entity_states.
+-- Powers /entity/{id}/timeline and the lineage view.
+CREATE TABLE IF NOT EXISTS entity_snapshots (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    snapshot_date      DATE NOT NULL,
+    entity_id          VARCHAR(100) NOT NULL,
+    entity_type        VARCHAR(50) NOT NULL,
+    application_id     VARCHAR(100) NOT NULL,
+    tenant_id          VARCHAR(50) NOT NULL DEFAULT 'default',
+    state              JSONB NOT NULL,
+    document_count     INT  NOT NULL DEFAULT 0,
+    graph_edge_count   INT  NOT NULL DEFAULT 0,
+    conflict_count     INT  NOT NULL DEFAULT 0,
+    completeness_pct   FLOAT NOT NULL DEFAULT 0.0,
+    snapshot_taken_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (snapshot_date, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_snapshots_date
+    ON entity_snapshots(snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_snapshots_entity
+    ON entity_snapshots(entity_id, snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_snapshots_tenant
+    ON entity_snapshots(tenant_id, snapshot_date);
+
+-- One row per builder execution. The watermark trail
+-- (watermark_from → watermark_to) shows where the incremental pull
+-- advanced on each tick; entities_updated / edges_created / docs_pulled
+-- give the ops dashboard a per-build delta.
+CREATE TABLE IF NOT EXISTS graph_build_runs (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id          VARCHAR(50) NOT NULL DEFAULT 'default',
+    build_date         DATE NOT NULL,
+    build_number       INT NOT NULL,
+    watermark_from     TIMESTAMPTZ,
+    watermark_to       TIMESTAMPTZ,
+    documents_pulled   INT NOT NULL DEFAULT 0,
+    documents_new      INT NOT NULL DEFAULT 0,
+    documents_skipped  INT NOT NULL DEFAULT 0,
+    entities_updated   INT NOT NULL DEFAULT 0,
+    edges_created      INT NOT NULL DEFAULT 0,
+    duration_ms        INT NOT NULL DEFAULT 0,
+    status             VARCHAR(20) NOT NULL DEFAULT 'completed',
+    error_details      TEXT,
+    started_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at       TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_graph_build_runs_date
+    ON graph_build_runs(build_date, build_number);
+CREATE INDEX IF NOT EXISTS idx_graph_build_runs_tenant
+    ON graph_build_runs(tenant_id, build_date DESC);
+
+-- =====================================================================
 -- Webhook outbox — async delivery decouples upload latency from
 -- subscriber availability. Every assembly fan-out writes a row here;
 -- a background worker (core/webhooks/delivery_worker.py) polls

@@ -310,6 +310,121 @@ async def get_applicant_id(request: Request, los_id: str):
     )
 
 
+# ---------------------------------------------------------------------------
+# Incremental graph endpoints — entity_states, snapshots, build runs.
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/entity/{entity_id}/state",
+    dependencies=[Depends(verify_api_key)],
+    summary="Current state of an entity (Decision-OS read shape)",
+    description=(
+        "Returns the live row from ``entity_states`` (write-through "
+        "from the incremental graph builder). This is what Decision OS "
+        "reads when it needs the current shape of a borrower / "
+        "co-borrower / property without re-assembling on the read path."
+    ),
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        404: {"description": "No state recorded for this entity."},
+    },
+)
+async def get_entity_state(request: Request, entity_id: str):
+    pg  = request.app.state.postgres_store
+    tid = get_tenant_id(request)
+    row = await pg.get_entity_state(entity_id, tenant_id=tid)
+    if not row:
+        raise HTTPException(status_code=404, detail="Entity not found")
+    return row
+
+
+@router.get(
+    "/entity/{entity_id}/timeline",
+    dependencies=[Depends(verify_api_key)],
+    summary="EOD snapshot timeline for an entity",
+    description=(
+        "Returns every ``entity_snapshots`` row for this entity ordered "
+        "by ``snapshot_date`` ascending — the lineage view used by "
+        "audit / replay tools. One row per simulated day."
+    ),
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        404: {"description": "No snapshots recorded for this entity yet."},
+    },
+)
+async def get_entity_timeline_endpoint(request: Request, entity_id: str):
+    pg  = request.app.state.postgres_store
+    tid = get_tenant_id(request)
+    rows = await pg.get_entity_timeline(entity_id, tenant_id=tid)
+    if not rows:
+        raise HTTPException(status_code=404, detail="No snapshots for entity")
+    return {
+        "entity_id": entity_id,
+        "snapshots": rows,
+        "count":     len(rows),
+    }
+
+
+@router.get(
+    "/graph/build-runs",
+    dependencies=[Depends(verify_api_key)],
+    summary="Builder execution log",
+    description=(
+        "Returns ``graph_build_runs`` rows in (build_date, build_number) "
+        "order. The watermark trail (``watermark_from`` → "
+        "``watermark_to``) shows where the incremental pull advanced on "
+        "each tick; the per-build deltas show docs pulled / new / "
+        "skipped + entities updated + edges created. Useful for ops "
+        "dashboards + post-mortems."
+    ),
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        422: {"description": "Validation error in date_from / date_to."},
+    },
+)
+async def list_graph_build_runs(
+    request: Request,
+    date_from: Optional[str] = None,
+    date_to:   Optional[str] = None,
+    limit:     int = 100,
+):
+    from datetime import date as _date, datetime as _dt, timedelta as _td
+    pg  = request.app.state.postgres_store
+    tid = get_tenant_id(request)
+    today = _dt.utcnow().date()
+    df = _date.fromisoformat(date_from) if date_from else (today - _td(days=60))
+    dt = _date.fromisoformat(date_to)   if date_to   else today
+    rows = await pg.get_graph_build_runs(df, dt, tenant_id=tid, limit=limit)
+    return {
+        "build_runs": rows,
+        "count":      len(rows),
+        "filters":    {"date_from": str(df), "date_to": str(dt)},
+    }
+
+
+@router.get(
+    "/graph/watermark",
+    dependencies=[Depends(verify_api_key)],
+    summary="Current S3 EDMS connector watermark",
+    description=(
+        "Returns the most-recent ``last_indexed_at`` for the "
+        "``s3_edms_connector`` source. Shows how far the incremental "
+        "pull has advanced — gap to NOW() = backlog."
+    ),
+    responses={401: {"description": "Missing or invalid `X-API-Key`."}},
+)
+async def get_graph_watermark(request: Request):
+    pg = request.app.state.postgres_store
+    row = await pg.get_watermark("s3_edms_connector")
+    last = (row or {}).get("last_indexed_at")
+    return {
+        "source":          "s3_edms_connector",
+        "last_indexed_at": last.isoformat() if hasattr(last, "isoformat") else last,
+        "status":          (row or {}).get("status", "idle"),
+    }
+
+
 @router.get(
     "/applicant/{applicant_id}/income-profile",
     response_model=IncomeProfileResponse,
