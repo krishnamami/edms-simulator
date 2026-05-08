@@ -4,12 +4,12 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "512",
   "memory": "1024",
-  "executionRoleArn": "arn:aws:iam::ACCOUNT_ID:role/ecsTaskExecutionRole",
-  "taskRoleArn": "arn:aws:iam::ACCOUNT_ID:role/edms-simulator-task-role",
+  "executionRoleArn": "arn:aws:iam::621646470377:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::621646470377:role/edms-simulator-task-role",
   "containerDefinitions": [
     {
       "name": "edms-simulator",
-      "image": "ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/edms-simulator:latest",
+      "image": "621646470377.dkr.ecr.us-east-1.amazonaws.com/edms-simulator:latest",
       "portMappings": [
         {
           "containerPort": 8001,
@@ -24,22 +24,22 @@
         {"name": "AWS_REGION", "value": "us-east-1"},
         {"name": "USE_LOCAL_STORAGE", "value": "false"},
         {"name": "USE_FAKE_REDIS", "value": "false"},
-        {"name": "REDIS_SSL", "value": "true"},
-        {"name": "AWS_S3_BUCKET", "value": "edms-simulator-loans"},
-        {"name": "AWS_S3_BUCKET_KMS", "value": "arn:aws:kms:us-east-1:621646470377:key/f61c6a3c-15aa-4e0d-b9dd-8665a8c88d26"}
+        {"name": "ENABLE_SCHEDULE_ENGINE", "value": "true"},
+        {"name": "S3_SIMULATION_SOURCE", "value": "s3://edms-simulator-loans/s3_simulation"}
+
       ],
       "secrets": [
         {
           "name": "DB_CONNECTION",
-          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/aurora/credentials-tNFwJM"
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/aurora/credentials"
         },
         {
           "name": "REDIS_CONNECTION",
-          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/redis/endpoint-Z3uo92"
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/redis/endpoint"
         },
         {
           "name": "API_KEY",
-          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/api/keys-NLNCtu:decision_os_api_key::"
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/api/keys"
         }
       ],
       "logConfiguration": {

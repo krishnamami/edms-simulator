@@ -25,10 +25,35 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 import yaml
+
+
+# Match shell-style ``${NAME}`` and ``${NAME:-default}`` references so a
+# single YAML can carry sensible local-fs defaults while ECS task
+# definitions inject the real S3 / API URL via env vars. Keeps the
+# config file checked in + tenant-agnostic; the deploy substitutes
+# the runtime values without sed/jinja gymnastics.
+_ENV_VAR_RE = re.compile(r"\$\{(\w+)(?::-([^}]*))?\}")
+
+
+def _resolve_env_vars(value: Any) -> Any:
+    """Recursively walk a parsed-YAML structure and substitute every
+    ``${VAR}`` / ``${VAR:-default}`` reference inside string leaves.
+    Non-string scalars (ints, bools, None) are passed through unchanged."""
+    if isinstance(value, str):
+        return _ENV_VAR_RE.sub(
+            lambda m: os.getenv(m.group(1), m.group(2) or ""),
+            value,
+        )
+    if isinstance(value, dict):
+        return {k: _resolve_env_vars(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve_env_vars(v) for v in value]
+    return value
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +120,8 @@ class ScheduleEngine:
     @staticmethod
     def _load_config(path: str) -> dict:
         with open(path, encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            raw = yaml.safe_load(f) or {}
+        return _resolve_env_vars(raw)
 
     def reload(self) -> dict:
         """Re-read the YAML in place + refresh dependent fields. Returns
