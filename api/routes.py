@@ -12,6 +12,7 @@ from typing import Any, Optional
 import structlog
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
 from api.schemas import (
     ApplicantIdResponse,
@@ -445,6 +446,18 @@ def _require_engine(request: Request):
     return engine
 
 
+class _SchedulerTriggerBody(BaseModel):
+    """Body for ``POST /scheduler/trigger``. Defined here (not at the
+    file top with the other schemas) because it's specific to this
+    endpoint and stays near its only caller for readability."""
+    job: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="Job name from schedule.yaml (e.g. `morning_build`, `eod_snapshot`).",
+    )
+
+
 @router.get(
     "/scheduler/status",
     dependencies=[Depends(verify_api_key)],
@@ -465,13 +478,6 @@ async def scheduler_status(request: Request):
     out = engine.status()
     out["loop_running"] = bool(getattr(request.app.state, "schedule_engine_task", None))
     return out
-
-
-from pydantic import BaseModel as _BaseModel, Field as _Field  # noqa: E402
-
-class _SchedulerTriggerBody(_BaseModel):
-    job: str = _Field(..., min_length=1, max_length=100,
-                      description="Job name from schedule.yaml (e.g. `morning_build`, `eod_snapshot`).")
 
 
 @router.post(
