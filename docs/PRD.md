@@ -37,11 +37,16 @@ parties.
 | Income assembly | Per-borrower assembler covering W2 / self-employed / rental / SSA / asset depletion / military, with versioned `income_profiles` (`superseded_by` chain). |
 | Credit assembly | Synthetic tri-merge profile generator deterministic by `credit_band`. |
 | Document generation | reportlab-rendered W2, paystub, bank statement, credit report; Pillow-rendered driver's license JPG; `package_generator` assembles full doc sets. |
-| Document extraction | PyMuPDF text extractor with type-detection + confidence scoring. Claude vision extractor stubbed for plug-in. |
-| Confidence ranking | `SOURCE_CONFIDENCE_RANKING` (IRS=0.99 … VERBAL=0.50). `ConfidenceResolver` picks the highest-confidence value across sources and flags >10% numeric divergence as a conflict. |
-| Caching | Redis (TTL-keyed, **fully async via `redis.asyncio`**) for status / income / credit / app-lookup / context / property / graph. |
+| Document extraction | **23 doc-type extractors** wired into the indexer dispatch — 8 original (W2 / paystub / bank / credit / appraisal / HOI / flood / tax) + 15 new income / asset / property / loan-terms / employment extractors covering IRS / 1040 / Schedule C/E / 1099 / K-1 / retirement / brokerage / gift / AVM / 1004MC / purchase / URLA / rate-lock / offer-letter. All share the same contract: `(pdf_bytes) → (fields, confidence)` returning `({}, 0.5)` on any failure, `base_conf × fraction_populated` on success. |
+| AI extraction fallback | Claude Vision (`claude-sonnet-4-6`) fires when a deterministic extractor returns empty (or no extractor exists for a doc type at all). Renders the first N pages as PNG, sends to Claude with a doc-type-specific field-hint prompt, parses JSON. Always-graceful — `({}, 0.5)` on missing key / disabled flag / network error. Gated on `ENABLE_AI_EXTRACTION=true` (default) and `AI_EXTRACTION_MAX_PAGES=3`. Cost-aware logging on every successful call. |
+| Confidence ranking | `SOURCE_CONFIDENCE_RANKING` (IRS=0.99 … VERBAL=0.50). `ConfidenceResolver` picks the highest-confidence value across sources and flags >10% numeric divergence as a conflict. Per-pair overrides in `FIELD_CONFLICT_THRESHOLDS` (IRS↔W2 5%, IRS↔1040 agi 2%, URLA stated income 10%, AVM↔appraisal 15%, 1004MC 20%, RATE_LOCK↔URLA 5%). |
+| Cross-doc graph | `COMPARISON_MAP` carries 43+ pairs covering IRS↔W2, W2↔paystub, Schedule C/E↔1040, 1099↔1040, K-1↔1040, OFFER↔W2/paystub/VOE, URLA↔W2 (stated-vs-documented via `monthly_income_stated_annual` annualization), URLA↔purchase, RATE_LOCK↔URLA, gift↔bank, AVM↔appraisal, purchase↔appraisal, 1004MC↔appraisal, plus the original employment / property / asset cross-checks. Reconciler emits typed edges (confirms / corroborates / contradicts) into `document_relationships`. |
+| Caching | Redis (TTL-keyed, **fully async via `redis.asyncio`**) for status / income / credit / app-lookup / context / property / graph plus Tier-1 entity caches `asset:{aid}` (4h) and `identity:{aid}` (24h). |
 | Persistence | Aurora-Postgres (asyncpg pool). FK-safe write order, JSONB columns, idempotent upserts. |
 | Concurrency safety | Per-applicant assembly lock (`assembly_lock:{applicant_id}`, 30s TTL) serializes `_run_assembly` for the same applicant; bailed contenders persist their docs first so the holder's inner-merge picks them up. `BatchIndexer` processes distinct applicants in parallel under `Semaphore(10)`. Joint-application doc-merge fans out the primary + co-borrower PG fetches via `asyncio.gather`. |
+| Application context | One-call `GET /application/{id}/context` returns nested `borrower` (income / credit / assets / identity / document_count / qualifying_monthly), `co_borrower_aggregation`, `loan_terms` (URLA / RATE_LOCK / PURCHASE_AGREEMENT merged), `conflicts: {count, critical: [...]}` (top contradicts edges), legacy `primary` / `co_borrower` snapshots (kept for backwards compat), property, vendor_checks, DTI/LTV, readiness flags, missing_items. Cached at `context:{application_id}` (TTL 30m). |
+| Readiness flags | 19 flags covering: borrower (income_verified, credit_pulled, identity_verified, employment_verified, assets_verified, identity_complete, tax_docs_received), property (appraisal_complete, title_clear, title_received, insurance_bound, flood_cert_received), application (dti_calculable, ltv_calculable, aus_ready), loan terms (loan_application_complete, purchase_agreement_received, rate_locked — date-aware), and a cross-doc fraud signal (no_critical_conflicts). |
+| Missing-documents catalog | `GET /application/{id}/missing-documents` returns 15 required slots (with `alternates` for W2_CURRENT∥W2_PRIOR / AUS_DU∥LP / HOI_BINDER∥HOI_DECLARATIONS) + 9 conditional slots (IRS transcript, 1040, Schedule C/E, gift letter, wind/hail, WDO, well/septic, HOA — each with the `reason` clause that triggers it) + `received` + `total_expected` / `total_received` / `completeness_pct`. |
 | API | FastAPI app, `X-API-Key` auth, `/health` + `/ready`, structured-log middleware, all `/ingest/*` and `/loans*` endpoints. |
 | Resilience | Anthropic upstream errors map to HTTP 502 with detail; email body fallback preserves attachment processing. |
 | Walkthrough | `scripts/simulate_local.py` runs all 7 ingestion-+aggregation steps end-to-end. |
@@ -51,7 +56,7 @@ parties.
 | Area | What's left |
 |---|---|
 | `_handle_normalized_ingest_event` for non-API channels | Today, only API events drive the full aggregation pipeline. Chat/PDF/email events are produced but not merged into the profile via `ConfidenceResolver`. (Spec called this BUILD 12.) |
-| `claude_extractor.extract` body | Stub raises `NotImplementedError`. The pdf_adapter handles this gracefully today. Real implementation lands when a use case demands it. |
+| ~~`claude_extractor.extract` body~~ | **Shipped Tier-3 (commit `1bde27a`).** `extract_with_claude` (async) + `extract_with_claude_sync` use Claude Vision as the indexer / pdf_adapter fallback. Always-graceful, gated on `ENABLE_AI_EXTRACTION` + `ANTHROPIC_API_KEY`. |
 | XRefStore startup hydration | After uvicorn restart, in-memory state is empty while Postgres persists. Causes `idx_applicant_ssn` UniqueViolation on re-run with existing SSN. Fix: hydrate from Postgres at startup, or have resolver fall back to a Postgres lookup. |
 | `/ingest/csv` ingestion | Endpoint returns parsed signals + report; doesn't push events through the aggregation pipeline. |
 | Live Claude extractor for image | Today image_adapter calls Claude vision directly; could route through `claude_extractor` for unified retry/cache. |
@@ -97,8 +102,10 @@ The simulator is considered "running correctly" when:
 
 1. `docker compose up -d postgres redis` brings both services healthy.
 2. `python -m pytest tests/ --ignore=tests/integration -q` reports
-   `271 passed, 2 skipped` (live tests skipped without API key) on a
-   fresh checkout. Integration + smoke add 11 more for `282 green`.
+   `329 passed, 2 skipped` (live tests skipped without API key) on a
+   fresh checkout. Integration + smoke add 11 more for `340 green`.
+   `python scripts/stress_test_indexing.py` reports `23 passed, 0 failed`
+   across 7 concurrency / cache / throughput / webhook tests.
 3. `python scripts/simulate_local.py` exits 0 and produces:
    - 5 documents in `local_storage/demo/` (≈ 51 KB total)
    - HTTP 200 from `/ingest/pdf` for the W2 with `confidence=1.0`
@@ -120,9 +127,12 @@ The simulator is considered "running correctly" when:
   - `python-multipart` (for `UploadFile` / `Form`)
   - `reportlab`, `PyMuPDF`, `Pillow` (Phase B)
   - `anthropic>=0.99.0` (Phase C)
-- **External services**: optional Anthropic API for chat/image/email body.
-  Cost ≈ a few cents per simulate_local run when live; deterministic adapters
-  are free.
+- **External services**: optional Anthropic API for chat / image / email body
+  / Tier-3 AI extraction fallback. Cost ≈ a few cents per simulate_local run
+  when live; the AI extraction fallback fires only when a deterministic
+  extractor returns empty, and is gated on `ENABLE_AI_EXTRACTION=true`
+  (default) + `AI_EXTRACTION_MAX_PAGES=3`. Flip the flag off for zero token
+  cost.
 - **AWS**: production code targets Aurora + ElastiCache + S3 + ECS + SQS.
   Local stack uses Postgres 15 + Redis 7 in containers and `local_storage/`
   for documents.

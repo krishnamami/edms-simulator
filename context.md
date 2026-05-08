@@ -36,13 +36,18 @@ Redis port is **6380**.
 
 ## Repo state at end of last session
 
-- Branch: `main`, all committed and pushed to origin (`https://github.com/krishnamami/edms-simulator`). Last 6 commits = concurrency hardening + async Redis + parallel indexer.
-- Tests: **271 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`). +3 integration + 8 smoke = 282 green.
-- `simulate_local.py` STEPS 1-5 still PASS; STEP 6 has a known pre-existing failure in the identity resolver (returns `match_method='probabilistic'` where the script asserts `'deterministic'` for an SSN-hash match — applicant_id resolution itself is correct). `simulate_s3_edms.py` has a known pre-existing `TypeError` (`generate_paystub() got an unexpected keyword argument 'employee_address'`) — script-side signature drift, unrelated to indexer code. `watch_pipeline.py --full` runs to completion through all 10 steps.
-- **`RedisStore` is now fully async** — uses `redis.asyncio.Redis` (and `fakeredis.aioredis.FakeRedis` under tests). Every method `await`s its underlying client call, so no FastAPI request handler blocks the event loop on a Redis round-trip.
+- Branch: `main`, all committed and pushed to origin (`https://github.com/krishnamami/edms-simulator`). Last 5 commits = production-grade indexing coverage + 15 new field extractors + Tier-2 cross-doc graph & nested context + Claude Vision AI fallback.
+- Tests: **329 passing, 2 skipped** (live-API tests gated on `ANTHROPIC_API_KEY`). +3 integration + 8 smoke = 340 green.
+- `simulate_local.py` STEPS 1-5 still PASS; STEP 6 has a known pre-existing failure in the identity resolver (returns `match_method='probabilistic'` where the script asserts `'deterministic'` for an SSN-hash match — applicant_id resolution itself is correct). `simulate_s3_edms.py` has a known pre-existing `TypeError` (`generate_paystub() got an unexpected keyword argument 'employee_address'`) — script-side signature drift. `watch_pipeline.py --full` runs to completion through all 10 steps. `scripts/stress_test_indexing.py` (now tracked in git) runs 23 checks across 7 tests — concurrency, indexer/upload race, cache invalidation, doc-type matrix, cross-applicant throughput, watermark rewind, webhook fan-out — all green.
+- **Every doc type a real loan file carries is now indexed, cached, and tracked.** `MISMO_TO_INTERNAL` + new `DOC_TYPE_ALIASES` canonicalize caller-supplied names (`DRIVERS_LICENSE` → `IDENTITY_DL`, `FORM_1040` → `TAX_RETURN_1040_CURRENT`); `_CATEGORY_MAP` renamed `compliance` → `vendor` and `loan` → `loan_terms` to align with the missing-documents catalog. Two new entity Redis caches: `asset:{applicant_id}` (4h TTL — total_liquid_assets / total_retirement / gift_funds / asset_doc_count) and `identity:{applicant_id}` (24h TTL — dl_verified / ssn_verified / ofac_clear / identity_complete). Both are write-through from `_run_assembly`. The missing-documents catalog now carries 15 required slots (with `alternates` for W2_CURRENT∥W2_PRIOR / AUS_DU∥LP / HOI_BINDER∥HOI_DECLARATIONS) + 9 conditional slots (each with the `reason` clause that triggers it) + `total_expected` / `total_received` / `completeness_pct`.
+- **23 doc-type extractors in the indexer dispatch.** 8 original (W2 / paystub / bank / credit / appraisal / HOI / flood / tax) + 15 new (`income_extractors.py`: IRS / 1040 / Schedule C / Schedule E / 1099 / K-1; `asset_extractors.py`: retirement / brokerage / gift_letter; extended `property/extractors.py`: AVM / 1004MC / purchase_agreement; `loan_extractors.py`: URLA_1003 / rate_lock / offer_letter). All share `_utils.py` helpers (`safe_text`, `money_to_float`, `find_labeled` / `find_money` / `find_int`, `fraction_populated`). Every extractor honours the contract: `({}, 0.5)` on any failure, `base_conf × fraction_populated` on success. 38 dispatch entries cover canonical + alias names. Confidence ceilings: IRS=0.99, URLA=0.95, 1099=0.93, K-1/Schedule C/E/1040/property tax=0.90, retirement/brokerage=0.92, AVM=0.87, gift_letter=0.88, offer_letter=0.82.
+- **Tier-2 cross-doc graph.** `COMPARISON_MAP` extended with new field tuples on existing entries (`box1_wages↔wages_salaries`, `wages_line1`, `avm_value`, `ending_balance`, `schedule_c_income / e_income`, `nonemployee_compensation↔other_income`) and 7 entirely new pairs (URLA↔W2, URLA↔purchase, RATE_LOCK↔URLA, OFFER↔W2/paystub/VOE, K1↔1040, 1004MC↔appraisal, retirement self-pair). New logical field `monthly_income_stated_annual` annualizes URLA monthly stated income before W2 comparison. Per-pair `FIELD_CONFLICT_THRESHOLDS` for the new pairs (URLA stated income 10%, OFFER 15%, RATE_LOCK 5%, 1004MC 20%).
+- **`ApplicationContext` gained Tier-2 fields.** `borrower: BorrowerAggregation` (nested `income/credit/assets/identity/document_count/qualifying_monthly`) + `co_borrower_aggregation` + `loan_terms` (URLA / RATE_LOCK / PURCHASE_AGREEMENT merged view) + `conflicts: {count, critical: [...]}` (top contradicts edges, capped at 10). Coexists with the legacy `primary` / `co_borrower` `BorrowerSnapshot` — no breaking changes. Seven new readiness flags: `identity_complete`, `tax_docs_received` (W2 always, +1040 if self-employed), `title_received`, `loan_application_complete`, `purchase_agreement_received`, `rate_locked` (date-aware: `lock_expiry >= today`), `no_critical_conflicts` (defaults True; flips on any contradicts edge above threshold).
+- **Claude Vision AI fallback.** When the deterministic extractor returns empty (or no extractor exists for a doc type at all), `BatchIndexer._extract` (now `async`) and `pdf_adapter` fall through to `core/documents/extractors/claude_extractor.py`. New `extract_with_claude` (async, `AsyncAnthropic`) + `extract_with_claude_sync` (for sync callers) render the first N PDF pages as PNG, send to Claude with a doc-type-specific field-hint prompt, parse JSON. Always-graceful: `({}, 0.5)` on missing key, disabled flag, render failure, network error, parse error. Two env flags: `ENABLE_AI_EXTRACTION=true` (default) and `AI_EXTRACTION_MAX_PAGES=3`. Per-doc-type `_EXPECTED_FIELDS` registry covers all 15 Tier-2 doc types + their canonical / alias forms. Cost-aware logging on success: `ai_extraction_complete` with `doc_type / fields_extracted / pages_sent / model`.
+- **`RedisStore` is fully async** — uses `redis.asyncio.Redis` (and `fakeredis.aioredis.FakeRedis` under tests). Every method `await`s its underlying client call, so no FastAPI request handler blocks the event loop on a Redis round-trip.
 - **`_run_assembly` is serialized per applicant** via a Redis SET-NX-EX advisory lock (`assembly_lock:{applicant_id}`, 30s crash-safety TTL). Concurrent uploads for the same applicant no longer race; bailed contenders persist their docs to PG before bailing so the holder's inner-merge picks them up.
-- **`BatchIndexer` processes applicants in parallel** under `asyncio.Semaphore(_MAX_CONCURRENT_APPLICANTS=10)`. Cap is intentional — the per-applicant lock guarantees correctness for the *same* applicant, the semaphore caps PG-pool pressure across *different* applicants.
-- **Production ECS service** still live + DB-backed at `http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com`. The Phases B → indexing changes — and now also the concurrency / async-Redis / parallel-indexer hardening — have **not been deployed to prod yet**. Only Phase 0/0.5/A are running there. Local docker-compose has every phase applied.
+- **`BatchIndexer` processes applicants in parallel** under `asyncio.Semaphore(_MAX_CONCURRENT_APPLICANTS=10)`. Cap is intentional — the per-applicant lock guarantees correctness for the *same* applicant, the semaphore caps PG-pool pressure across *different* applicants. Indexer also skips docs already fully indexed by the event-driven path (early-exit before `s3.get_raw`).
+- **Production ECS service** still live + DB-backed at `http://edms-simulator-alb-1374683374.us-east-1.elb.amazonaws.com`. The Phases B → indexing changes, the concurrency / async-Redis / parallel-indexer hardening, AND the Tier-2 indexing coverage + extractors + cross-doc graph + AI fallback have **not been deployed to prod yet**. Only Phase 0/0.5/A are running there. Local docker-compose has every phase applied.
 - The pipeline now has three full layers in code:
   1. **Borrower** — universal ingestion + raw storage + identity + income/credit assembly + document graph
   2. **Property** — properties / property_profiles + URAR / HOI / flood / tax / title generators + extractors + PITI math
@@ -57,6 +62,12 @@ Redis port is **6380**.
 Latest commits (top of `main`):
 
 ```
+1bde27a  feat(extractors): Claude Vision AI fallback for the indexer + pdf_adapter
+73d8d6e  feat(graph,context): Tier-2 cross-doc graph + nested borrower context + 7 readiness flags
+2f97bd4  feat(extractors): structured-text extractors for the 15 income/asset/property/loan-terms doc types
+baf49ad  feat(indexing): production-grade coverage — every doc type indexed, cached, tracked
+5361e8b  test(stress): fix stress_test_indexing.py response-shape parsing
+7af97ab  docs: refresh context.md + PRD with session 7's concurrency hardening + async Redis
 64c56b8  perf(indexing): parallelize per-applicant processing under a semaphore cap
 c9f74c9  perf(redis): switch RedisStore from sync redis.Redis to async redis.asyncio.Redis
 6d4a466  perf(aggregation): parallelize PG fetches in _merge_request_with_indexed_docs
@@ -367,6 +378,164 @@ Errors:
 - ✅ **Phase A schema applied to RDS prod**. `raw_ingestion` table + 4 indexes
   live; verified via `scripts/watch_pipeline.py --live`.
 
+### Resolved this session (Tier-1 indexing coverage + Tier-2 extractors / graph / context + Tier-3 AI fallback)
+
+Five commits, all on `main`, pushed to origin. Theme: bring every document
+type a real loan file carries into the read layer (Tier 1), build field
+extractors for the 15 doc types where caller-supplied fields aren't
+guaranteed (Tier 2), then add a Claude Vision AI fallback so unknown /
+unparseable doc types still surface structured fields (Tier 3).
+
+- ✅ **Stress-test response-shape parsing fixes** (`5361e8b`). Four
+  assertions in `scripts/stress_test_indexing.py` collapsed to the same
+  root cause: API endpoints use a consistent `{"source": ..., "data": ...}`
+  envelope (same as `/income-profile` / `/credit-profile`) and tests 1/3/4
+  were reading from the top level instead of `.data`. The endpoints were
+  always correct; the tests were wrong. Tightened to read
+  `summary["data"]["document_count"]` (`/graph/summary`),
+  `ctx["data"]["primary"]["qualifying_monthly"]` (`/context`), and to
+  unwrap `best_value` (which is the highest-confidence row dict, not a
+  scalar — extract `field_value` and normalize the float-vs-int suffix).
+  Added debug logging on the context test so future structure changes
+  produce a useful log line instead of a silent zero. Net: stress suite
+  back to 23/23 PASS, 0 FAIL.
+
+- ✅ **Production-grade indexing coverage — every doc type indexed,
+  cached, tracked** (`baf49ad`). 5-part fix.
+  - `core/ingestion/mismo.py`: new `DOC_TYPE_ALIASES` + `canonicalize_doc_type()`
+    resolves caller-supplied names (`DRIVERS_LICENSE` → `IDENTITY_DL`,
+    `FORM_1040` → `TAX_RETURN_1040_CURRENT`, `RETIREMENT_ACCOUNT` →
+    `ASSET_STATEMENT_RETIREMENT`, etc.). `_CATEGORY_MAP` renamed
+    `compliance` → `vendor` and `loan` → `loan_terms` to align with the
+    missing-documents catalog. `OFAC_/SSN_` moved out of `credit` into
+    `vendor`. `_persist_and_reconcile_documents` canonicalizes doc_type
+    and auto-derives the category at save time so two callers using
+    different names land in the same slot.
+  - `core/storage/redis_store.py`: 6 new async methods —
+    `set/get/invalidate_asset_summary` (key `asset:{aid}`, TTL 4h) +
+    `set/get/invalidate_identity_summary` (key `identity:{aid}`, TTL 24h).
+  - `core/aggregation/service.py`: `_aggregate_and_cache_assets` and
+    `_aggregate_and_cache_identity` run inside `_run_assembly`'s lock,
+    on the same merged doc set as income/credit. Asset summary computes
+    `total_liquid_assets` (banks + brokerage) / `total_retirement` /
+    `gift_funds` / `asset_doc_count`. Identity computes `dl_verified` /
+    `ssn_verified` / `ofac_clear` / `identity_complete`. No new schema —
+    both summaries are recomputable from `document_index`. Failure of
+    either logs but never blocks the upload.
+  - `api/routes.py`: `/application/{id}/missing-documents` now returns
+    `required` (15 slots across all 7 categories with `alternates` for
+    W2_CURRENT∥W2_PRIOR / AUS_DU∥LP / HOI_BINDER∥HOI_DECLARATIONS),
+    `conditional` (9 situational slots — IRS transcript, Form 1040,
+    Schedule C/E, gift letter, wind/hail, WDO, well/septic, HOA — each
+    with the `reason` clause that triggers it), `received`,
+    `total_expected` / `total_received` / `completeness_pct`.
+  - `core/indexing/batch_indexer.py`: extended the category-touch check
+    to also cover `identity` / `employment` / `loan_terms` / `vendor` so
+    indexer-driven uploads also refresh the asset/identity write-through.
+
+- ✅ **15 structured-text field extractors** (`2f97bd4`). Adds the
+  extractors for every doc type that drives an underwriter's
+  calculation but didn't have one yet.
+  - `core/documents/extractors/_utils.py` (new) — shared helpers:
+    `safe_text` (graceful `fitz.open`), `money_to_float`,
+    `fraction_populated`, `find_labeled` / `find_money` / `find_int`.
+  - `core/documents/extractors/income_extractors.py` (new) — 6 extractors:
+    `extract_irs_transcript` (0.99), `extract_1040` (0.90),
+    `extract_schedule_c/e` (0.90), `extract_1099` (0.93,
+    NEC/MISC/INT/DIV detected from title), `extract_k1` (0.90).
+  - `core/documents/extractors/asset_extractors.py` (new) — 3 extractors:
+    `extract_retirement_account` (0.92, account_type detected via regex
+    precedence so Roth IRA wins over IRA / 401k), `extract_brokerage_account`
+    (0.92), `extract_gift_letter` (0.88, `repayment_required` derived
+    from "no repayment" / "is a gift" wording).
+  - `core/property/extractors.py` (extended) — 3 extractors:
+    `extract_avm_report` (0.87), `extract_1004mc` (0.85, market_trend
+    anchored near "Trend" / "Property Values" so it doesn't pick up the
+    keyword elsewhere), `extract_purchase_agreement` (0.85).
+  - `core/documents/extractors/loan_extractors.py` (new) — 3 extractors:
+    `extract_urla_1003` (0.95, parses interest rate from "6.5%",
+    loan_term from "30 years" → 360, ssn_last4 from "***-**-1234"),
+    `extract_rate_lock` (0.93), `extract_offer_letter` (0.82,
+    employment_type detected from body text, pay_frequency from
+    weekly/biweekly/monthly markers).
+  - `core/indexing/batch_indexer.py`: 38 dispatch entries cover
+    canonical + alias names (FORM_1040 routes to `extract_1040`,
+    K1_SCHEDULE to `extract_k1`, RETIREMENT_ACCOUNT to
+    `extract_retirement_account`, etc.).
+  - 4 new test files — graceful-fallback tests for every extractor:
+    empty bytes, binary garbage, truncated PDF — all return `({}, 0.5)`.
+    +42 new tests.
+
+- ✅ **Tier-2 cross-doc graph + nested borrower context + 7 readiness
+  flags** (`73d8d6e`). 4-part fix.
+  - `core/graph/reconciler.py`: `COMPARISON_MAP` extended with new
+    field tuples on existing entries (`box1_wages↔wages_salaries`
+    on W2↔IRS, `wages_line1` on W2↔1040, `avm_value` on
+    appraisal↔AVM, `ending_balance` on gift↔bank, `schedule_c_income /
+    e_income` on Schedule↔1040) and 7 entirely new pair entries
+    (URLA↔W2 / URLA↔purchase / RATE_LOCK↔URLA / OFFER↔W2/paystub/VOE /
+    K1↔1040 / 1004MC↔appraisal / retirement self-pair). New logical
+    field `monthly_income_stated_annual` annualises URLA monthly stated
+    income before W2 comparison (same dual-shape pattern as
+    `annualized_ytd`). 4 new `FIELD_CONFLICT_THRESHOLDS` entries.
+  - `core/context/models.py`: new `BorrowerAggregation` packs the
+    per-borrower entity caches into one nested dict.
+    `ApplicationContext` gained `borrower` / `co_borrower_aggregation` /
+    `loan_terms` / `conflicts` top-level fields. Coexists with the
+    legacy `primary` / `co_borrower` `BorrowerSnapshot` — no breaking
+    changes for existing readers. 7 new `ReadinessFlags`:
+    `identity_complete`, `tax_docs_received`, `title_received`,
+    `loan_application_complete`, `purchase_agreement_received`,
+    `rate_locked`, `no_critical_conflicts`.
+  - `core/context/assembler.py`: reads `asset:{aid}` / `identity:{aid}`
+    via Redis with PG fallback, builds `BorrowerAggregation` for primary
+    + co. `_build_loan_terms` merges URLA / RATE_LOCK / PURCHASE_AGREEMENT
+    extracted_fields with the application row's loan_amount /
+    loan_purpose; most-recent doc per type wins. `_build_conflicts`
+    pulls the top contradicts edges (capped at 10) so Decision OS can
+    render fraud signals without a separate API call. `requires_review`
+    now also flips True on any critical conflict.
+  - `tests/core/graph/test_new_pairs.py` — 9 new tests covering
+    IRS↔W2 confirms/contradicts, URLA↔W2 stated-vs-documented,
+    AVM↔appraisal, purchase↔appraisal, gift↔bank, plus the
+    `COMPARISON_MAP` size assertion (>=43 pairs).
+
+- ✅ **Claude Vision AI fallback** (`1bde27a`). When the deterministic
+  extractor returns empty (or no extractor exists for a doc type at all),
+  the indexer / pdf_adapter falls through to Claude Vision.
+  - `core/documents/extractors/claude_extractor.py` — full rewrite of the
+    Phase-B stub. Two entry points share the same prompt-builder /
+    page-renderer / JSON-parser:
+      * `async extract_with_claude(...)` — async (uses `AsyncAnthropic`)
+        for `BatchIndexer`.
+      * `def extract_with_claude_sync(...)` — sync (uses `Anthropic`)
+        for `pdf_adapter` / `router`.
+    Always-graceful: `({}, 0.5)` on missing key, disabled flag, render
+    failure, network error, parse error. Never raises. `_EXPECTED_FIELDS`
+    registry covers all 15 Tier-2 doc types + canonical / alias forms.
+    Cost-aware logging on success: `ai_extraction_complete` with
+    `doc_type / fields_extracted / pages_sent / model`. Phase-B
+    `extract()` shim retained — now delegates to the sync entry point so
+    `pdf_adapter`'s import keeps working.
+  - `core/indexing/batch_indexer.py`: `_extract` is now `async def` and
+    takes a `doc_category` arg. Three-step dispatch: deterministic →
+    AI fallback (only if det returned empty) → graceful `({}, 0.5)`.
+    The single caller in `_process_applicant` updated to
+    `await self._extract(pdf_bytes, s3_doc.doc_type, s3_doc.category)`.
+  - `core/ingestion/adapters/pdf_adapter.py`: tightened the existing
+    claude_fallback merge — only treats the AI result as useful if
+    `claude_fields` is non-empty (otherwise the graceful tuple no longer
+    spuriously appends `claude_fallback` to notes). Empty result records
+    `claude_fallback_empty` instead. The legacy `NotImplementedError` /
+    `ClaudeExtractorUnavailable` catch is now dead code (kept defensively).
+  - `.env.example`: `ENABLE_AI_EXTRACTION=true` (default) and
+    `AI_EXTRACTION_MAX_PAGES=3`. Flip the flag to false for zero token
+    cost.
+
+Test count: **329 unit (+58 vs prior session's 271) + 3 integration + 8
+smoke = 340 green.** 7 new files: 4 extractor modules + 4 new test files
++ 1 graph test file + the rewritten claude_extractor test file.
+
 ### Resolved this session (concurrency hardening + async Redis + parallel indexer)
 
 Six commits, all on `main`, pushed to origin. Theme: under concurrent load the
@@ -512,9 +681,9 @@ Verified end-to-end against prod: `income:APL-00003-P qualifying_monthly: $12,38
 - ✅ **Incremental indexer** — watermark + S3Scanner + BatchIndexer + AsyncIOScheduler. `simulate_s3_edms.py` validates the skip-unchanged-applicant property.
 - ✅ **FakePostgresStore.save_document upserts on document_id** — caught by the indexer test where `_run_assembly` re-saves docs already persisted by the indexer; previously appended duplicates that production's `ON CONFLICT DO UPDATE` would have collapsed.
 
-### Production deploy of Phases B → indexer + concurrency hardening (NOT YET DEPLOYED)
+### Production deploy of Phases B → indexer + concurrency + Tier-1/2/3 extraction (NOT YET DEPLOYED)
 
-The local docker-compose has every phase applied. Production ECS still runs Phase 0/0.5/A. The async-Redis + per-applicant lock + parallel-indexer commits from this session carry no schema or dependency changes (`redis.asyncio` ships in `redis-py >= 4.2` already in `requirements.txt`; `fakeredis` is dev-only), so they ride along with the Phase B → indexer deploy without adding prerequisites.
+The local docker-compose has every phase applied. Production ECS still runs Phase 0/0.5/A. The async-Redis + per-applicant lock + parallel-indexer commits carry no schema or dependency changes. The Tier-1/2/3 commits this session also carry no schema changes — the new `asset:{aid}` / `identity:{aid}` Redis keys are recomputed on every assembly from `document_index`; the new readiness flags / loan_terms / conflicts / borrower aggregation are derived in the assembler at read time. Two new env flags ship with the AI fallback: `ENABLE_AI_EXTRACTION=true` (default) and `AI_EXTRACTION_MAX_PAGES=3` — leave the flag off in prod until you've sized the Anthropic budget. Everything rides along with the Phase B → indexer deploy without adding prerequisites.
 
 1. **Apply schema deltas to prod RDS.** New tables since the last prod apply: `properties`, `property_profiles`, `webhooks`, `webhook_deliveries`, `context_versions`, `indexing_watermarks`, `indexing_runs`. Plus `applications.property_id` ALTER. Use the same `scripts/apply_schema.py` ECS one-off task pattern that landed Phase A.
 2. **Push image with `apscheduler` deps.** `requirements.txt` gained `APScheduler==3.10.4` + `pytz` + `tzdata` + `tzlocal`. Re-pin via `pip freeze` and rebuild before deploy.
