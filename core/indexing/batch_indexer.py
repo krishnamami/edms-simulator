@@ -267,7 +267,9 @@ class BatchIndexer:
                 )
                 continue
 
-            extracted = self._extract(pdf_bytes, s3_doc.doc_type)
+            extracted = await self._extract(
+                pdf_bytes, s3_doc.doc_type, s3_doc.category,
+            )
 
             existing_fields = (existing or {}).get("extracted_fields") or {}
             new_fields = extracted["fields"] or {}
@@ -379,9 +381,19 @@ class BatchIndexer:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract(pdf_bytes: bytes, doc_type: str) -> dict:
-        """Pick a pymupdf extractor by doc-type. Falls back to empty
-        fields with confidence=0.5 when no specific extractor exists."""
+    async def _extract(
+        pdf_bytes: bytes,
+        doc_type: str,
+        doc_category: str = "",
+    ) -> dict:
+        """Pick a pymupdf extractor by doc-type, then fall through to
+        Claude Vision if the deterministic extractor returned empty
+        (or no extractor exists for this doc type at all). Always
+        returns ``{"fields": dict, "confidence": float}`` — never
+        raises. The AI fallback is gated on
+        ``ENABLE_AI_EXTRACTION=true`` (default) and only fires when
+        ``ANTHROPIC_API_KEY`` is set.
+        """
         from core.documents.extractors.pymupdf_extractor import (
             extract_bank_statement,
             extract_credit_report,
@@ -461,15 +473,46 @@ class BatchIndexer:
             "RATE_LOCK":               extract_rate_lock,
             "OFFER_LETTER":            extract_offer_letter,
         }
+        # Step 1 — deterministic extractor (free, fast, brittle on
+        # non-synthetic PDFs).
         extractor = extractors.get(doc_type)
-        if extractor is None:
-            return {"fields": {}, "confidence": 0.5}
+        det_fields: dict = {}
+        det_conf: float = 0.5
+        if extractor is not None:
+            try:
+                det_fields, det_conf_raw = extractor(pdf_bytes)
+                det_conf = float(det_conf_raw or 0.5)
+            except Exception as exc:
+                logger.warning(
+                    "batch_index_extract_failed",
+                    extra={"doc_type": doc_type, "error": str(exc)[:200]},
+                )
+
+        if det_fields:
+            return {"fields": det_fields, "confidence": det_conf}
+
+        # Step 2 — Claude Vision fallback. Only fires when the
+        # deterministic extractor returned empty (or no extractor
+        # exists at all for this doc type). The fallback itself
+        # gracefully returns ``({}, 0.5)`` when ENABLE_AI_EXTRACTION
+        # is false or no API key is set, so this stays safe in CI
+        # and on key-less deployments.
         try:
-            fields, confidence = extractor(pdf_bytes)
-            return {"fields": fields, "confidence": float(confidence or 0.5)}
+            from core.documents.extractors.claude_extractor import (
+                extract_with_claude,
+            )
+            ai_fields, ai_conf = await extract_with_claude(
+                pdf_bytes, doc_type, doc_category,
+            )
+            if ai_fields:
+                return {"fields": ai_fields, "confidence": float(ai_conf)}
         except Exception as exc:
             logger.warning(
-                "batch_index_extract_failed",
+                "ai_extraction_failed",
                 extra={"doc_type": doc_type, "error": str(exc)[:200]},
             )
-            return {"fields": {}, "confidence": 0.5}
+
+        # Step 3 — give up gracefully. Empty fields + 0.5 confidence
+        # is the documented "no signal" return; the indexer's
+        # anti-clobber path keeps the caller-supplied extracted_fields.
+        return {"fields": {}, "confidence": 0.5}

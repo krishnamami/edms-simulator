@@ -71,12 +71,17 @@ def test_detects_credit_report():
     assert event.document_type == "CREDIT_REPORT"
 
 
-def test_low_confidence_on_unrecognized_pdf():
+def test_low_confidence_on_unrecognized_pdf(monkeypatch):
     # Tiny PDF unrelated to mortgage docs — neither pymupdf nor claude
     # can extract; expect requires_verification=True and notes captured.
+    # Disable AI extraction so this test runs deterministically without
+    # requiring a real ANTHROPIC_API_KEY.
+    monkeypatch.setenv("ENABLE_AI_EXTRACTION", "false")
     minimal_pdf = b"%PDF-1.4\n%\xc7\xec\x8f\xa2\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 0/Kids[]>>endobj\nxref\n0 3\n0000000000 65535 f\n0000000017 00000 n\n0000000060 00000 n\ntrailer<</Size 3/Root 1 0 R>>\nstartxref\n104\n%%EOF\n"
     event = pdf_adapter.adapt(minimal_pdf)
     assert event.requires_verification is True
-    # claude_extractor stub raises NotImplementedError or ClaudeExtractorUnavailable
+    # Tier-3 made claude_extractor.extract() always-graceful (returns
+    # ({}, 0.5) instead of raising), so the note is now
+    # ``claude_fallback_empty`` rather than ``claude_fallback_unavailable``.
     notes = event.extracted_fields.get("_notes", [])
-    assert any("claude_fallback_unavailable" in n for n in notes)
+    assert any("claude_fallback_empty" in n for n in notes), notes

@@ -86,12 +86,26 @@ def adapt(
         fields, confidence = extractor(pdf_bytes)
 
     if confidence < CONFIDENCE_FLOOR:
+        # claude_extractor.extract() now delegates to
+        # extract_with_claude_sync — graceful (returns ({}, 0.5)) when
+        # ENABLE_AI_EXTRACTION=false or ANTHROPIC_API_KEY is unset, and
+        # returns real fields at confidence 0.88 on a successful Vision
+        # call. Either way it doesn't raise, so the old NotImplementedError
+        # / ClaudeExtractorUnavailable catch is now dead code (kept for
+        # safety in case a future revision starts raising again).
         try:
-            claude_fields, claude_conf = claude_extractor.extract(pdf_bytes, hint=doc_type)
-            if claude_conf > confidence:
+            claude_fields, claude_conf = claude_extractor.extract(
+                pdf_bytes, hint=doc_type,
+            )
+            # Only treat the AI result as useful if it actually produced
+            # fields — otherwise the graceful (empty, 0.5) tuple would
+            # spuriously append "claude_fallback" to notes.
+            if claude_fields and claude_conf > confidence:
                 fields = {**fields, **claude_fields}
                 confidence = claude_conf
                 notes.append("claude_fallback")
+            elif not claude_fields:
+                notes.append("claude_fallback_empty")
         except (
             claude_extractor.ClaudeExtractorUnavailable,
             NotImplementedError,
