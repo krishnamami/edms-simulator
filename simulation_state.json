@@ -1,0 +1,75 @@
+{
+  "LOS-SIM-001": {
+    "application_id": "APP-LOS-SIM-001",
+    "applicant_id": "APL-00001-P",
+    "co_applicant_id": "APL-00002-C",
+    "match_method": "deterministic",
+    "is_new_record": false,
+    "property_id": "PROP-d79e43d621da"
+  },
+  "LOS-SIM-002": {
+    "application_id": "APP-LOS-SIM-002",
+    "applicant_id": "APL-00003-P",
+    "co_applicant_id": "APL-00004-C",
+    "match_method": "deterministic",
+    "is_new_record": false
+  },
+  "LOS-SIM-003": {
+    "application_id": "APP-LOS-SIM-003",
+    "applicant_id": "APL-00005-P",
+    "co_applicant_id": "APL-00006-C",
+    "match_method": "deterministic",
+    "is_new_record": false,
+    "property_id": "PROP-056eba3923d2"
+  },
+  "LOS-SIM-004": {
+    "application_id": "APP-LOS-SIM-004",
+    "applicant_id": "APL-00007-P",
+    "co_applicant_id": "APL-00008-C",
+    "match_method": "deterministic",
+    "is_new_record": false
+  },
+  "LOS-SIM-005": {
+    "application_id": "APP-LOS-SIM-005",
+    "applicant_id": "APL-00009-P",
+    "co_applicant_id": "APL-00010-C",
+    "match_method": "deterministic",
+    "is_new_record": false,
+    "property_id": "PROP-a0c11ca0e46f"
+  },
+  "LOS-SIM-006": {
+    "application_id": "APP-LOS-SIM-006",
+    "applicant_id": "APL-00011-P",
+    "co_applicant_id": "APL-00012-C",
+    "match_method": "deterministic",
+    "is_new_record": false
+  },
+  "LOS-SIM-008": {
+    "application_id": "APP-LOS-SIM-008",
+    "applicant_id": "APL-00013-P",
+    "co_applicant_id": "APL-00014-C",
+    "match_method": "deterministic",
+    "is_new_record": false
+  },
+  "LOS-SIM-009": {
+    "application_id": "APP-LOS-SIM-009",
+    "applicant_id": "APL-00015-P",
+    "co_applicant_id": "APL-00016-C",
+    "match_method": "deterministic",
+    "is_new_record": false
+  },
+  "LOS-SIM-010": {
+    "application_id": "APP-LOS-SIM-010",
+    "applicant_id": "APL-00017-P",
+    "co_applicant_id": "APL-00018-C",
+    "match_method": "deterministic",
+    "is_new_record": false
+  },
+  "LOS-SIM-007": {
+    "application_id": "APP-LOS-SIM-007",
+    "applicant_id": "APL-00019-P",
+    "co_applicant_id": "APL-00020-C",
+    "match_method": "new_record",
+    "is_new_record": true
+  }
+}

@@ -397,8 +397,32 @@ class FakePostgresStore:
             "indexing_runs":           len(self.indexing_runs),
             "webhooks":                len(self.webhooks),
             "webhook_deliveries":      len(self.webhook_deliveries),
+            "export_watermarks":       len(getattr(self, "export_watermarks", {})),
         }
         return mapping.get(table_name, 0)
+
+    # Bulk-export streams + watermarks (Interface 3) — minimal stubs so
+    # service-layer tests don't blow up if a code path tries to exercise
+    # them. Real coverage is the live Postgres path in api/exports.py.
+
+    async def get_export_watermark(self, consumer, table_name):
+        return getattr(self, "export_watermarks", {}).get((consumer, table_name))
+
+    async def upsert_export_watermark(self, consumer, table_name, watermark_ts):
+        if not hasattr(self, "export_watermarks"):
+            self.export_watermarks = {}
+        row = {
+            "consumer": consumer, "table_name": table_name,
+            "watermark_ts": watermark_ts,
+        }
+        self.export_watermarks[(consumer, table_name)] = row
+        return row
+
+    async def list_export_watermarks(self, consumer=None):
+        rows = list(getattr(self, "export_watermarks", {}).values())
+        if consumer:
+            rows = [r for r in rows if r["consumer"] == consumer]
+        return rows
 
 
 @pytest.fixture

@@ -74,3 +74,20 @@ async def fetchval(query: str, *args):
     pool = await get_pool()
     async with pool.acquire() as conn:
         return await conn.fetchval(query, *args)
+
+
+async def stream(query: str, *args, prefetch: int = 500):
+    """Async-iterate a query's rows via a server-side cursor.
+
+    asyncpg requires the cursor to live inside a transaction; the
+    transaction is committed when the generator exits. Prefetch=500
+    keeps round-trip count reasonable while bounding memory at ~one
+    page of rows. Used by the bulk-export streaming endpoints so
+    multi-thousand-row dumps never load the whole result set into
+    Python memory.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            async for row in conn.cursor(query, *args, prefetch=prefetch):
+                yield row

@@ -485,3 +485,31 @@ CREATE INDEX IF NOT EXISTS idx_rel_confirms
     ON document_relationships(applicant_id, confidence DESC)
     WHERE relationship_type = 'confirms';
 
+-- =====================================================================
+-- Bulk Export (Interface 3) — DWH consumer watermarks
+-- One row per (consumer, table_name) tuple. Consumers like a Snowflake
+-- ETL pipeline POST a watermark after a successful pull so the next
+-- incremental query starts from where they left off.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS export_watermarks (
+    watermark_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    consumer       VARCHAR NOT NULL,
+    table_name     VARCHAR NOT NULL,
+    watermark_ts   TIMESTAMPTZ NOT NULL,
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (consumer, table_name)
+);
+CREATE INDEX IF NOT EXISTS idx_export_watermarks_consumer
+    ON export_watermarks(consumer);
+CREATE INDEX IF NOT EXISTS idx_applicants_updated_at
+    ON applicants(updated_at);
+-- The bulk-export "since" filter on documents/relationships uses the
+-- existing received_at / created_at columns. Backfill an explicit index
+-- there so a multi-million-row table can answer the incremental query
+-- without scanning. (received_at already has idx_doc_received DESC; this
+-- is the ASC ordering used by the streaming export.)
+CREATE INDEX IF NOT EXISTS idx_doc_received_asc
+    ON document_index(received_at);
+CREATE INDEX IF NOT EXISTS idx_rel_created_asc
+    ON document_relationships(created_at);
+

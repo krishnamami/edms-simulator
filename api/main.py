@@ -129,10 +129,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="EDMS Simulator", version="0.1.0", lifespan=lifespan)
 
+from api.exports import router as exports_router  # noqa: E402
 from api.health import health_router  # noqa: E402
 from api.middleware import RequestMiddleware  # noqa: E402
+from api.reports import router as reports_router  # noqa: E402
 from api.routes import router  # noqa: E402
 
 app.add_middleware(RequestMiddleware)
 app.include_router(router)
 app.include_router(health_router)
+app.include_router(reports_router, prefix="/reports", tags=["reports"])
+app.include_router(exports_router, prefix="/export", tags=["exports"])

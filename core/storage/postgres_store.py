@@ -1210,3 +1210,619 @@ class PostgresStore:
             _to_jsonb(urla) if urla is not None else None,
             application_id,
         )
+
+    # ---------------- reports (Interface 2: operational reports) -----------------
+    #
+    # The methods below back the /reports/* endpoints in api/reports.py.
+    # They run analytical SQL across many loans (LIMIT/OFFSET pagination,
+    # date-range filters) and never warm Redis directly — caching happens
+    # at the endpoint layer with a 5-minute TTL keyed on the param hash.
+
+    async def count_pipeline_report(
+        self,
+        date_from,
+        date_to,
+        status: Optional[str] = None,
+    ) -> int:
+        val = await db.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM applications a
+            WHERE a.created_at >= $1::timestamptz
+              AND a.created_at <  $2::timestamptz
+              AND ($3::text IS NULL OR a.status = $3)
+            """,
+            _to_ts(date_from), _to_ts(date_to), status,
+        )
+        return int(val or 0)
+
+    async def get_pipeline_report(
+        self,
+        date_from,
+        date_to,
+        status: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list:
+        """One row per application with the heavy lifting done in SQL —
+        per-applicant doc count, conflict count, max(received_at) — joined
+        against the applicant golden record, income/credit profiles, and
+        the latest context snapshot for readiness flags + DTI/LTV."""
+        rows = await db.fetch(
+            """
+            SELECT
+                a.application_id, a.los_id, a.status,
+                a.applicant_id, a.co_applicant_id,
+                a.loan_amount, a.interest_rate, a.created_at,
+                p.full_name  AS borrower_name,
+                cp.full_name AS co_borrower_name,
+                ip.profile_data AS income_data,
+                cr.mid_score    AS mid_score,
+                cr.credit_band  AS credit_band,
+                (SELECT COUNT(*) FROM document_index di
+                  WHERE di.is_current = TRUE
+                    AND (di.application_id = a.application_id
+                         OR di.applicant_id = a.applicant_id
+                         OR (a.co_applicant_id IS NOT NULL
+                             AND di.applicant_id = a.co_applicant_id))
+                ) AS docs_received,
+                COALESCE(
+                  (SELECT ARRAY_AGG(DISTINCT di.document_type)
+                     FROM document_index di
+                    WHERE di.is_current = TRUE
+                      AND di.document_type IS NOT NULL
+                      AND (di.application_id = a.application_id
+                           OR di.applicant_id = a.applicant_id
+                           OR (a.co_applicant_id IS NOT NULL
+                               AND di.applicant_id = a.co_applicant_id))
+                  ), ARRAY[]::text[]
+                ) AS doc_types,
+                (SELECT COUNT(*) FROM document_relationships dr
+                  WHERE dr.relationship_type = 'contradicts'
+                    AND (dr.applicant_id = a.applicant_id
+                         OR (a.co_applicant_id IS NOT NULL
+                             AND dr.applicant_id = a.co_applicant_id))
+                ) AS conflict_count,
+                (SELECT COUNT(*) FROM document_relationships dr
+                  WHERE dr.relationship_type = 'contradicts'
+                    AND COALESCE(dr.delta_pct, 0) >= 20
+                    AND (dr.applicant_id = a.applicant_id
+                         OR (a.co_applicant_id IS NOT NULL
+                             AND dr.applicant_id = a.co_applicant_id))
+                ) AS critical_conflict_count,
+                (SELECT MAX(di.received_at) FROM document_index di
+                  WHERE di.is_current = TRUE
+                    AND (di.application_id = a.application_id
+                         OR di.applicant_id = a.applicant_id
+                         OR (a.co_applicant_id IS NOT NULL
+                             AND di.applicant_id = a.co_applicant_id))
+                ) AS last_doc_received_at,
+                (SELECT cv.context_data FROM context_versions cv
+                  WHERE cv.application_id = a.application_id
+                  ORDER BY cv.assembled_at DESC LIMIT 1
+                ) AS context_data
+            FROM applications a
+            LEFT JOIN applicants p   ON p.applicant_id  = a.applicant_id
+            LEFT JOIN applicants cp  ON cp.applicant_id = a.co_applicant_id
+            LEFT JOIN income_profiles ip
+                ON ip.applicant_id = a.applicant_id AND ip.superseded_by IS NULL
+            LEFT JOIN credit_profiles cr
+                ON cr.applicant_id = a.applicant_id AND cr.is_current = TRUE
+            WHERE a.created_at >= $1::timestamptz
+              AND a.created_at <  $2::timestamptz
+              AND ($3::text IS NULL OR a.status = $3)
+            ORDER BY a.created_at DESC
+            LIMIT $4 OFFSET $5
+            """,
+            _to_ts(date_from), _to_ts(date_to), status, int(limit), int(offset),
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def count_conflicts_report(
+        self,
+        date_from,
+        date_to,
+        min_delta_pct: Optional[float] = None,
+    ) -> int:
+        val = await db.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM document_relationships dr
+            WHERE dr.relationship_type = 'contradicts'
+              AND dr.created_at >= $1::timestamptz
+              AND dr.created_at <  $2::timestamptz
+              AND ($3::float IS NULL OR COALESCE(dr.delta_pct, 0) >= $3)
+            """,
+            _to_ts(date_from), _to_ts(date_to), min_delta_pct,
+        )
+        return int(val or 0)
+
+    async def get_conflicts_report(
+        self,
+        date_from,
+        date_to,
+        min_delta_pct: Optional[float] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list:
+        """Every contradicts edge in the window, joined to source/target
+        document_type and the application that owns the applicant. The
+        ordering — delta_pct DESC NULLS LAST — surfaces the largest
+        divergences first so triage UIs see the highest-fraud-signal
+        edges at the top of page 1."""
+        rows = await db.fetch(
+            """
+            SELECT
+                dr.relationship_id,
+                dr.applicant_id,
+                dr.source_doc_id,
+                dr.target_doc_id,
+                dr.relationship_type,
+                dr.field_name,
+                dr.source_value,
+                dr.target_value,
+                dr.delta_pct,
+                dr.confidence,
+                dr.created_at,
+                sd.document_type AS source_doc_type,
+                td.document_type AS target_doc_type,
+                a.application_id,
+                a.los_id,
+                p.full_name AS borrower_name
+            FROM document_relationships dr
+            JOIN document_index sd ON sd.document_id = dr.source_doc_id
+            JOIN document_index td ON td.document_id = dr.target_doc_id
+            LEFT JOIN applications a
+                ON a.applicant_id = dr.applicant_id
+                OR a.co_applicant_id = dr.applicant_id
+            LEFT JOIN applicants p ON p.applicant_id = dr.applicant_id
+            WHERE dr.relationship_type = 'contradicts'
+              AND dr.created_at >= $1::timestamptz
+              AND dr.created_at <  $2::timestamptz
+              AND ($3::float IS NULL OR COALESCE(dr.delta_pct, 0) >= $3)
+            ORDER BY dr.delta_pct DESC NULLS LAST, dr.created_at DESC
+            LIMIT $4 OFFSET $5
+            """,
+            _to_ts(date_from), _to_ts(date_to), min_delta_pct,
+            int(limit), int(offset),
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_applications_with_doc_types(
+        self,
+        date_from,
+        date_to,
+    ) -> list:
+        """Every application in the window with the de-duped set of
+        document_types its file currently carries (across the primary +
+        co-applicant + the application itself). Powers the completeness
+        report — the endpoint computes the missing slots in Python by
+        diffing against the _REQUIRED_DOCS / _CONDITIONAL_DOCS catalogs.
+        Done in SQL with array_agg so we never round-trip per-row."""
+        rows = await db.fetch(
+            """
+            SELECT
+                a.application_id, a.los_id, a.applicant_id, a.co_applicant_id,
+                a.created_at,
+                COALESCE(
+                  ARRAY_AGG(DISTINCT di.document_type)
+                    FILTER (WHERE di.document_type IS NOT NULL),
+                  ARRAY[]::text[]
+                ) AS doc_types
+            FROM applications a
+            LEFT JOIN document_index di
+              ON di.is_current = TRUE
+             AND (di.application_id = a.application_id
+                  OR di.applicant_id = a.applicant_id
+                  OR (a.co_applicant_id IS NOT NULL
+                      AND di.applicant_id = a.co_applicant_id))
+            WHERE a.created_at >= $1::timestamptz
+              AND a.created_at <  $2::timestamptz
+            GROUP BY a.application_id, a.los_id, a.applicant_id,
+                     a.co_applicant_id, a.created_at
+            ORDER BY a.created_at DESC
+            """,
+            _to_ts(date_from), _to_ts(date_to),
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_extraction_method_totals(
+        self,
+        date_from,
+        date_to,
+    ) -> dict:
+        """One row of grand totals for the extraction-quality report —
+        one count column per extraction_method bucket. Filtered on
+        received_at so the numerator/denominator stay in the same window."""
+        row = await db.fetchrow(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE extraction_method = 'deterministic')   AS deterministic,
+                COUNT(*) FILTER (WHERE extraction_method = 'caller_supplied') AS caller_supplied,
+                COUNT(*) FILTER (WHERE extraction_method = 'ai_vision')       AS ai_vision,
+                COUNT(*) FILTER (WHERE extraction_method = 'none'
+                                   OR extraction_method IS NULL)              AS none_method
+            FROM document_index
+            WHERE received_at >= $1::timestamptz
+              AND received_at <  $2::timestamptz
+            """,
+            _to_ts(date_from), _to_ts(date_to),
+        )
+        return _row_to_dict(row) or {}
+
+    async def get_extraction_method_by_doc_type(
+        self,
+        date_from,
+        date_to,
+    ) -> list:
+        rows = await db.fetch(
+            """
+            SELECT
+                document_type,
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE extraction_method = 'deterministic')   AS deterministic,
+                COUNT(*) FILTER (WHERE extraction_method = 'caller_supplied') AS caller_supplied,
+                COUNT(*) FILTER (WHERE extraction_method = 'ai_vision')       AS ai_vision,
+                COUNT(*) FILTER (WHERE extraction_method = 'none'
+                                   OR extraction_method IS NULL)              AS none_method
+            FROM document_index
+            WHERE received_at >= $1::timestamptz
+              AND received_at <  $2::timestamptz
+            GROUP BY document_type
+            ORDER BY total DESC, document_type
+            """,
+            _to_ts(date_from), _to_ts(date_to),
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_income_verification_data(
+        self,
+        date_from,
+        date_to,
+    ) -> list:
+        """Pair every URLA_1003 with every W2_CURRENT for the same
+        applicant in the window, surfacing the raw stated/documented
+        numbers + applicant + application fields. The endpoint computes
+        the delta_pct + flag in Python so non-numeric extracted_fields
+        (e.g. ``box1_wages='one hundred ten thousand'`` from the chaos
+        test) silently skip instead of raising in SQL CAST."""
+        rows = await db.fetch(
+            """
+            SELECT
+                u.applicant_id,
+                u.application_id,
+                u.extracted_fields ->> 'monthly_income_stated' AS monthly_stated_raw,
+                w.extracted_fields ->> 'box1_wages'            AS w2_wages_raw,
+                u.received_at AS urla_received_at,
+                w.received_at AS w2_received_at,
+                p.full_name AS borrower_name,
+                a.los_id   AS los_id
+            FROM document_index u
+            JOIN document_index w
+              ON w.applicant_id = u.applicant_id
+             AND w.document_type = 'W2_CURRENT'
+             AND w.is_current = TRUE
+             AND w.extracted_fields ? 'box1_wages'
+            LEFT JOIN applicants  p ON p.applicant_id = u.applicant_id
+            LEFT JOIN applications a
+              ON a.applicant_id  = u.applicant_id
+              OR a.co_applicant_id = u.applicant_id
+            WHERE u.document_type = 'URLA_1003'
+              AND u.is_current = TRUE
+              AND u.extracted_fields ? 'monthly_income_stated'
+              AND u.received_at >= $1::timestamptz
+              AND u.received_at <  $2::timestamptz
+            """,
+            _to_ts(date_from), _to_ts(date_to),
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    # ---------------- bulk export (Interface 3) -----------------
+    #
+    # The stream_* methods are async generators that yield rows one at a
+    # time via a server-side asyncpg cursor (see core.storage.db.stream).
+    # This lets the /export/* endpoints write a multi-thousand-row JSONL
+    # stream straight to the HTTP response without ever loading the full
+    # result set into Python memory. The per-stream prefetch defaults to
+    # 500 — small enough to stay under typical API-gateway buffers,
+    # large enough to keep round-trip count manageable.
+    #
+    # SAFE_NUM is a regex tested against an extracted_fields string
+    # before casting to numeric. Chaos-test inputs like
+    # box1_wages='one hundred ten thousand' would crash a bare ::numeric
+    # cast; the CASE wrapper turns those into NULL instead, matching the
+    # silent-skip semantics _coerce_float uses on the report endpoints.
+
+    _SAFE_NUM = r"^-?[0-9]+(\.[0-9]+)?$"
+
+    async def stream_entities(
+        self,
+        since=None,
+        prefetch: int = 500,
+    ):
+        """One row per applicant joined with the latest income +
+        credit profiles, owning application, and a few document /
+        relationship aggregates (counts, asset rollups, identity
+        flags) computed via correlated subqueries against
+        document_index. Filtered on ``applicants.updated_at``."""
+        query = f"""
+            SELECT
+                a.applicant_id,
+                a.full_name,
+                a.first_name,
+                a.last_name,
+                a.status                         AS applicant_status,
+                a.updated_at,
+                COALESCE(app.application_id, app2.application_id) AS application_id,
+                CASE
+                    WHEN app.applicant_id    = a.applicant_id THEN 'primary'
+                    WHEN app2.co_applicant_id = a.applicant_id THEN 'co_borrower'
+                    ELSE 'unknown'
+                END                              AS role,
+                ip.profile_data                  AS income_data,
+                cp.mid_score                     AS mid_score,
+                cp.profile_data                  AS credit_data,
+                (SELECT COUNT(*) FROM document_index di
+                  WHERE di.applicant_id = a.applicant_id
+                    AND di.is_current = TRUE
+                ) AS document_count,
+                (SELECT COUNT(*) FROM document_relationships dr
+                  WHERE dr.applicant_id = a.applicant_id
+                    AND dr.relationship_type = 'contradicts'
+                ) AS conflict_count,
+                (SELECT COALESCE(SUM(
+                          CASE WHEN di.extracted_fields->>'ending_balance' ~ '{self._SAFE_NUM}'
+                               THEN (di.extracted_fields->>'ending_balance')::numeric
+                               ELSE 0 END), 0)
+                   FROM document_index di
+                  WHERE di.applicant_id = a.applicant_id
+                    AND di.is_current = TRUE
+                    AND di.document_type LIKE 'BANK_STATEMENT%'
+                ) AS total_liquid,
+                (SELECT COALESCE(SUM(
+                          CASE WHEN di.extracted_fields->>'balance' ~ '{self._SAFE_NUM}'
+                               THEN (di.extracted_fields->>'balance')::numeric
+                               ELSE 0 END), 0)
+                   FROM document_index di
+                  WHERE di.applicant_id = a.applicant_id
+                    AND di.is_current = TRUE
+                    AND di.document_type IN ('RETIREMENT_401K','RETIREMENT_IRA','RETIREMENT')
+                ) AS total_retirement,
+                (SELECT COALESCE(SUM(
+                          CASE WHEN di.extracted_fields->>'gift_amount' ~ '{self._SAFE_NUM}'
+                               THEN (di.extracted_fields->>'gift_amount')::numeric
+                               ELSE 0 END), 0)
+                   FROM document_index di
+                  WHERE di.applicant_id = a.applicant_id
+                    AND di.is_current = TRUE
+                    AND di.document_type = 'GIFT_LETTER'
+                ) AS gift_funds,
+                EXISTS (SELECT 1 FROM document_index di
+                         WHERE di.applicant_id = a.applicant_id
+                           AND di.is_current = TRUE
+                           AND di.document_type = 'IDENTITY_DL'
+                ) AS dl_verified,
+                EXISTS (SELECT 1 FROM document_index di
+                         WHERE di.applicant_id = a.applicant_id
+                           AND di.is_current = TRUE
+                           AND di.document_type IN ('SSN_VALIDATION','IDENTITY_SSN_CARD')
+                ) AS ssn_verified,
+                EXISTS (SELECT 1 FROM document_index di
+                         WHERE di.applicant_id = a.applicant_id
+                           AND di.is_current = TRUE
+                           AND di.document_type IN ('OFAC_REPORT','OFAC_CHECK')
+                ) AS ofac_clear
+            FROM applicants a
+            LEFT JOIN applications app  ON app.applicant_id    = a.applicant_id
+            LEFT JOIN applications app2 ON app2.co_applicant_id = a.applicant_id
+            LEFT JOIN income_profiles ip
+              ON ip.applicant_id = a.applicant_id AND ip.superseded_by IS NULL
+            LEFT JOIN credit_profiles cp
+              ON cp.applicant_id = a.applicant_id AND cp.is_current = TRUE
+            WHERE ($1::timestamptz IS NULL OR a.updated_at > $1::timestamptz)
+            ORDER BY a.updated_at ASC, a.applicant_id ASC
+        """
+        async for row in db.stream(query, _to_ts(since), prefetch=prefetch):
+            yield _row_to_dict(row)
+
+    async def stream_documents(
+        self,
+        since=None,
+        doc_type: Optional[str] = None,
+        category: Optional[str] = None,
+        prefetch: int = 500,
+    ):
+        """Every row in ``document_index`` ordered by received_at, with
+        optional doc_type / category / since filters."""
+        query = """
+            SELECT
+                document_id,
+                applicant_id,
+                application_id,
+                document_type,
+                document_category,
+                borrower_role,
+                s3_key,
+                status,
+                received_at,
+                expiry_date,
+                is_current,
+                extracted_fields,
+                confidence_score,
+                extraction_method
+            FROM document_index
+            WHERE ($1::timestamptz IS NULL OR received_at > $1::timestamptz)
+              AND ($2::text IS NULL OR document_type = $2)
+              AND ($3::text IS NULL OR document_category = $3)
+            ORDER BY received_at ASC, document_id ASC
+        """
+        async for row in db.stream(
+            query, _to_ts(since), doc_type, category, prefetch=prefetch,
+        ):
+            yield _row_to_dict(row)
+
+    async def stream_graph_edges(
+        self,
+        since=None,
+        relationship_type: Optional[str] = None,
+        prefetch: int = 500,
+    ):
+        query = """
+            SELECT
+                relationship_id,
+                applicant_id,
+                source_doc_id,
+                target_doc_id,
+                relationship_type,
+                field_name,
+                source_value,
+                target_value,
+                delta_pct,
+                confidence,
+                reasoning,
+                created_by,
+                created_at
+            FROM document_relationships
+            WHERE ($1::timestamptz IS NULL OR created_at > $1::timestamptz)
+              AND ($2::text IS NULL OR relationship_type = $2)
+            ORDER BY created_at ASC, relationship_id ASC
+        """
+        async for row in db.stream(
+            query, _to_ts(since), relationship_type, prefetch=prefetch,
+        ):
+            yield _row_to_dict(row)
+
+    async def stream_income_profiles(
+        self,
+        since=None,
+        prefetch: int = 500,
+    ):
+        query = """
+            SELECT
+                profile_id, applicant_id, application_id,
+                assembled_at, profile_data, lineage_hash, version,
+                created_at
+            FROM income_profiles
+            WHERE superseded_by IS NULL
+              AND ($1::timestamptz IS NULL OR assembled_at > $1::timestamptz)
+            ORDER BY assembled_at ASC, profile_id ASC
+        """
+        async for row in db.stream(query, _to_ts(since), prefetch=prefetch):
+            yield _row_to_dict(row)
+
+    async def stream_credit_profiles(
+        self,
+        since=None,
+        prefetch: int = 500,
+    ):
+        query = """
+            SELECT
+                profile_id, applicant_id, mid_score, credit_band,
+                profile_data, report_date, expiry_date, created_at
+            FROM credit_profiles
+            WHERE is_current = TRUE
+              AND ($1::timestamptz IS NULL OR created_at > $1::timestamptz)
+            ORDER BY created_at ASC, profile_id ASC
+        """
+        async for row in db.stream(query, _to_ts(since), prefetch=prefetch):
+            yield _row_to_dict(row)
+
+    async def stream_applications_export(
+        self,
+        since=None,
+        prefetch: int = 500,
+    ):
+        """Application-level summary including loan terms, joined to
+        the borrower golden record + the latest context_versions
+        snapshot for readiness/DTI/LTV. Filter on
+        COALESCE(updated_at, created_at) so older rows that pre-date
+        the updated_at column still flow through the first export."""
+        query = """
+            SELECT
+                a.application_id, a.applicant_id, a.co_applicant_id,
+                a.los_id, a.status, a.loan_amount, a.interest_rate,
+                a.loan_term_months, a.loan_purpose, a.loan_type,
+                a.occupancy, a.external_loan_id,
+                a.created_at, a.updated_at,
+                p.full_name  AS borrower_name,
+                cp.full_name AS co_borrower_name,
+                (SELECT COUNT(*) FROM document_index di
+                   WHERE di.is_current = TRUE
+                     AND (di.application_id = a.application_id
+                          OR di.applicant_id = a.applicant_id
+                          OR (a.co_applicant_id IS NOT NULL
+                              AND di.applicant_id = a.co_applicant_id))
+                ) AS document_count,
+                (SELECT COUNT(*) FROM document_relationships dr
+                   WHERE dr.relationship_type = 'contradicts'
+                     AND (dr.applicant_id = a.applicant_id
+                          OR (a.co_applicant_id IS NOT NULL
+                              AND dr.applicant_id = a.co_applicant_id))
+                ) AS conflict_count,
+                (SELECT cv.context_data FROM context_versions cv
+                   WHERE cv.application_id = a.application_id
+                   ORDER BY cv.assembled_at DESC LIMIT 1
+                ) AS context_data
+            FROM applications a
+            LEFT JOIN applicants p  ON p.applicant_id  = a.applicant_id
+            LEFT JOIN applicants cp ON cp.applicant_id = a.co_applicant_id
+            WHERE ($1::timestamptz IS NULL
+                   OR COALESCE(a.updated_at, a.created_at) > $1::timestamptz)
+            ORDER BY COALESCE(a.updated_at, a.created_at) ASC, a.application_id ASC
+        """
+        async for row in db.stream(query, _to_ts(since), prefetch=prefetch):
+            yield _row_to_dict(row)
+
+    # ---- export watermarks (DWH consumer state) ----
+
+    async def get_export_watermark(
+        self, consumer: str, table_name: str
+    ) -> Optional[dict]:
+        row = await db.fetchrow(
+            """
+            SELECT consumer, table_name, watermark_ts, updated_at
+              FROM export_watermarks
+             WHERE consumer = $1 AND table_name = $2
+            """,
+            consumer, table_name,
+        )
+        return _row_to_dict(row)
+
+    async def upsert_export_watermark(
+        self, consumer: str, table_name: str, watermark_ts,
+    ) -> dict:
+        await db.execute(
+            """
+            INSERT INTO export_watermarks (consumer, table_name, watermark_ts)
+            VALUES ($1, $2, $3::timestamptz)
+            ON CONFLICT (consumer, table_name) DO UPDATE SET
+                watermark_ts = EXCLUDED.watermark_ts,
+                updated_at   = NOW()
+            """,
+            consumer, table_name, _to_ts(watermark_ts),
+        )
+        return await self.get_export_watermark(consumer, table_name)
+
+    async def list_export_watermarks(
+        self, consumer: Optional[str] = None
+    ) -> list:
+        if consumer:
+            rows = await db.fetch(
+                """
+                SELECT consumer, table_name, watermark_ts, updated_at
+                  FROM export_watermarks
+                 WHERE consumer = $1
+                 ORDER BY table_name
+                """,
+                consumer,
+            )
+        else:
+            rows = await db.fetch(
+                """
+                SELECT consumer, table_name, watermark_ts, updated_at
+                  FROM export_watermarks
+                 ORDER BY consumer, table_name
+                """
+            )
+        return [_row_to_dict(r) for r in rows]
