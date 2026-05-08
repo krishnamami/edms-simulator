@@ -450,40 +450,44 @@ class AggregationService:
         New docs in the request override existing rows on document_id so a
         re-upload with corrected fields wins over the stale indexed copy.
         """
-        merged: dict = {}
-
-        async def _load(aid: Optional[str]):
+        async def _load(aid: Optional[str]) -> list:
             if not aid:
-                return
+                return []
             try:
-                rows = await self.postgres_store.get_documents_for_applicant(aid)
+                return await self.postgres_store.get_documents_for_applicant(aid)
             except Exception as exc:
                 logger.warning("hydrate_docs_failed", applicant_id=aid, error=str(exc))
-                return
-            for row in rows:
-                fields = row.get("extracted_fields") or {}
-                if isinstance(fields, str):
-                    import json as _json
-                    try:
-                        fields = _json.loads(fields)
-                    except Exception:
-                        fields = {}
-                doc_id = row.get("document_id")
-                if not doc_id:
-                    continue
-                merged[doc_id] = {
-                    **fields,
-                    "document_id":       doc_id,
-                    "document_type":     row.get("document_type"),
-                    "document_category": row.get("document_category"),
-                    "borrower_role":     row.get("borrower_role"),
-                    "s3_key":            row.get("s3_key"),
-                    "confidence_score":  row.get("confidence_score"),
-                    "status":            row.get("status"),
-                }
+                return []
 
-        await _load(applicant_id)
-        await _load(co_applicant_id)
+        # Fetch primary + co-borrower docs in parallel — independent
+        # queries, no point serializing them on joint applications.
+        primary_rows, co_rows = await asyncio.gather(
+            _load(applicant_id),
+            _load(co_applicant_id),
+        )
+
+        merged: dict = {}
+        for row in list(primary_rows) + list(co_rows):
+            fields = row.get("extracted_fields") or {}
+            if isinstance(fields, str):
+                import json as _json
+                try:
+                    fields = _json.loads(fields)
+                except Exception:
+                    fields = {}
+            doc_id = row.get("document_id")
+            if not doc_id:
+                continue
+            merged[doc_id] = {
+                **fields,
+                "document_id":       doc_id,
+                "document_type":     row.get("document_type"),
+                "document_category": row.get("document_category"),
+                "borrower_role":     row.get("borrower_role"),
+                "s3_key":            row.get("s3_key"),
+                "confidence_score":  row.get("confidence_score"),
+                "status":            row.get("status"),
+            }
 
         for d in new_docs or []:
             doc_id = d.get("document_id")
