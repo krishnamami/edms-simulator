@@ -389,27 +389,77 @@ class BatchIndexer:
             extract_w2,
         )
         from core.property.extractors import (
+            extract_1004mc,
             extract_appraisal_pdf,
+            extract_avm_report,
             extract_flood_pdf,
             extract_hoi_pdf,
+            extract_purchase_agreement,
             extract_tax_pdf,
+        )
+        from core.documents.extractors.income_extractors import (
+            extract_1040,
+            extract_1099,
+            extract_irs_transcript,
+            extract_k1,
+            extract_schedule_c,
+            extract_schedule_e,
+        )
+        from core.documents.extractors.asset_extractors import (
+            extract_brokerage_account,
+            extract_gift_letter,
+            extract_retirement_account,
+        )
+        from core.documents.extractors.loan_extractors import (
+            extract_offer_letter,
+            extract_rate_lock,
+            extract_urla_1003,
         )
 
         extractors = {
-            "W2_CURRENT":            extract_w2,
-            "W2_PRIOR":              extract_w2,
-            "PAYSTUB_CURRENT":       extract_paystub,
-            "PAYSTUB_PRIOR":         extract_paystub,
-            "BANK_STATEMENT_M1":     extract_bank_statement,
-            "CREDIT_REPORT":         extract_credit_report,
-            "APPRAISAL_URAR":        extract_appraisal_pdf,
-            "APPRAISAL_UPDATE":      extract_appraisal_pdf,
-            "APPRAISAL_DESK":        extract_appraisal_pdf,
-            "APPRAISAL_FIELD":       extract_appraisal_pdf,
-            "HOI_BINDER":            extract_hoi_pdf,
-            "HOI_DECLARATIONS":      extract_hoi_pdf,
-            "FLOOD_CERT":            extract_flood_pdf,
-            "PROPERTY_TAX_BILL":     extract_tax_pdf,
+            # Income (canonical doc types from MISMOMapper). Accept the
+            # alias forms too — TAX_RETURN_1040_* is canonical, but the
+            # indexer may see FORM_1040 from a hand-typed S3 path.
+            "W2_CURRENT":              extract_w2,
+            "W2_PRIOR":                extract_w2,
+            "PAYSTUB_CURRENT":         extract_paystub,
+            "PAYSTUB_PRIOR":           extract_paystub,
+            "IRS_TRANSCRIPT":          extract_irs_transcript,
+            "TAX_RETURN_1040_CURRENT": extract_1040,
+            "TAX_RETURN_1040_PRIOR":   extract_1040,
+            "FORM_1040":               extract_1040,
+            "SCHEDULE_C":              extract_schedule_c,
+            "SCHEDULE_E":              extract_schedule_e,
+            "SCHEDULE_F":              extract_schedule_e,  # same shape as E
+            "1099_NEC":                extract_1099,
+            "FORM_1099_NEC":           extract_1099,
+            "K1_PARTNERSHIP":          extract_k1,
+            "K1_SCHEDULE":             extract_k1,
+            # Asset
+            "BANK_STATEMENT_M1":         extract_bank_statement,
+            "ASSET_STATEMENT_RETIREMENT": extract_retirement_account,
+            "RETIREMENT_ACCOUNT":         extract_retirement_account,
+            "ASSET_STATEMENT_BROKERAGE":  extract_brokerage_account,
+            "BROKERAGE_ACCOUNT":          extract_brokerage_account,
+            "GIFT_LETTER":               extract_gift_letter,
+            # Credit
+            "CREDIT_REPORT":           extract_credit_report,
+            # Property / valuation
+            "APPRAISAL_URAR":          extract_appraisal_pdf,
+            "APPRAISAL_UPDATE":        extract_appraisal_pdf,
+            "APPRAISAL_DESK":          extract_appraisal_pdf,
+            "APPRAISAL_FIELD":         extract_appraisal_pdf,
+            "AVM_REPORT":              extract_avm_report,
+            "FORM_1004MC":             extract_1004mc,
+            "HOI_BINDER":              extract_hoi_pdf,
+            "HOI_DECLARATIONS":        extract_hoi_pdf,
+            "FLOOD_CERT":              extract_flood_pdf,
+            "PROPERTY_TAX_BILL":       extract_tax_pdf,
+            "PURCHASE_AGREEMENT":      extract_purchase_agreement,
+            # Loan terms / employment
+            "URLA_1003":               extract_urla_1003,
+            "RATE_LOCK":               extract_rate_lock,
+            "OFFER_LETTER":            extract_offer_letter,
         }
         extractor = extractors.get(doc_type)
         if extractor is None:
