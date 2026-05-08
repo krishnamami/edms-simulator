@@ -1,0 +1,169 @@
+{
+  "scenario": "scenario_2_coborrower",
+  "los_id": "LOS-CHAOS-CO02",
+  "borrower": {
+    "first": "Thomas",
+    "last": "O'Brien-Smith",
+    "ssn_last4": "5678"
+  },
+  "co_borrower": {
+    "first": "Sarah",
+    "last": "O'Brien-Smith",
+    "ssn_last4": "9012"
+  },
+  "loan": {},
+  "documents": [
+    {
+      "filename": "CO_W2_2025.pdf",
+      "doc_type": "W2_CURRENT",
+      "category": "income",
+      "role": "co_borrower",
+      "fields": {
+        "box1_wages": 142000,
+        "tax_year": "2025",
+        "employer_name": "Memorial Hermann Health System — Department of Radiology and Interventional Procedures"
+      }
+    },
+    {
+      "filename": "CO_PAYSTUB.pdf",
+      "doc_type": "PAYSTUB_CURRENT",
+      "category": "income",
+      "role": "co_borrower",
+      "fields": {
+        "ytd_gross": 71000,
+        "pay_period_end": "2026-06-15",
+        "pay_frequency": "semi_monthly"
+      }
+    },
+    {
+      "filename": "CO_OFFER_LETTER.pdf",
+      "doc_type": "OFFER_LETTER",
+      "category": "employment",
+      "role": "co_borrower",
+      "fields": {
+        "employer_name": "Texas Children's Hospital",
+        "position_title": "Lead Radiologist",
+        "start_date": "2026-09-01",
+        "base_salary": 165000,
+        "employment_type": "full_time"
+      }
+    },
+    {
+      "filename": "GIFT_LETTER.pdf",
+      "doc_type": "GIFT_LETTER",
+      "category": "asset",
+      "role": "primary",
+      "fields": {
+        "gift_amount": 25000,
+        "donor_name": "Memorial Hermann Health System",
+        "donor_relationship": "employer",
+        "repayment_required": false
+      }
+    },
+    {
+      "filename": "CREDIT_REPORT.pdf",
+      "doc_type": "CREDIT_REPORT",
+      "category": "credit",
+      "role": "primary",
+      "fields": {
+        "mid_score": 721,
+        "tradeline_count": 10,
+        "total_monthly_payments": 1200,
+        "derogatory_count": 1
+      }
+    },
+    {
+      "filename": "CREDIT_EXPLAIN.pdf",
+      "doc_type": "CREDIT_EXPLANATION",
+      "category": "credit",
+      "role": "primary",
+      "fields": {
+        "explanation_type": "late_payment",
+        "creditor": "Chase Visa",
+        "reason": "medical_emergency",
+        "resolved": true
+      }
+    },
+    {
+      "filename": "DL.pdf",
+      "doc_type": "DRIVERS_LICENSE",
+      "category": "identity",
+      "role": "primary",
+      "fields": {
+        "dl_number": "TX-11111111",
+        "name_match": true
+      }
+    },
+    {
+      "filename": "SSN_VALID.pdf",
+      "doc_type": "SSN_VALIDATION",
+      "category": "identity",
+      "role": "primary",
+      "fields": {
+        "ssn_valid": true,
+        "name_match": true,
+        "ssn_last4_on_doc": "5687"
+      }
+    },
+    {
+      "filename": "OFAC.pdf",
+      "doc_type": "OFAC_CHECK",
+      "category": "identity",
+      "role": "primary",
+      "fields": {
+        "ofac_clear": true
+      }
+    },
+    {
+      "filename": "BANK_M1_PRIMARY.pdf",
+      "doc_type": "BANK_STATEMENT_M1",
+      "category": "asset",
+      "role": "primary",
+      "fields": {
+        "ending_balance": 1200,
+        "avg_balance": 950
+      }
+    },
+    {
+      "filename": "BANK_M1_CO.pdf",
+      "doc_type": "BANK_STATEMENT_M1",
+      "category": "asset",
+      "role": "co_borrower",
+      "fields": {
+        "ending_balance": 67000,
+        "avg_balance": 62000
+      }
+    },
+    {
+      "filename": "APPRAISAL.pdf",
+      "doc_type": "APPRAISAL_URAR",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "appraised_value": 520000,
+        "property_type": "Condo"
+      }
+    },
+    {
+      "filename": "PURCHASE_AGT.pdf",
+      "doc_type": "PURCHASE_AGREEMENT",
+      "category": "loan_terms",
+      "role": "primary",
+      "fields": {
+        "purchase_price": 515000
+      }
+    },
+    {
+      "filename": "URLA.pdf",
+      "doc_type": "URLA_1003",
+      "category": "loan_terms",
+      "role": "primary",
+      "fields": {
+        "loan_amount": 412000,
+        "interest_rate": 6.75,
+        "loan_term_months": 360,
+        "occupancy": "primary_residence"
+      }
+    }
+  ]
+}

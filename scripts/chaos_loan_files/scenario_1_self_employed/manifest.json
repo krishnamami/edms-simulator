@@ -1,0 +1,211 @@
+{
+  "scenario": "scenario_1_self_employed",
+  "los_id": "LOS-CHAOS-SE01",
+  "borrower": {
+    "first": "Maria",
+    "last": "Gonzalez-Rivera",
+    "ssn_last4": "1234"
+  },
+  "co_borrower": null,
+  "loan": {},
+  "documents": [
+    {
+      "filename": "W2_2025.pdf",
+      "doc_type": "W2_CURRENT",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "box1_wages": 8500,
+        "tax_year": "2025",
+        "employer_name": "QuickBooks Freelance Payroll"
+      }
+    },
+    {
+      "filename": "SCHEDULE_C_2025.pdf",
+      "doc_type": "SCHEDULE_C",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "gross_receipts": 145000,
+        "total_expenses": 162000,
+        "net_profit": -17000,
+        "depreciation": 28000,
+        "amortization": 5000,
+        "business_name": "MG Web Design LLC",
+        "tax_year": "2025"
+      }
+    },
+    {
+      "filename": "K1_2025.pdf",
+      "doc_type": "K1_SCHEDULE",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "ordinary_income": -5200,
+        "guaranteed_payments": 36000,
+        "rental_income": 0,
+        "partnership_name": "Southwest Ventures LP",
+        "tax_year": "2025"
+      }
+    },
+    {
+      "filename": "1099_NEC_1.pdf",
+      "doc_type": "FORM_1099_NEC",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "nonemployee_compensation": 42000,
+        "payer_name": "Acme Consulting",
+        "tax_year": "2025"
+      }
+    },
+    {
+      "filename": "1099_NEC_2.pdf",
+      "doc_type": "FORM_1099_NEC",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "nonemployee_compensation": 18500,
+        "payer_name": "Beta Corp",
+        "tax_year": "2025"
+      }
+    },
+    {
+      "filename": "1099_NEC_3.pdf",
+      "doc_type": "FORM_1099_NEC",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "nonemployee_compensation": 7200,
+        "payer_name": "Gamma Industries",
+        "tax_year": "2025"
+      }
+    },
+    {
+      "filename": "1099_NEC_4.pdf",
+      "doc_type": "FORM_1099_NEC",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "nonemployee_compensation": 0,
+        "payer_name": "Delta LLC",
+        "tax_year": "2025"
+      }
+    },
+    {
+      "filename": "IRS_TRANSCRIPT.pdf",
+      "doc_type": "IRS_TRANSCRIPT",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "agi": 82350,
+        "wages_salaries": 8500,
+        "self_employment_income": -17000,
+        "schedule_c_net": -17000,
+        "tax_year": "2025",
+        "amended": true
+      }
+    },
+    {
+      "filename": "FORM_1040.pdf",
+      "doc_type": "FORM_1040",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "agi": 91500,
+        "wages_line1": 8500,
+        "schedule_c_income": 12000,
+        "tax_year": "2025"
+      }
+    },
+    {
+      "filename": "BANK_STMT_M1.pdf",
+      "doc_type": "BANK_STATEMENT_M1",
+      "category": "asset",
+      "role": "primary",
+      "fields": {
+        "ending_balance": 92000,
+        "avg_balance": 78200,
+        "large_deposits_noted": true
+      }
+    },
+    {
+      "filename": "BANK_STMT_M2.pdf",
+      "doc_type": "BANK_STATEMENT_M2",
+      "category": "asset",
+      "role": "primary",
+      "fields": {
+        "ending_balance": 47000,
+        "avg_balance": 39950,
+        "large_deposits_noted": true
+      }
+    },
+    {
+      "filename": "BANK_STMT_M3.pdf",
+      "doc_type": "BANK_STATEMENT_M3",
+      "category": "asset",
+      "role": "primary",
+      "fields": {
+        "ending_balance": 48500,
+        "avg_balance": 41225,
+        "large_deposits_noted": true
+      }
+    },
+    {
+      "filename": "W2_2024.pdf",
+      "doc_type": "W2_PRIOR",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "box1_wages": 52000,
+        "tax_year": "2024",
+        "employer_name": "OldJob Corp"
+      }
+    },
+    {
+      "filename": "CREDIT_REPORT.pdf",
+      "doc_type": "CREDIT_REPORT",
+      "category": "credit",
+      "role": "primary",
+      "fields": {
+        "mid_score": 698,
+        "tradeline_count": 15,
+        "total_monthly_payments": 2350,
+        "derogatory_count": 1,
+        "collections_count": 1
+      }
+    },
+    {
+      "filename": "APPRAISAL.pdf",
+      "doc_type": "APPRAISAL_URAR",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "appraised_value": 385000,
+        "property_type": "SFR"
+      }
+    },
+    {
+      "filename": "PURCHASE_AGT.pdf",
+      "doc_type": "PURCHASE_AGREEMENT",
+      "category": "loan_terms",
+      "role": "primary",
+      "fields": {
+        "purchase_price": 379000,
+        "closing_date": "2026-08-15"
+      }
+    },
+    {
+      "filename": "DL.pdf",
+      "doc_type": "DRIVERS_LICENSE",
+      "category": "identity",
+      "role": "primary",
+      "fields": {
+        "dl_number": "TX-98765432",
+        "state": "TX",
+        "expiry_date": "2027-11-30",
+        "name_match": true
+      }
+    }
+  ]
+}

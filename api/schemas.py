@@ -1,5 +1,5 @@
 """Request/response schemas for the EDMS Simulator API."""
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -50,26 +50,33 @@ class DocumentSchema(BaseModel):
     document_category: str = "income"
     borrower_role: str = "primary"
     extracted_fields: dict = {}
-    # Income / asset fields kept as named for IDE completion + light
-    # validation on the legacy callers. Anything else flows through via
-    # ``extra="allow"``.
-    box1_wages: Optional[float] = None
-    employer_name: Optional[str] = None
-    monthly_benefit: Optional[float] = None
-    is_non_taxable: Optional[bool] = None
-    base_pay_monthly: Optional[float] = None
-    bah_monthly: Optional[float] = None
-    bas_monthly: Optional[float] = None
-    special_pay_monthly: Optional[float] = None
-    net_income_after_addbacks: Optional[float] = None
-    has_schedule_c: Optional[bool] = None
-    gross_rent_annual: Optional[float] = None
-    expenses_annual: Optional[float] = None
-    account_type: Optional[str] = None
-    balance: Optional[float] = None
-    amount: Optional[float] = None
-    payer_name: Optional[str] = None
-    tax_year: Optional[int] = None
+    # Income / asset / property fields kept as ``Optional[Any]`` so the
+    # API boundary doesn't 422 on unparseable values like
+    # ``box1_wages="one hundred ten thousand"``. The document still
+    # lands in document_index with the raw value; the assemblers
+    # downstream do best-effort coercion (``float(d.get(k) or 0)``)
+    # and skip what they can't parse. The chaos test surfaced this —
+    # rejecting at the API boundary loses the document entirely
+    # (no row in document_index, no graph node, no completeness
+    # credit), which is strictly worse than accepting the document
+    # and letting downstream skip the bad field.
+    box1_wages: Optional[Any] = None
+    employer_name: Optional[Any] = None
+    monthly_benefit: Optional[Any] = None
+    is_non_taxable: Optional[Any] = None
+    base_pay_monthly: Optional[Any] = None
+    bah_monthly: Optional[Any] = None
+    bas_monthly: Optional[Any] = None
+    special_pay_monthly: Optional[Any] = None
+    net_income_after_addbacks: Optional[Any] = None
+    has_schedule_c: Optional[Any] = None
+    gross_rent_annual: Optional[Any] = None
+    expenses_annual: Optional[Any] = None
+    account_type: Optional[Any] = None
+    balance: Optional[Any] = None
+    amount: Optional[Any] = None
+    payer_name: Optional[Any] = None
+    tax_year: Optional[Any] = None
 
 
 class CreateLoanRequest(BaseModel):

@@ -1,0 +1,154 @@
+{
+  "scenario": "scenario_3_property_disaster",
+  "los_id": "LOS-CHAOS-PD03",
+  "borrower": {
+    "first": "David",
+    "last": "Chen",
+    "ssn_last4": "3456"
+  },
+  "co_borrower": null,
+  "loan": {},
+  "documents": [
+    {
+      "filename": "W2_2025.pdf",
+      "doc_type": "W2_CURRENT",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "box1_wages": 95000,
+        "employer_name": "State Farm Insurance",
+        "tax_year": "2025"
+      }
+    },
+    {
+      "filename": "CREDIT.pdf",
+      "doc_type": "CREDIT_REPORT",
+      "category": "credit",
+      "role": "primary",
+      "fields": {
+        "mid_score": 765,
+        "total_monthly_payments": 1100
+      }
+    },
+    {
+      "filename": "APPRAISAL.pdf",
+      "doc_type": "APPRAISAL_URAR",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "appraised_value": 340000,
+        "property_type": "SFR",
+        "condition": "C4",
+        "year_built": 1972,
+        "gla_sqft": 1800
+      }
+    },
+    {
+      "filename": "PURCHASE_AGT.pdf",
+      "doc_type": "PURCHASE_AGREEMENT",
+      "category": "loan_terms",
+      "role": "primary",
+      "fields": {
+        "purchase_price": 365000,
+        "closing_date": "2026-08-01"
+      }
+    },
+    {
+      "filename": "AVM.pdf",
+      "doc_type": "AVM_REPORT",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "avm_value": 255000,
+        "confidence_score": 0.62
+      }
+    },
+    {
+      "filename": "FLOOD_CERT.pdf",
+      "doc_type": "FLOOD_CERT",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "flood_zone": "X",
+        "requires_insurance": false
+      }
+    },
+    {
+      "filename": "FLOOD_INSURANCE.pdf",
+      "doc_type": "FLOOD_CERT",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "flood_zone": "AE",
+        "requires_insurance": true,
+        "annual_premium": 2800
+      }
+    },
+    {
+      "filename": "HOA.pdf",
+      "doc_type": "HOA_CERT",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "monthly_dues": 450,
+        "special_assessments": 3500,
+        "reserve_balance": 12000,
+        "litigation_pending": true
+      }
+    },
+    {
+      "filename": "TITLE.pdf",
+      "doc_type": "TITLE_COMMITMENT",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "exceptions_count": 6,
+        "effective_date": "2026-06-15",
+        "has_liens": true
+      }
+    },
+    {
+      "filename": "PEST.pdf",
+      "doc_type": "WDO_REPORT",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "findings": "active_infestation",
+        "treatment_required": true,
+        "structural_damage": true
+      }
+    },
+    {
+      "filename": "WELL_SEPTIC.pdf",
+      "doc_type": "WELL_SEPTIC_INSPECTION",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "well_flow_rate_gpm": 3.2,
+        "septic_condition": "fair",
+        "rural_property": true,
+        "water_quality_issues": true
+      }
+    },
+    {
+      "filename": "DL.pdf",
+      "doc_type": "DRIVERS_LICENSE",
+      "category": "identity",
+      "role": "primary",
+      "fields": {
+        "name_match": true
+      }
+    },
+    {
+      "filename": "URLA.pdf",
+      "doc_type": "URLA_1003",
+      "category": "loan_terms",
+      "role": "primary",
+      "fields": {
+        "loan_amount": 292000,
+        "interest_rate": 7.125,
+        "loan_term_months": 360
+      }
+    }
+  ]
+}

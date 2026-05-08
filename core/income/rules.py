@@ -4,7 +4,39 @@ One function per income type. Functions never raise — instead they return an
 IncomeSource with excluded=True and exclusion_reason populated. Each function
 emits a human-readable calculation_method string for audit.
 """
+from typing import Optional
+
 from core.income.sources import IncomeSource, IncomeSourceType
+
+
+def _f(value) -> float:
+    """Best-effort numeric coercion that NEVER raises.
+
+    Tolerates None, bool, currency strings (``"$92,400.00"``,
+    ``"92,400"``), and unparseable values (``"one hundred ten thousand"``)
+    — returns 0 for anything that isn't a parseable number. The API
+    boundary now accepts any JSON value for extracted_fields (per the
+    chaos-test fix), so the assemblers are the place to defend against
+    unparseable strings instead of the API dropping them with a 422.
+    """
+    if value is None or isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        cleaned = (
+            str(value)
+            .replace("$", "")
+            .replace(",", "")
+            .replace("(", "-")
+            .replace(")", "")
+            .strip()
+        )
+        if not cleaned:
+            return 0.0
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return 0.0
 
 
 def calculate_w2_salaried(
@@ -27,7 +59,7 @@ def calculate_w2_salaried(
     if not paystubs:
         warnings.append("No pay stub - using W2 annualized only")
     w2 = w2_docs[0]
-    annual = float(w2.get("box1_wages") or 0)
+    annual = _f(w2.get("box1_wages"))
     monthly = round(annual / 12, 2)
     conf = 0.97 if paystubs else 0.90
     doc_ids = [d.get("document_id", "") for d in w2_docs + paystubs]
@@ -63,8 +95,8 @@ def calculate_self_employed(
             exclusion_reason="Only 1 year available",
         )
     warnings: list[str] = []
-    yr1 = float(tax_returns[0].get("net_income_after_addbacks") or 0)
-    yr2 = float(tax_returns[1].get("net_income_after_addbacks") or 0)
+    yr1 = _f(tax_returns[0].get("net_income_after_addbacks"))
+    yr2 = _f(tax_returns[1].get("net_income_after_addbacks"))
     if yr2 < yr1 * 0.80:
         warnings.append(
             f"Business declining: yr2 ${yr2:,.0f} < 80% of yr1 ${yr1:,.0f}"
@@ -113,8 +145,8 @@ def calculate_rental(
     # present with value ``None`` (e.g. caller supplied an explicit None,
     # or a doc was hydrated from PG with a NULL column). The default
     # second arg only fires when the key is missing.
-    gross = float(schedule_e.get("gross_rent_annual") or 0) / 12
-    expenses = float(schedule_e.get("expenses_annual") or 0) / 12
+    gross = _f(schedule_e.get("gross_rent_annual")) / 12
+    expenses = _f(schedule_e.get("expenses_annual")) / 12
     net = round((gross * 0.75) - expenses, 2)
     if net <= 0:
         return IncomeSource(
@@ -167,7 +199,7 @@ def calculate_retirement_ssa(
             excluded=True,
             exclusion_reason="Missing SSA award letter",
         )
-    benefit = float(ssa_letter.get("monthly_benefit") or 0)
+    benefit = _f(ssa_letter.get("monthly_benefit"))
     non_taxable = ssa_letter.get("is_non_taxable", False)
     qualifying = round(benefit * 1.25 if non_taxable else benefit, 2)
     method = f"SSA ${benefit:,.2f}/mo"
@@ -206,7 +238,7 @@ def calculate_asset_depletion(
     total = 0.0
     for s in asset_statements:
         atype = s.get("account_type", "checking")
-        balance = float(s.get("balance") or 0)
+        balance = _f(s.get("balance"))
         if atype in ["checking", "savings", "investment", "brokerage"]:
             total += balance
         elif atype in ["retirement", "401k", "ira"]:
@@ -250,10 +282,10 @@ def calculate_military(les_data: dict, borrower_id: str) -> IncomeSource:
             excluded=True,
             exclusion_reason="Missing Leave and Earnings Statement",
         )
-    base = float(les_data.get("base_pay_monthly") or 0)
-    bah = float(les_data.get("bah_monthly") or 0)
-    bas = float(les_data.get("bas_monthly") or 0)
-    special = float(les_data.get("special_pay_monthly") or 0)
+    base = _f(les_data.get("base_pay_monthly"))
+    bah = _f(les_data.get("bah_monthly"))
+    bas = _f(les_data.get("bas_monthly"))
+    special = _f(les_data.get("special_pay_monthly"))
     q = round(base + (bah * 1.25) + (bas * 1.25) + special, 2)
     return IncomeSource(
         source_type=IncomeSourceType.MILITARY,

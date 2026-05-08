@@ -1,0 +1,140 @@
+{
+  "scenario": "scenario_4_data_quality",
+  "los_id": "LOS-CHAOS-DQ04",
+  "borrower": {
+    "first": "José",
+    "last": "García-López",
+    "ssn_last4": "7890"
+  },
+  "co_borrower": null,
+  "loan": {},
+  "documents": [
+    {
+      "filename": "W2_MESSY.pdf",
+      "doc_type": "W2_CURRENT",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "box1_wages": "one hundred ten thousand",
+        "tax_year": "2025",
+        "employer_name": null,
+        "employer_ein": null
+      }
+    },
+    {
+      "filename": "BANK_NEGATIVE.pdf",
+      "doc_type": "BANK_STATEMENT_M1",
+      "category": "asset",
+      "role": "primary",
+      "fields": {
+        "ending_balance": -2340,
+        "avg_balance": -890
+      }
+    },
+    {
+      "filename": "PAYSTUB_DATES.pdf",
+      "doc_type": "PAYSTUB_CURRENT",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "ytd_gross": 55000,
+        "pay_period_end": "06/15/2026",
+        "hire_date": "March 3rd, 2019"
+      }
+    },
+    {
+      "filename": "EMPTY.pdf",
+      "doc_type": "APPRAISAL_URAR",
+      "category": "property",
+      "role": "primary",
+      "fields": {}
+    },
+    {
+      "filename": "GARBAGE.pdf",
+      "doc_type": "CREDIT_REPORT",
+      "category": "credit",
+      "role": "primary",
+      "fields": {
+        "mid_score": null,
+        "tradeline_count": "unknown"
+      }
+    },
+    {
+      "filename": "W2_DUPLICATE_0.pdf",
+      "doc_type": "W2_CURRENT",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "box1_wages": 95000,
+        "tax_year": "2025",
+        "employer_name": "Stable Corp"
+      },
+      "force_doc_id": "DOC-LOS-CHAOS-DQ04-W2-DUPE"
+    },
+    {
+      "filename": "W2_DUPLICATE_1.pdf",
+      "doc_type": "W2_CURRENT",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "box1_wages": 98000,
+        "tax_year": "2025",
+        "employer_name": "Stable Corp"
+      },
+      "force_doc_id": "DOC-LOS-CHAOS-DQ04-W2-DUPE"
+    },
+    {
+      "filename": "W2_DUPLICATE_2.pdf",
+      "doc_type": "W2_CURRENT",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "box1_wages": 102000,
+        "tax_year": "2025",
+        "employer_name": "Stable Corp"
+      },
+      "force_doc_id": "DOC-LOS-CHAOS-DQ04-W2-DUPE"
+    },
+    {
+      "filename": "DL_UNICODE.pdf",
+      "doc_type": "DRIVERS_LICENSE",
+      "category": "identity",
+      "role": "primary",
+      "fields": {
+        "dl_number": "CA-ÜN1C0DE",
+        "name_match": true
+      }
+    },
+    {
+      "filename": "VOE_LONG.pdf",
+      "doc_type": "VOE_TWN",
+      "category": "employment",
+      "role": "primary",
+      "fields": {
+        "employer_name": "The Very Long Named Corporation of America and International Partners The Very Long Named Corporation of America and International Partners The Very Long Named Corporation of America and International Partners ",
+        "employment_status": "Active",
+        "income_amount": 110000
+      }
+    },
+    {
+      "filename": "PURCHASE.pdf",
+      "doc_type": "PURCHASE_AGREEMENT",
+      "category": "loan_terms",
+      "role": "primary",
+      "fields": {
+        "purchase_price": 425000
+      }
+    },
+    {
+      "filename": "URLA.pdf",
+      "doc_type": "URLA_1003",
+      "category": "loan_terms",
+      "role": "primary",
+      "fields": {
+        "loan_amount": 340000,
+        "interest_rate": 6.5,
+        "loan_term_months": 360
+      }
+    }
+  ]
+}

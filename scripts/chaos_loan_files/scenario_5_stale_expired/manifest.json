@@ -1,0 +1,150 @@
+{
+  "scenario": "scenario_5_stale_expired",
+  "los_id": "LOS-CHAOS-LE05",
+  "borrower": {
+    "first": "Amanda",
+    "last": "Wilson",
+    "ssn_last4": "2345"
+  },
+  "co_borrower": null,
+  "loan": {},
+  "documents": [
+    {
+      "filename": "W2_WRONG_YEAR.pdf",
+      "doc_type": "W2_CURRENT",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "box1_wages": 88000,
+        "tax_year": "2023",
+        "employer_name": "Previous Corp"
+      }
+    },
+    {
+      "filename": "PAYSTUB_STALE.pdf",
+      "doc_type": "PAYSTUB_CURRENT",
+      "category": "income",
+      "role": "primary",
+      "fields": {
+        "ytd_gross": 22000,
+        "pay_period_end": "2026-03-15"
+      }
+    },
+    {
+      "filename": "RATE_LOCK_EXPIRED.pdf",
+      "doc_type": "RATE_LOCK",
+      "category": "loan_terms",
+      "role": "primary",
+      "fields": {
+        "locked_rate": 5.875,
+        "lock_expiry": "2026-03-01",
+        "lock_days": 45,
+        "status": "expired"
+      }
+    },
+    {
+      "filename": "CREDIT_OLD.pdf",
+      "doc_type": "CREDIT_REPORT",
+      "category": "credit",
+      "role": "primary",
+      "fields": {
+        "mid_score": 735,
+        "total_monthly_payments": 1500,
+        "report_date": "2025-12-01"
+      }
+    },
+    {
+      "filename": "VOE_TERMINATED.pdf",
+      "doc_type": "VOE_TWN",
+      "category": "employment",
+      "role": "primary",
+      "fields": {
+        "employer_name": "TechStartup Inc",
+        "employment_status": "Terminated",
+        "termination_date": "2026-04-30",
+        "income_amount": 88000
+      }
+    },
+    {
+      "filename": "AUS_REFER.pdf",
+      "doc_type": "AUS_DU_FINDINGS",
+      "category": "vendor",
+      "role": "primary",
+      "fields": {
+        "recommendation": "Refer with Caution",
+        "risk_class": "Caution"
+      }
+    },
+    {
+      "filename": "APPRAISAL_1.pdf",
+      "doc_type": "APPRAISAL_URAR",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "appraised_value": 410000,
+        "effective_date": "2026-03-01"
+      }
+    },
+    {
+      "filename": "APPRAISAL_2.pdf",
+      "doc_type": "APPRAISAL_URAR",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "appraised_value": 348500,
+        "effective_date": "2026-06-01"
+      }
+    },
+    {
+      "filename": "APPRAISAL_OLD.pdf",
+      "doc_type": "APPRAISAL_UPDATE",
+      "category": "property",
+      "role": "primary",
+      "fields": {
+        "original_value": 410000,
+        "updated_value": 405000,
+        "update_date": "2026-06-15",
+        "days_since_original": 156
+      }
+    },
+    {
+      "filename": "PURCHASE.pdf",
+      "doc_type": "PURCHASE_AGREEMENT",
+      "category": "loan_terms",
+      "role": "primary",
+      "fields": {
+        "purchase_price": 400000
+      }
+    },
+    {
+      "filename": "DL.pdf",
+      "doc_type": "DRIVERS_LICENSE",
+      "category": "identity",
+      "role": "primary",
+      "fields": {
+        "name_match": true
+      }
+    },
+    {
+      "filename": "URLA.pdf",
+      "doc_type": "URLA_1003",
+      "category": "loan_terms",
+      "role": "primary",
+      "fields": {
+        "loan_amount": 320000,
+        "interest_rate": 6.875,
+        "loan_term_months": 360
+      }
+    },
+    {
+      "filename": "BANK_M1.pdf",
+      "doc_type": "BANK_STATEMENT_M1",
+      "category": "asset",
+      "role": "primary",
+      "fields": {
+        "ending_balance": 35000,
+        "avg_balance": 32000
+      }
+    }
+  ]
+}
