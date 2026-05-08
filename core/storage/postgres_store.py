@@ -2470,3 +2470,92 @@ class PostgresStore:
             applicant_id, tenant_id,
         )
         return int(val or 0)
+
+    # ---------------- entity-state lookup helpers -----------------
+    #
+    # Used by the entity_state_builder running at the end of
+    # ``AggregationService._run_assembly``. The two queries below are
+    # cheap (small applicant doc sets, partial indexes already present)
+    # and run once per assembly — fine to do inline.
+
+    async def get_documents_by_app_and_category(
+        self,
+        application_id: str,
+        category: str,
+        tenant_id: str = "default",
+    ) -> list:
+        """Every current doc filed against ``application_id`` matching
+        ``document_category``. Pulls across the application's primary +
+        co-applicant by joining through ``applications`` so docs that
+        landed on either borrower's row are visible. Tenant-scoped."""
+        rows = await db.fetch(
+            """
+            SELECT di.* FROM document_index di
+            JOIN applications a
+              ON a.application_id = $1
+             AND a.tenant_id      = $3
+            WHERE di.is_current        = TRUE
+              AND di.tenant_id         = $3
+              AND di.document_category = $2
+              AND (di.application_id   = $1
+                   OR di.applicant_id  = a.applicant_id
+                   OR (a.co_applicant_id IS NOT NULL
+                       AND di.applicant_id = a.co_applicant_id))
+            ORDER BY di.received_at DESC
+            """,
+            application_id, category, tenant_id,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_documents_by_types(
+        self,
+        applicant_id: str,
+        doc_types: list,
+        tenant_id: str = "default",
+    ) -> list:
+        """Every current doc for ``applicant_id`` whose ``document_type``
+        is in ``doc_types``. Empty input list returns an empty result.
+        Tenant-scoped via the PK + composite filter."""
+        if not doc_types:
+            return []
+        rows = await db.fetch(
+            """
+            SELECT * FROM document_index
+             WHERE applicant_id = $1
+               AND tenant_id    = $3
+               AND is_current   = TRUE
+               AND document_type = ANY($2::text[])
+             ORDER BY received_at DESC
+            """,
+            applicant_id, list(doc_types), tenant_id,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_documents_for_application_by_types(
+        self,
+        application_id: str,
+        doc_types: list,
+        tenant_id: str = "default",
+    ) -> list:
+        """Application-scoped variant of get_documents_by_types — used
+        by the loan_terms entity which is keyed on application_id, not
+        applicant_id."""
+        if not doc_types:
+            return []
+        rows = await db.fetch(
+            """
+            SELECT di.* FROM document_index di
+            JOIN applications a
+              ON a.application_id = $1 AND a.tenant_id = $3
+            WHERE di.is_current  = TRUE
+              AND di.tenant_id   = $3
+              AND di.document_type = ANY($2::text[])
+              AND (di.application_id  = $1
+                   OR di.applicant_id = a.applicant_id
+                   OR (a.co_applicant_id IS NOT NULL
+                       AND di.applicant_id = a.co_applicant_id))
+            ORDER BY di.received_at DESC
+            """,
+            application_id, list(doc_types), tenant_id,
+        )
+        return [_row_to_dict(r) for r in rows]

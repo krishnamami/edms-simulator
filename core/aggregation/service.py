@@ -479,6 +479,29 @@ class AggregationService:
                     )
             except Exception as exc:
                 logger.warning("identity_aggregation_failed", error=str(exc))
+
+            # ── entity_states write-through ──────────────────────────
+            #
+            # After every layer is assembled + cached, fan out into
+            # entity_states for the four lending entities (borrower /
+            # co_borrower / property / loan_terms). Wrapped in a global
+            # try/except so a malformed state on one entity never blocks
+            # the upload path; per-entity failures are bucketed inside
+            # ``upsert_all_entities`` and logged.
+            try:
+                from core.aggregation.entity_state_builder import upsert_all_entities
+                await upsert_all_entities(
+                    pg=self.postgres_store,
+                    redis=self.redis_store,
+                    application_id=application_id,
+                    applicant_id=applicant_id,
+                    co_applicant_id=co_applicant_id,
+                    tenant_id=current_tenant_id(),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "entity_states_upsert_failed", error=str(exc)[:200]
+                )
         finally:
             await self.redis_store.release_assembly_lock(applicant_id, tenant_id=current_tenant_id())
 

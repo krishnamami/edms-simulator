@@ -138,6 +138,93 @@ class FakePostgresStore:
                 if d.get("application_id") == application_id
                 and d.get("tenant_id", "default") == tenant_id]
 
+    async def get_documents_by_app_and_category(
+        self, application_id, category, tenant_id="default",
+    ):
+        # Walk applications first to know primary + co; the FakePG fan-out
+        # mirrors the real SQL JOIN through ``applications``.
+        app = self.applications.get(application_id)
+        primary = (app or {}).get("applicant_id")
+        co      = (app or {}).get("co_applicant_id")
+        return [
+            d for d in self.documents
+            if d.get("tenant_id", "default") == tenant_id
+            and d.get("document_category") == category
+            and d.get("is_current", True)
+            and (d.get("application_id") == application_id
+                 or d.get("applicant_id") in (primary, co))
+        ]
+
+    async def get_documents_by_types(
+        self, applicant_id, doc_types, tenant_id="default",
+    ):
+        types = set(doc_types or [])
+        if not types:
+            return []
+        return [
+            d for d in self.documents
+            if d.get("applicant_id") == applicant_id
+            and d.get("document_type") in types
+            and d.get("tenant_id", "default") == tenant_id
+            and d.get("is_current", True)
+        ]
+
+    async def get_documents_for_application_by_types(
+        self, application_id, doc_types, tenant_id="default",
+    ):
+        types = set(doc_types or [])
+        if not types:
+            return []
+        app = self.applications.get(application_id)
+        primary = (app or {}).get("applicant_id")
+        co      = (app or {}).get("co_applicant_id")
+        return [
+            d for d in self.documents
+            if d.get("tenant_id", "default") == tenant_id
+            and d.get("document_type") in types
+            and d.get("is_current", True)
+            and (d.get("application_id") == application_id
+                 or d.get("applicant_id") in (primary, co))
+        ]
+
+    async def upsert_entity_state(
+        self, entity_id, entity_type, application_id, state,
+        document_count=0, graph_edge_count=0, conflict_count=0,
+        completeness_pct=0.0, tenant_id="default",
+    ):
+        if not hasattr(self, "_entity_states"):
+            self._entity_states = {}
+        from datetime import datetime, timezone
+        self._entity_states[entity_id] = {
+            "entity_id":        entity_id,
+            "entity_type":      entity_type,
+            "application_id":   application_id,
+            "tenant_id":        tenant_id,
+            "state":            state,
+            "document_count":   int(document_count),
+            "graph_edge_count": int(graph_edge_count),
+            "conflict_count":   int(conflict_count),
+            "completeness_pct": float(completeness_pct),
+            "last_updated":     datetime.now(timezone.utc),
+        }
+
+    async def get_entity_state(self, entity_id, tenant_id="default"):
+        row = getattr(self, "_entity_states", {}).get(entity_id)
+        if row and row.get("tenant_id", "default") != tenant_id:
+            return None
+        return row
+
+    async def count_edges_for_entity(self, applicant_id, tenant_id="default"):
+        return len([r for r in self.relationships
+                    if r.get("applicant_id") == applicant_id
+                    and r.get("tenant_id", "default") == tenant_id])
+
+    async def count_conflicts_for_entity(self, applicant_id, tenant_id="default"):
+        return len([r for r in self.relationships
+                    if r.get("applicant_id") == applicant_id
+                    and r.get("relationship_type") == "contradicts"
+                    and r.get("tenant_id", "default") == tenant_id])
+
     async def get_all_applicants(self):
         return list(self.applicants.values())
 

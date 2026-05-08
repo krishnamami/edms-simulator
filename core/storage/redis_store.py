@@ -439,3 +439,54 @@ class RedisStore:
             logger.warning(
                 "redis_invalidate_identity_failed", extra={"error": str(e)}
             )
+
+    # ---------------- entity_states write-through -----------------
+    #
+    # The /documents/upload path now upserts entity_states for every
+    # affected entity (borrower / co_borrower / property / loan_terms)
+    # at the end of AggregationService._run_assembly. The state JSONB
+    # is also mirrored into Redis under ``entity:{entity_id}`` so
+    # /entity/{id}/state can serve from cache without a PG hit. The
+    # 1-hour TTL matches typical decision-engine refresh cadence —
+    # short enough that stale reads heal fast, long enough to absorb
+    # a burst of assembly fan-out.
+
+    TTL_ENTITY_STATE = 3600  # 1 hour
+
+    async def set_entity_state(
+        self, entity_id: str, state_json: str,
+        ttl: Optional[int] = None,
+        tenant_id: str = "default",
+    ) -> bool:
+        """Cache an entity_states.state payload as a JSON string. The
+        caller passes the already-serialized string so we don't double-
+        encode (and any non-JSON-safe values it contains are already
+        the caller's problem)."""
+        try:
+            await self._r.setex(
+                self._k(tenant_id, f"entity:{entity_id}"),
+                ttl or self.TTL_ENTITY_STATE,
+                state_json,
+            )
+            return True
+        except Exception as e:
+            logger.warning("redis_set_entity_state_failed",
+                           extra={"error": str(e)})
+            return False
+
+    async def get_entity_state(
+        self, entity_id: str, tenant_id: str = "default",
+    ) -> Optional[str]:
+        try:
+            return await self._r.get(self._k(tenant_id, f"entity:{entity_id}"))
+        except Exception:
+            return None
+
+    async def invalidate_entity_state(
+        self, entity_id: str, tenant_id: str = "default",
+    ) -> None:
+        try:
+            await self._r.delete(self._k(tenant_id, f"entity:{entity_id}"))
+        except Exception as e:
+            logger.warning("redis_invalidate_entity_state_failed",
+                           extra={"error": str(e)})
