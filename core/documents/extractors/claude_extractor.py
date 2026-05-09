@@ -272,8 +272,8 @@ async def extract_with_claude(
         client = AsyncAnthropic()
     except Exception as exc:
         logger.warning(
-            "ai_extraction_client_unavailable",
-            extra={"error": str(exc)[:200]},
+            f"ai_extraction_client_unavailable "
+            f"error_type={type(exc).__name__} error={str(exc)[:300]}"
         )
         return _GRACEFUL_FAILURE
 
@@ -298,9 +298,12 @@ async def extract_with_claude(
             ],
         )
     except Exception as exc:
+        # Inline error into the message so the production stdlib
+        # formatter surfaces it in CloudWatch (extra={} keys are
+        # dropped by the default formatter).
         logger.warning(
-            "ai_extraction_api_failed",
-            extra={"doc_type": doc_type, "error": str(exc)[:200]},
+            f"ai_extraction_api_failed doc_type={doc_type} "
+            f"error_type={type(exc).__name__} error={str(exc)[:300]}"
         )
         return _GRACEFUL_FAILURE
 
@@ -353,8 +356,8 @@ def extract_with_claude_sync(
             return _GRACEFUL_FAILURE
     except Exception as exc:
         logger.warning(
-            "ai_extraction_client_unavailable",
-            extra={"error": str(exc)[:200]},
+            f"ai_extraction_client_unavailable "
+            f"error_type={type(exc).__name__} error={str(exc)[:300]}"
         )
         return _GRACEFUL_FAILURE
 
@@ -379,9 +382,12 @@ def extract_with_claude_sync(
             ],
         )
     except Exception as exc:
+        # Inline error into the message so the production stdlib
+        # formatter surfaces it in CloudWatch (extra={} keys are
+        # dropped by the default formatter).
         logger.warning(
-            "ai_extraction_api_failed",
-            extra={"doc_type": doc_type, "error": str(exc)[:200]},
+            f"ai_extraction_api_failed doc_type={doc_type} "
+            f"error_type={type(exc).__name__} error={str(exc)[:300]}"
         )
         return _GRACEFUL_FAILURE
 
