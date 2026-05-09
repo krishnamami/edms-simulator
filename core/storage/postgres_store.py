@@ -242,14 +242,21 @@ class PostgresStore:
         async def _insert_borrower(b: dict) -> str:
             seq = await self.next_sequence()
             applicant_id = f"APL-{seq:05d}-P"
+            # Prefer the event's explicit ssn_hash so the v3 generator
+            # can guarantee no two borrowers across a sim collide on
+            # the applicants(ssn_hash) UNIQUE INDEX. Falls back to the
+            # deterministic compute when no explicit hash is supplied
+            # (legacy callers + tests).
+            ssn_hash = b.get("ssn_hash") or _ssn_hash(
+                b.get("ssn_last4", "0000"), b["dob"], b["last_name"],
+            )
             gr = {
                 "applicant_id": applicant_id,
                 "full_name":    f"{b['first_name']} {b['last_name']}",
                 "first_name":   b["first_name"],
                 "last_name":    b["last_name"],
                 "dob":          b["dob"],
-                "ssn_hash":     _ssn_hash(b.get("ssn_last4", "0000"),
-                                          b["dob"], b["last_name"]),
+                "ssn_hash":     ssn_hash,
                 "ssn_last4":    b.get("ssn_last4"),
                 "email":        b.get("email"),
                 "phone":        b.get("phone"),

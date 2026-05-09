@@ -79,7 +79,8 @@ class FakePostgresStore:
         await self.save_golden_record({
             "applicant_id": applicant_id, "full_name": f"{b['first_name']} {b['last_name']}",
             "first_name": b["first_name"], "last_name": b["last_name"],
-            "dob": b["dob"], "ssn_hash": f"hash-{b.get('ssn_last4', '0000')}",
+            "dob": b["dob"],
+            "ssn_hash": b.get("ssn_hash") or f"hash-{b.get('ssn_last4', '0000')}",
             "ssn_last4": b.get("ssn_last4"), "email": b.get("email"),
             "status": "active",
         }, tenant_id=tenant_id)
@@ -92,7 +93,8 @@ class FakePostgresStore:
                 "applicant_id": co_applicant_id,
                 "full_name": f"{cb['first_name']} {cb['last_name']}",
                 "first_name": cb["first_name"], "last_name": cb["last_name"],
-                "dob": cb["dob"], "ssn_hash": f"hash-{cb.get('ssn_last4', '0000')}",
+                "dob": cb["dob"],
+                "ssn_hash": cb.get("ssn_hash") or f"hash-{cb.get('ssn_last4', '0000')}",
                 "ssn_last4": cb.get("ssn_last4"), "email": cb.get("email"),
                 "status": "active",
             }, tenant_id=tenant_id)
