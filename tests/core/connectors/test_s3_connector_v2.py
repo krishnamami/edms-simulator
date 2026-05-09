@@ -194,3 +194,25 @@ def test_watermark_filter_excludes_pre_window_docs(v2_root: Path):
     # Only the 14:15 (meta-pair) and 15:15 / 19:15 (corelogic + ai_chat)
     # docs should remain. The 09:15, 10:15, 11:15 ones are filtered out.
     assert all(r > "2026-01-01T12:00:00Z" for r in received), received
+
+
+def test_sibling_pdf_b64_files_are_ignored_by_dispatch(v2_root: Path):
+    """``edms_pull/`` and ``los_encompass/`` may carry sibling
+    ``.pdf.b64`` evidence files alongside the JSON record (added by
+    ``generate_realworld_simulation.py`` for format-aware doc types).
+    The connector must read only the JSON and skip the binaries —
+    otherwise the count would double when the renderer runs."""
+    edms_dir = v2_root / "2026-01-01" / "edms_pull"
+    # Drop a sibling .pdf.b64 next to the existing JSON record.
+    fake_pdf = edms_dir / "EDMS-W2-001.pdf.b64"
+    fake_pdf.write_text("JVBERi0xLjQK", encoding="ascii")
+
+    c = S3EDMSConnector(str(v2_root), _StubPG())
+    docs = asyncio.run(c.pull_documents_since("1970-01-01T00:00:00Z"))
+    edms_docs = [d for d in docs if d.get("source_channel") == "edms_pull"]
+    # Still exactly 1 doc — the sibling .pdf.b64 must NOT have been
+    # parsed as a JSON record.
+    assert len(edms_docs) == 1, (
+        f"sibling .pdf.b64 leaked into the pull (found {len(edms_docs)} edms docs)"
+    )
+    assert edms_docs[0]["document_id"] == "EDMS-W2-001"

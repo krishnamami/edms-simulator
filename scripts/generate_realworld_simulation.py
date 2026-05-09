@@ -54,6 +54,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# Format-aware PDF renderers (W2/paystub/bank/title/credit/appraisal each
+# have 2-3 layout variants per real-world institution). The dispatcher
+# falls back to a generic title+kv layout for doc types without a
+# custom renderer (rate lock, HOI binder, gift letter, etc.).
+from scripts import pdf_formats  # noqa: E402
+
 
 DEFAULT_OUT       = "local_storage/s3_simulation_v2"
 DEFAULT_S3_TARGET = "s3://edms-simulator-loans/s3_simulation_v2/"
@@ -794,32 +800,18 @@ def _extracted_fields(
 
 
 # ===========================================================================
-# PDF + base64 helpers — minimal one-page PDF stamping the doc info.
-# Each PDF stays under ~5 KB so the simulation tree stays small.
+# PDF + base64 helpers — dispatch through ``pdf_formats`` so each loan
+# gets a format-appropriate layout (ADP / Paychex / Gusto W-2, Chase /
+# Wells / BOA bank statements, etc.). Multi-page docs fan out within
+# the renderer; the meta.json and the rendered PDF stay in lockstep.
 # ===========================================================================
 
 
-def _make_pdf_bytes(title: str, lines: list) -> bytes:
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=letter)
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(72, 720, title[:90])
-    c.setFont("Helvetica", 10)
-    y = 690
-    for line in lines:
-        c.drawString(72, y, str(line)[:100])
-        y -= 14
-        if y < 80:
-            break
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-
-def _pdf_b64(title: str, lines: list) -> str:
-    return base64.b64encode(_make_pdf_bytes(title, lines)).decode("ascii")
+def _pdf_b64(
+    doc_type: str, fields: dict, los_id: str, role: str = "primary",
+) -> str:
+    pdf_bytes = pdf_formats.make_pdf(doc_type, fields, los_id, role)
+    return base64.b64encode(pdf_bytes).decode("ascii")
 
 
 # ===========================================================================
@@ -888,6 +880,7 @@ def _channel_dir(out: Path, day: int, channel: str, start_date: date) -> Path:
 
 def _write_edms_pull(out, los_id, doc_type, role, day, hour, extras, start_date):
     folder = _channel_dir(out, day, "edms_pull", start_date)
+    fields = _extracted_fields(doc_type, los_id, role, day, extras)
     doc = {
         "document_id":        _doc_id("edms_pull", los_id, doc_type, day, hour),
         "document_type":      doc_type,
@@ -898,11 +891,26 @@ def _write_edms_pull(out, los_id, doc_type, role, day, hour, extras, start_date)
         "source_institution": extras.get("source_institution", "EDMS"),
         "source_channel":     "edms_pull",
         "received_at":        _received_at(start_date, day, hour),
-        "extracted_fields":   _extracted_fields(doc_type, los_id, role, day, extras),
+        "extracted_fields":   fields,
     }
     with (folder / f"{doc['document_id']}.json").open("w", encoding="utf-8") as f:
         json.dump(doc, f, indent=2, default=str)
-    return 1
+    written = 1
+    # When a format-aware renderer exists for this doc type (W-2, paystub,
+    # bank stmt, credit report, appraisal, title), also drop a sibling
+    # ``.pdf.b64`` so the rendered PDF is available for AI-Vision
+    # verification + visual review. The connector keys on ``.json`` and
+    # ignores the sibling, so this is purely additive — the JSON record
+    # remains the source of truth indexed by the connector.
+    fmt = pdf_formats.format_for(doc_type, los_id, role)
+    if fmt is not None:
+        pdf_bytes = pdf_formats.make_pdf(doc_type, fields, los_id, role)
+        sibling = folder / f"{doc['document_id']}.pdf.b64"
+        sibling.write_text(
+            base64.b64encode(pdf_bytes).decode("ascii"), encoding="ascii",
+        )
+        written += 1
+    return written
 
 
 def _write_email_inbox(out, los_id, doc_type, role, day, hour, extras, start_date):
@@ -910,10 +918,7 @@ def _write_email_inbox(out, los_id, doc_type, role, day, hour, extras, start_dat
     suffix = extras.get("doc_id_suffix", "")
     doc_id = _doc_id("email_inbox", los_id, doc_type, day, hour, suffix)
     fields = _extracted_fields(doc_type, los_id, role, day, extras)
-    pdf_b64 = _pdf_b64(
-        f"{doc_type} — {los_id}",
-        [f"{k}: {v}" for k, v in fields.items()][:8],
-    )
+    pdf_b64 = _pdf_b64(doc_type, fields, los_id, role)
     base = f"{doc_id}_email"
     (folder / f"{base}.pdf.b64").write_text(pdf_b64, encoding="ascii")
     meta = {
@@ -941,10 +946,7 @@ def _write_borrower_portal(out, los_id, doc_type, role, day, hour, extras, start
     fields = _extracted_fields(doc_type, los_id, role, day, extras)
     fmt = extras.get("format", "pdf")
     base = f"{doc_id}_upload"
-    pdf_b64 = _pdf_b64(
-        f"{doc_type} (uploaded)",
-        [f"{k}: {v}" for k, v in fields.items()][:6],
-    )
+    pdf_b64 = _pdf_b64(doc_type, fields, los_id, role)
     (folder / f"{base}.{fmt}.b64").write_text(pdf_b64, encoding="ascii")
     p = LOAN_PROFILES[los_id]
     uploaded_by = (
@@ -989,7 +991,26 @@ def _write_los_encompass_batch(out, los_id, doc_types, role, day, hour, extras,
     fname = f"{los_id}_batch_{folder_date}_h{hour:02d}.json"
     with (folder / fname).open("w", encoding="utf-8") as f:
         json.dump(docs, f, indent=2, default=str)
-    return 1
+    written = 1
+    # For each batch entry that has a format-aware renderer (CREDIT_REPORT
+    # is the main one — Encompass batches it together with URLA + AUS
+    # findings), drop a sibling ``.pdf.b64`` named by document_id so the
+    # rendered PDF is on disk for AI-Vision verification + visual review.
+    # Connector ignores .pdf.b64 (suffix mismatch on the json scan), so
+    # this stays additive.
+    for d in docs:
+        fmt = pdf_formats.format_for(d["document_type"], los_id, role)
+        if fmt is None:
+            continue
+        pdf_bytes = pdf_formats.make_pdf(
+            d["document_type"], d["extracted_fields"], los_id, role,
+        )
+        sibling = folder / f"{d['document_id']}.pdf.b64"
+        sibling.write_text(
+            base64.b64encode(pdf_bytes).decode("ascii"), encoding="ascii",
+        )
+        written += 1
+    return written
 
 
 def _write_vendor_equifax(out, los_id, doc_type, role, day, hour, extras, start_date):
@@ -1038,10 +1059,7 @@ def _write_vendor_title(out, los_id, doc_type, role, day, hour, extras, start_da
     folder = _channel_dir(out, day, "vendor_title", start_date)
     doc_id = _doc_id("vendor_title", los_id, doc_type, day, hour)
     fields = _extracted_fields(doc_type, los_id, role, day, extras)
-    pdf_b64 = _pdf_b64(
-        f"{doc_type} — First American",
-        [f"{k}: {v}" for k, v in fields.items()][:8],
-    )
+    pdf_b64 = _pdf_b64(doc_type, fields, los_id, role)
     base = f"{doc_id}_title"
     (folder / f"{base}.pdf.b64").write_text(pdf_b64, encoding="ascii")
     meta = {
@@ -1064,10 +1082,14 @@ def _write_vendor_title(out, los_id, doc_type, role, day, hour, extras, start_da
     return 2
 
 
-def _write_shared_drive(out, day, hour, scan_text, start_date):
+def _write_shared_drive(out, day, hour, scan_text, variant_idx, start_date):
+    """Render a shared-drive scan with a real-world artifact (rotation /
+    landscape / two-docs-per-page / faded photocopy) — variant_idx
+    cycles through the four artifact styles deterministically."""
     folder = _channel_dir(out, day, "shared_drive", start_date)
     ts = (start_date + timedelta(days=day - 1)).strftime("%Y%m%d") + f"-{hour:02d}{15:02d}"
-    pdf_b64 = _pdf_b64("Scanned document", [scan_text, "(no metadata; classify via AI)"])
+    pdf_bytes = pdf_formats.make_shared_drive_scan(scan_text, variant_idx)
+    pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
     (folder / f"scan_{ts}.pdf.b64").write_text(pdf_b64, encoding="ascii")
     return 1
 
@@ -1163,11 +1185,15 @@ def generate(
             else:
                 print(f"  WARN unknown channel: {channel}")
 
-    # Sprinkle unclassified shared-drive scans across the window.
-    for day, hour, scan_text in SHARED_DRIVE_DROPS:
+    # Sprinkle unclassified shared-drive scans across the window. The
+    # variant index cycles 0..3 → rotated / landscape / two-doc / faded
+    # so the first run hits all four real-world scanner artifacts.
+    for variant_idx, (day, hour, scan_text) in enumerate(SHARED_DRIVE_DROPS):
         if day > num_days:
             continue
-        n = _write_shared_drive(out_dir, day, hour, scan_text, start_date)
+        n = _write_shared_drive(
+            out_dir, day, hour, scan_text, variant_idx, start_date,
+        )
         files_total += n
         by_channel["shared_drive"] = by_channel.get("shared_drive", 0) + n
 
