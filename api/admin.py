@@ -263,3 +263,89 @@ async def deactivate_api_key(request: Request, api_key: str):
         "tenant_id":      existing["tenant_id"],
         "is_active":      False,
     }
+
+
+@router.post(
+    "/admin/reset",
+    summary="DESTRUCTIVE — wipe all loan data for a clean slate",
+    description=(
+        "TRUNCATEs every loan-data table (entity_states, snapshots, "
+        "events, document_index, document_relationships, "
+        "graph_build_runs, applications, applicants, "
+        "indexing_watermarks) and FLUSHDB on Redis so the next build "
+        "starts from zero. Tenants + api_keys + webhooks are "
+        "preserved. Use BEFORE swapping the connector source to a new "
+        "simulation tree, or after a generator change that produces "
+        "different applicant_ids.\n\n"
+        "**This is a hard reset** — there is no undo. The operation "
+        "is logged but no backup is taken."
+    ),
+    dependencies=[Depends(require_admin)],
+    responses={
+        200: {"description": "Reset complete; row counts after truncate."},
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        403: {"description": "`admin` scope required."},
+    },
+)
+async def admin_reset(request: Request):
+    pg    = request.app.state.postgres_store
+    redis = request.app.state.redis_store
+    # Order matters because of FK constraints: child tables before
+    # parents. CASCADE on the tail handles anything we forget.
+    tables = (
+        "entity_state_events",
+        "entity_snapshots",
+        "entity_states",
+        "graph_build_runs",
+        "indexing_watermarks",
+        "document_relationships",
+        "document_index",
+        "income_profiles",
+        "credit_profiles",
+        "applications",
+        "applicant_identity_xref",
+        "applicants",
+    )
+    truncated: list = []
+    failed:    list = []
+    from core.storage import db
+    for t in tables:
+        try:
+            await db.execute(f"TRUNCATE TABLE {t} CASCADE")
+            truncated.append(t)
+        except Exception as exc:
+            failed.append({"table": t, "error": str(exc)[:200]})
+            logger.warning(
+                f"admin_reset_truncate_failed table={t} "
+                f"error_type={type(exc).__name__} error={str(exc)[:200]}"
+            )
+    # Reset the applicant sequence so APL-00001-P starts fresh.
+    try:
+        await db.execute("ALTER SEQUENCE applicant_sequence RESTART WITH 1")
+    except Exception as exc:
+        logger.warning(
+            f"admin_reset_sequence_reset_failed error={str(exc)[:200]}"
+        )
+    # FLUSHDB Redis — best-effort; a Redis blip shouldn't fail the
+    # whole reset since the next build re-warms caches.
+    redis_flushed = False
+    try:
+        await redis._r.flushdb()
+        redis_flushed = True
+    except Exception as exc:
+        logger.warning(
+            f"admin_reset_redis_flush_failed error={str(exc)[:200]}"
+        )
+
+    logger.info(
+        f"admin_reset_complete tenant={getattr(request.state, 'tenant_id', '?')} "
+        f"truncated={len(truncated)} failed={len(failed)} "
+        f"redis_flushed={redis_flushed}"
+    )
+    return {
+        "status":            "reset_complete",
+        "tables_truncated":  len(truncated),
+        "truncated":         truncated,
+        "failed":            failed,
+        "redis_flushed":     redis_flushed,
+    }

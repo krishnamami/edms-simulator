@@ -274,7 +274,7 @@ LOAN_PROFILES: dict = {
         "primary_name":   "James Wilson",
         "primary_first":  "James", "primary_last": "Wilson",
         "primary_dob":    "1985-01-01", "primary_ssn4": "1001",
-        "primary_ssn_hash": "unique_ssn_LOAN101_1001",
+        "primary_ssn_hash": "unique_LOAN101_1001",
         "primary_email":  "james.wilson@email.com",
         "primary_phone":  "512-555-0101",
         "primary_address":"456 Elm St, Austin TX 78745",
@@ -306,7 +306,7 @@ LOAN_PROFILES: dict = {
         "primary_name":   "Maria Garcia",
         "primary_first":  "Maria", "primary_last": "Garcia",
         "primary_dob":    "1982-02-02", "primary_ssn4": "1002",
-        "primary_ssn_hash": "unique_ssn_LOAN102_1002",
+        "primary_ssn_hash": "unique_LOAN102_1002",
         "primary_email":  "maria.garcia@email.com",
         "primary_phone":  "210-555-0102",
         "primary_address":"789 Sunset Blvd, San Antonio TX 78201",
@@ -339,14 +339,14 @@ LOAN_PROFILES: dict = {
         "primary_name":   "David Kim",
         "primary_first":  "David", "primary_last": "Kim",
         "primary_dob":    "1980-03-03", "primary_ssn4": "1003",
-        "primary_ssn_hash": "unique_ssn_LOAN103_1003",
+        "primary_ssn_hash": "unique_LOAN103_1003",
         "primary_email":  "david.kim@email.com",
         "primary_phone":  "512-555-0103",
         "primary_address":"888 Forest Ln, Round Rock TX 78664",
         "co_name":        "Sarah Kim",
         "co_first":       "Sarah", "co_last": "Kim",
         "co_dob":         "1983-03-13", "co_ssn4": "1013",
-        "co_ssn_hash":    "unique_ssn_LOAN103C_1013",
+        "co_ssn_hash":    "unique_LOAN103C_1013",
         "co_email":       "sarah.kim@email.com",
         "income":         195000, "stated_income": 195000,
         "primary_income": 110000, "co_income": 85000,
@@ -378,7 +378,7 @@ LOAN_PROFILES: dict = {
         "primary_name":   "Robert Johnson",
         "primary_first":  "Robert", "primary_last": "Johnson",
         "primary_dob":    "1958-04-04", "primary_ssn4": "1004",
-        "primary_ssn_hash": "unique_ssn_LOAN104_1004",
+        "primary_ssn_hash": "unique_LOAN104_1004",
         "primary_email":  "robert.johnson@email.com",
         "primary_phone":  "512-555-0104",
         "primary_address":"100 Pinewood Dr, Georgetown TX 78626",
@@ -411,7 +411,7 @@ LOAN_PROFILES: dict = {
         "primary_name":   "Amanda Chen",
         "primary_first":  "Amanda", "primary_last": "Chen",
         "primary_dob":    "1995-05-05", "primary_ssn4": "1005",
-        "primary_ssn_hash": "unique_ssn_LOAN105_1005",
+        "primary_ssn_hash": "unique_LOAN105_1005",
         "primary_email":  "amanda.chen@gmail.com",
         "primary_phone":  "512-555-0105",
         "primary_address":"22 Garden St, Pflugerville TX 78660",
@@ -443,7 +443,7 @@ LOAN_PROFILES: dict = {
         "primary_name":   "Carlos Rivera",
         "primary_first":  "Carlos", "primary_last": "Rivera",
         "primary_dob":    "1978-06-06", "primary_ssn4": "1006",
-        "primary_ssn_hash": "unique_ssn_LOAN106_1006",
+        "primary_ssn_hash": "unique_LOAN106_1006",
         "primary_email":  "carlos.rivera@email.com",
         "primary_phone":  "214-555-0106",
         "primary_address":"77 Liberty Way, Dallas TX 75201",
@@ -475,14 +475,14 @@ LOAN_PROFILES: dict = {
         "primary_name":   "Jennifer Brown",
         "primary_first":  "Jennifer", "primary_last": "Brown",
         "primary_dob":    "1984-07-07", "primary_ssn4": "1007",
-        "primary_ssn_hash": "unique_ssn_LOAN107_1007",
+        "primary_ssn_hash": "unique_LOAN107_1007",
         "primary_email":  "jennifer.brown@email.com",
         "primary_phone":  "512-555-0107",
         "primary_address":"304 Maple Dr, Austin TX 78704",
         "co_name":        "Mike Brown",
         "co_first":       "Mike", "co_last": "Brown",
         "co_dob":         "1982-07-17", "co_ssn4": "1017",
-        "co_ssn_hash":    "unique_ssn_LOAN107C_1017",
+        "co_ssn_hash":    "unique_LOAN107C_1017",
         "co_email":       "mike.brown@email.com",
         "income":         165000, "stated_income": 165000,
         "primary_income": 95000, "co_income": 70000,
@@ -514,7 +514,7 @@ LOAN_PROFILES: dict = {
         "primary_name":   "Priya Patel",
         "primary_first":  "Priya", "primary_last": "Patel",
         "primary_dob":    "1990-08-08", "primary_ssn4": "1008",
-        "primary_ssn_hash": "unique_ssn_LOAN108_1008",
+        "primary_ssn_hash": "unique_LOAN108_1008",
         "primary_email":  "priya.patel@email.com",
         "primary_phone":  "972-555-0108",
         "primary_address":"15 Innovation Blvd, Frisco TX 75033",
@@ -546,7 +546,7 @@ LOAN_PROFILES: dict = {
         "primary_name":   "Thomas O'Brien",
         "primary_first":  "Thomas", "primary_last": "O'Brien",
         "primary_dob":    "1976-09-09", "primary_ssn4": "1009",
-        "primary_ssn_hash": "unique_ssn_LOAN109_1009",
+        "primary_ssn_hash": "unique_LOAN109_1009",
         "primary_email":  "thomas.obrien@email.com",
         "primary_phone":  "512-555-0109",
         "primary_address":"500 River Run, Cedar Park TX 78613",
@@ -579,14 +579,14 @@ LOAN_PROFILES: dict = {
         "primary_name":   "Lisa Zhang",
         "primary_first":  "Lisa", "primary_last": "Zhang",
         "primary_dob":    "1988-10-10", "primary_ssn4": "1010",
-        "primary_ssn_hash": "unique_ssn_LOAN110_1010",
+        "primary_ssn_hash": "unique_LOAN110_1010",
         "primary_email":  "lisa.zhang@email.com",
         "primary_phone":  "512-555-0110",
         "primary_address":"700 Lakefront Pl, Austin TX 78701",
         "co_name":        "Wei Zhang",
         "co_first":       "Wei", "co_last": "Zhang",
         "co_dob":         "1986-10-20", "co_ssn4": "1020",
-        "co_ssn_hash":    "unique_ssn_LOAN110C_1020",
+        "co_ssn_hash":    "unique_LOAN110C_1020",
         "co_email":       "wei.zhang@email.com",
         "income":         202000, "stated_income": 202000,
         "primary_income": 130000, "co_income": 72000,
@@ -711,12 +711,29 @@ def _extracted_fields(
         suffix = doc_type.rsplit("_", 1)[-1]
         bal_map = {"M1": 62000, "M2": 58500, "M3": 56000}
         bal = bal_map.get(suffix, 60000)
+        # Gap-12 (gift verification chain): the M1 statement's
+        # ``largest_deposit`` lights up the third step of the chain
+        # when it matches the gift amount the gift letter declares.
+        largest_dep = (
+            profile.get("gift_amount", 0)
+            if (suffix == "M1" and profile.get("gift_amount"))
+            else round(income / 12 * 0.4, 2)
+        )
         return {
             "bank_name":            profile.get("bank", "Chase Bank"),
             "account_holder":       name,
             "ending_balance":       bal,
             "avg_monthly_deposits": round(income / 12 * 0.95, 2),
+            "largest_deposit":      largest_dep,
             "months_count":         1,
+        }
+    if doc_type == "GIFT_DONOR_BANK_STATEMENT":
+        return {
+            "donor_name":      profile.get("donor_name", "Family"),
+            "withdrawal_amount": profile.get("gift_amount", 25000),
+            "withdrawal_date": "2026-01-08",
+            "donor_balance_before": 85000,
+            "donor_balance_after":  85000 - profile.get("gift_amount", 25000),
         }
     if doc_type == "GIFT_LETTER":
         return {
@@ -879,7 +896,25 @@ def _extracted_fields(
             "total_income":      profile.get("income", 109000) + 1500,
             "wages_line1":       profile.get("wages_w2", profile.get("income", 0)),
             "schedule_c_income": profile.get("income_1099", 0),
+            "schedule_c_net":    profile.get("income_1099", 0),
+            # Depreciation addback for the 2-year average (Gap 1).
+            "depreciation":      3500 if profile.get("scenario") == "self_employed" else 0,
             "tax_year":          "2025",
+            "filing_status":     "Single",
+        }
+    if doc_type == "TAX_RETURN_1040_PRIOR":
+        # Prior-year tax return for the 2-year-average self-employed
+        # calc (Gap 1). Slight delta from current year so the
+        # ``trending`` field comes out non-trivial.
+        prior_factor = 0.9 if profile.get("scenario") == "self_employed" else 1.0
+        return {
+            "agi":               round(profile.get("income", 109000) * prior_factor),
+            "total_income":      round((profile.get("income", 109000) + 1500) * prior_factor),
+            "wages_line1":       round(profile.get("wages_w2", profile.get("income", 0)) * prior_factor),
+            "schedule_c_income": round(profile.get("income_1099", 0) * prior_factor),
+            "schedule_c_net":    round(profile.get("income_1099", 0) * prior_factor),
+            "depreciation":      4000 if profile.get("scenario") == "self_employed" else 0,
+            "tax_year":          "2024",
             "filing_status":     "Single",
         }
     if doc_type == "IRS_TRANSCRIPT":
@@ -938,10 +973,12 @@ def _extracted_fields(
         }
     if doc_type == "PAYMENT_HISTORY_24MO":
         return {
-            "months_reviewed": 24,
-            "late_payments":   0,
-            "current":         True,
-            "lender":          "USAA Federal Savings",
+            "months_reviewed":  24,
+            "late_payments":    0,
+            "current":          True,
+            "monthly_payment":  1850,   # current mortgage P&I+T+I (Gap 10)
+            "current_rate":     4.875,
+            "lender":           "USAA Federal Savings",
         }
     if doc_type == "ESCROW_ANALYSIS":
         return {
@@ -952,10 +989,13 @@ def _extracted_fields(
         }
     if doc_type == "DIVORCE_DECREE":
         return {
-            "decree_date":          "2024-09-15",
+            "decree_date":          "2024-01-15",
             "court":                "Travis County District Court",
             "alimony_amount":       profile.get("alimony_monthly", 2000),
             "alimony_frequency":    "monthly",
+            # Gap-2: alimony only counts as income with 3+ years
+            # remaining; pin to 5 so the income block's gate passes.
+            "remaining_years":      5,
             "child_support_amount": 0,
             "division_of_assets":   "per attached property settlement",
         }
@@ -1118,7 +1158,8 @@ def _category_for(doc_type: str) -> str:
     if doc_type in {"CREDIT_REPORT", "CREDIT_EXPLANATION"}:
         return "credit"
     if doc_type.startswith("BANK_STATEMENT") or doc_type in {
-        "RETIREMENT_ACCOUNT", "GIFT_LETTER", "GIFT_FUNDS_TRAIL"
+        "RETIREMENT_ACCOUNT", "GIFT_LETTER", "GIFT_FUNDS_TRAIL",
+        "GIFT_DONOR_BANK_STATEMENT",
     }:
         return "asset"
     if doc_type in {"DRIVERS_LICENSE", "SSN_VALIDATION", "OFAC_CHECK",
@@ -1336,6 +1377,8 @@ def _build_timeline(profile: dict, los_id: str) -> list:
                    "payer_name": "DesignHub", "amount": 33500, "doc_id_suffix": "designhub"}))
         e.append((9, 10, "irs_manual",  "TAX_RETURN_1040_CURRENT", "primary", {}))
         e.append((9, 11, "irs_manual",  "SCHEDULE_C", "primary", {}))
+        # Gap-1: 2-year-average needs the prior year's 1040.
+        e.append((9, 12, "irs_manual",  "TAX_RETURN_1040_PRIOR", "primary", {}))
 
     if profile["scenario"] == "investment_rental":
         e.append((6, 10, "irs_manual",  "SCHEDULE_E", "primary", {}))
@@ -1349,6 +1392,12 @@ def _build_timeline(profile: dict, los_id: str) -> list:
         e.append((12, 10, "email_inbox", "GIFT_LETTER", "primary",
                   {"sender": profile["primary_email"], "subject": "Gift letter from parents"}))
         e.append((12, 11, "edms_pull",   "GIFT_FUNDS_TRAIL", "primary", {}))
+        # Gap-12: third step of the gift-verification chain — the
+        # donor's own bank statement showing the withdrawal that
+        # became the borrower's deposit.
+        e.append((12, 14, "email_inbox", "GIFT_DONOR_BANK_STATEMENT", "primary",
+                  {"sender": "robert.chen@email.com",
+                   "subject": "Donor bank stmt for gift"}))
         e.append((13, 19, "ai_chat",     "AI_CHAT_TRANSCRIPT", "primary",
                   {"explanation_type": "large_deposit",
                    "reason": "gift from parents documented"}))

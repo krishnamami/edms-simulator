@@ -814,6 +814,20 @@ ALTER TABLE document_relationships
 CREATE INDEX IF NOT EXISTS idx_dr_app
     ON document_relationships(application_id);
 
+-- v4.1 — Gap-fixes 6, 8, 10: mortgage-insurance + combined LTV +
+-- existing-mortgage-payment indexed columns. ``mi_monthly`` lifts the
+-- monthly MI premium out of the JSONB so DTI / PITI workbench filters
+-- can predicate on it. ``cltv`` is loan_amount + subordinate liens /
+-- property_value × 100 — the metric secondary mortgages are bound by.
+-- ``existing_mortgage_payment`` matters on refis where the borrower's
+-- current mortgage payment is being replaced; the credit report
+-- already counts it as a monthly obligation, so this column is for
+-- workbench display + audit.
+ALTER TABLE entity_states
+    ADD COLUMN IF NOT EXISTS mi_monthly                FLOAT,
+    ADD COLUMN IF NOT EXISTS cltv                      FLOAT,
+    ADD COLUMN IF NOT EXISTS existing_mortgage_payment FLOAT;
+
 -- =====================================================================
 -- Webhook outbox — async delivery decouples upload latency from
 -- subscriber availability. Every assembly fan-out writes a row here;
