@@ -28,6 +28,8 @@ def _write(path: Path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     if isinstance(payload, (dict, list)):
         path.write_text(json.dumps(payload), encoding="utf-8")
+    elif isinstance(payload, bytes):
+        path.write_bytes(payload)
     else:
         path.write_text(payload, encoding="utf-8")
 
@@ -87,11 +89,12 @@ def v2_root(tmp_path: Path) -> Path:
          "received_at": "2026-01-01T10:15:00Z", "extracted_fields": {}},
     ])
 
-    # 3. Meta-pair channels — pdf.b64 + _meta.json. Connector reads ONLY
-    # the meta.json, attaches an evidence_file hint to the sibling .b64.
+    # 3. Meta-pair channels — raw .pdf + _meta.json. Connector reads
+    # ONLY the meta.json, attaches an evidence_file hint to the sibling
+    # binary.
     for ch in ("email_inbox", "borrower_portal", "vendor_title"):
-        _write(day / ch / f"{ch.upper()}-LOAN101.pdf.b64",
-               "JVBERi0xLjMK")  # bytes don't matter
+        _write(day / ch / f"{ch.upper()}-LOAN101.pdf",
+               b"%PDF-1.4 stub")  # bytes don't matter
         _write(day / ch / f"{ch.upper()}-LOAN101_meta.json", {
             "document_id":   f"{ch.upper()}-LOAN101",
             "document_type": "PURCHASE_AGREEMENT" if ch == "email_inbox"
@@ -106,7 +109,7 @@ def v2_root(tmp_path: Path) -> Path:
 
     # 4. Raw-scan channel — no metadata. Connector synthesises an
     # UNKNOWN doc per binary file.
-    _write(day / "shared_drive" / "scan_20260101-1015.pdf.b64", "JVBERi0xLjMK")
+    _write(day / "shared_drive" / "scan_20260101-1015.pdf", b"%PDF-1.4 stub")
 
     return root
 
@@ -144,9 +147,13 @@ def test_meta_pair_channels_read_meta_only_with_evidence_hint(v2_root: Path):
         )
         d = rows[0]
         assert d.get("evidence_file"), f"{chan} doc missing evidence_file hint"
-        # The .pdf.b64 itself must NOT be parsed as JSON; the only JSON
-        # we read is the _meta.json. Validate the read succeeded by
-        # checking a known field landed.
+        assert d["evidence_file"].endswith(".pdf"), (
+            f"{chan} evidence hint should point at the raw .pdf, "
+            f"got {d['evidence_file']!r}"
+        )
+        # The .pdf binary itself must NOT be parsed as JSON; the only
+        # JSON we read is the _meta.json. Validate the read succeeded
+        # by checking a known field landed.
         assert d.get("extracted_fields", {}).get("k") == "v"
 
 
@@ -160,7 +167,7 @@ def test_shared_drive_synthesizes_unclassified_doc(v2_root: Path):
     assert s["requires_classification"] is True
     assert s["status"] == "pending_classification"
     assert s["received_at"].startswith("2026-01-01T")
-    assert s["evidence_file"].endswith(".pdf.b64")
+    assert s["evidence_file"].endswith(".pdf")
 
 
 def test_v1_legacy_layout_falls_back_to_recursive_scan(tmp_path: Path):
@@ -196,23 +203,23 @@ def test_watermark_filter_excludes_pre_window_docs(v2_root: Path):
     assert all(r > "2026-01-01T12:00:00Z" for r in received), received
 
 
-def test_sibling_pdf_b64_files_are_ignored_by_dispatch(v2_root: Path):
-    """``edms_pull/`` and ``los_encompass/`` may carry sibling
-    ``.pdf.b64`` evidence files alongside the JSON record (added by
+def test_sibling_pdf_files_are_ignored_by_dispatch(v2_root: Path):
+    """``edms_pull/`` and ``los_encompass/`` may carry sibling raw
+    ``.pdf`` evidence files alongside the JSON record (added by
     ``generate_realworld_simulation.py`` for format-aware doc types).
     The connector must read only the JSON and skip the binaries —
     otherwise the count would double when the renderer runs."""
     edms_dir = v2_root / "2026-01-01" / "edms_pull"
-    # Drop a sibling .pdf.b64 next to the existing JSON record.
-    fake_pdf = edms_dir / "EDMS-W2-001.pdf.b64"
-    fake_pdf.write_text("JVBERi0xLjQK", encoding="ascii")
+    # Drop a sibling .pdf next to the existing JSON record.
+    fake_pdf = edms_dir / "EDMS-W2-001.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4 stub")
 
     c = S3EDMSConnector(str(v2_root), _StubPG())
     docs = asyncio.run(c.pull_documents_since("1970-01-01T00:00:00Z"))
     edms_docs = [d for d in docs if d.get("source_channel") == "edms_pull"]
-    # Still exactly 1 doc — the sibling .pdf.b64 must NOT have been
-    # parsed as a JSON record.
+    # Still exactly 1 doc — the sibling .pdf must NOT have been parsed
+    # as a JSON record.
     assert len(edms_docs) == 1, (
-        f"sibling .pdf.b64 leaked into the pull (found {len(edms_docs)} edms docs)"
+        f"sibling .pdf leaked into the pull (found {len(edms_docs)} edms docs)"
     )
     assert edms_docs[0]["document_id"] == "EDMS-W2-001"

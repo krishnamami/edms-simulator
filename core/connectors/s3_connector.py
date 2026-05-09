@@ -6,14 +6,18 @@ to feed the incremental graph builder. Two layouts are supported:
 **v2 (channel-segmented)** — the production layout::
 
     s3://bucket/prefix/2026-01-01/
-        edms_pull/             ← individual .json (one doc each)
-        los_encompass/         ← batch .json (a JSON array of docs)
-        email_inbox/           ← {name}.pdf.b64 + {name}_meta.json pairs
-        borrower_portal/       ← {name}.{pdf,jpg}.b64 + {name}_meta.json pairs
+        edms_pull/             ← individual .json (one doc each;
+                                 plus sibling .pdf for format-renderable
+                                 doc types)
+        los_encompass/         ← batch .json (a JSON array of docs;
+                                 plus sibling .pdf per format-renderable
+                                 batch entry)
+        email_inbox/           ← {name}.pdf + {name}_meta.json pairs
+        borrower_portal/       ← {name}.pdf + {name}_meta.json pairs
         vendor_equifax/        ← individual .json
         vendor_corelogic/      ← individual .json
-        vendor_title/          ← .pdf.b64 + _meta.json pairs
-        shared_drive/          ← raw .pdf.b64 only (NO metadata)
+        vendor_title/          ← {name}.pdf + {name}_meta.json pairs
+        shared_drive/          ← raw .pdf only (NO metadata)
         ai_chat/               ← individual .json
 
 **v1 (legacy flat)** — kept for backwards compat with older buckets::
@@ -73,8 +77,7 @@ _KNOWN_CHANNELS = (
 )
 # Suffixes the meta-pair + raw-scan handlers treat as "evidence files"
 # (the actual document binary, separate from the JSON metadata).
-_EVIDENCE_SUFFIXES = (".pdf.b64", ".jpg.b64", ".jpeg.b64", ".png.b64",
-                      ".pdf", ".jpg", ".jpeg", ".png")
+_EVIDENCE_SUFFIXES = (".pdf", ".jpg", ".jpeg", ".png")
 
 
 def _parse_iso(value: str) -> datetime:
@@ -562,8 +565,9 @@ class S3EDMSConnector(BaseEDMSConnector):
                 if not payload.get("evidence_file"):
                     base = str(f)[:-len("_meta.json")]
                     # Convention from generate_realworld_simulation.py:
-                    # email/title use .pdf.b64; portal may use .jpg.b64.
-                    payload["evidence_file"] = base + ".pdf.b64"
+                    # every meta-pair channel writes a sibling raw
+                    # ``.pdf`` so it can be downloaded + opened directly.
+                    payload["evidence_file"] = base + ".pdf"
                 yield payload, f
             return
 

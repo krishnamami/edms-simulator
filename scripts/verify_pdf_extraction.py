@@ -27,7 +27,6 @@ tuple so re-runs hit the same files."""
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import sys
@@ -42,9 +41,9 @@ DEFAULT_ROOT = Path("local_storage/s3_simulation_v2")
 
 
 def _doc_id_from_filename(name: str) -> str:
-    """``EDMS-2026-LOAN-101-W2_CURRENT-D02-09.pdf.b64`` →
+    """``EDMS-2026-LOAN-101-W2_CURRENT-D02-09.pdf`` →
     ``EDMS-2026-LOAN-101-W2_CURRENT-D02-09``."""
-    return name[: -len(".pdf.b64")] if name.endswith(".pdf.b64") else name
+    return name[: -len(".pdf")] if name.endswith(".pdf") else name
 
 
 def _ground_truth_for(pdf_path: Path) -> dict | None:
@@ -65,9 +64,9 @@ def _ground_truth_for(pdf_path: Path) -> dict | None:
 
     if channel in ("email_inbox", "borrower_portal", "vendor_title"):
         # Strip the convention suffix used by the generator
-        # (..._email.pdf.b64 / ..._upload.pdf.b64 / ..._title.pdf.b64).
+        # (..._email.pdf / ..._upload.pdf / ..._title.pdf).
         for suffix in ("_email", "_upload", "_title"):
-            base = pdf_path.name[: -len(".pdf.b64")]
+            base = pdf_path.name[: -len(".pdf")]
             if base.endswith(suffix):
                 meta = parent / (base[: -len(suffix)] + suffix + "_meta.json")
                 if meta.exists():
@@ -76,8 +75,8 @@ def _ground_truth_for(pdf_path: Path) -> dict | None:
         return None
 
     if channel == "los_encompass":
-        # Doc id encoded in the .pdf.b64 filename; find the matching
-        # entry inside the only batch.json sibling at that path's day.
+        # Doc id encoded in the .pdf filename; find the matching entry
+        # inside the only batch.json sibling at that path's day.
         target_id = _doc_id_from_filename(pdf_path.name)
         for batch in parent.glob("*.json"):
             with batch.open() as f:
@@ -90,7 +89,7 @@ def _ground_truth_for(pdf_path: Path) -> dict | None:
         return None
 
     # Default: edms_pull / vendor_equifax / vendor_corelogic / ai_chat
-    sibling_json = parent / (pdf_path.name[: -len(".pdf.b64")] + ".json")
+    sibling_json = parent / (pdf_path.name[: -len(".pdf")] + ".json")
     if sibling_json.exists():
         with sibling_json.open() as f:
             d = json.load(f)
@@ -100,7 +99,7 @@ def _ground_truth_for(pdf_path: Path) -> dict | None:
 
 def _doc_type_and_los_for(pdf_path: Path) -> tuple[str, str]:
     """Recover ``(doc_type, los_id)`` from the file name. The generator
-    encodes both: ``EDMS-2026-LOAN-101-W2_CURRENT-D02-09.pdf.b64``."""
+    encodes both: ``EDMS-2026-LOAN-101-W2_CURRENT-D02-09.pdf``."""
     name = _doc_id_from_filename(pdf_path.name)
     # Trim per-channel suffix
     for suffix in ("_email", "_upload", "_title"):
@@ -124,7 +123,7 @@ def pick_samples(root: Path, max_pdfs: int) -> list[Path]:
     pick the same files. Limits the total to ``max_pdfs``."""
     seen: set[tuple[str, str | None]] = set()
     out: list[Path] = []
-    for pdf in sorted(root.rglob("*.pdf.b64")):
+    for pdf in sorted(root.rglob("*.pdf")):
         if pdf.parent.name == "shared_drive":
             continue
         doc_type, los_id = _doc_type_and_los_for(pdf)
@@ -191,7 +190,7 @@ def main():
     ap.add_argument("--max-pdfs", type=int, default=8,
                     help="cap the number of API calls (cost guard)")
     ap.add_argument("--paths",    nargs="*",
-                    help="explicit list of pdf.b64 paths to test "
+                    help="explicit list of .pdf paths to test "
                          "(overrides automatic sampling)")
     args = ap.parse_args()
 
@@ -236,7 +235,7 @@ def main():
             print(f"{doc_type:<24}{fmt:<14}-      no ground-truth — skipping")
             continue
 
-        pdf_bytes = base64.b64decode(pdf_path.read_text())
+        pdf_bytes = pdf_path.read_bytes()
         extracted, conf = extract_with_claude_sync(pdf_bytes, doc_type)
 
         matches, total, _misses = _accuracy_row(gt, extracted)

@@ -6,14 +6,18 @@ per source-system pattern)::
 
     local_storage/s3_simulation_v2/
         2026-01-01/
-            edms_pull/             ← {document_id}.json (one doc each)
-            email_inbox/           ← {name}.pdf.b64 + {name}_meta.json pairs
-            borrower_portal/       ← {name}.{pdf,jpg}.b64 + {name}_meta.json
-            los_encompass/         ← {los_id}_batch_{date}.json (JSON array)
+            edms_pull/             ← {document_id}.json (one doc each;
+                                     plus sibling {id}.pdf for format-
+                                     renderable doc types)
+            email_inbox/           ← {name}.pdf + {name}_meta.json pairs
+            borrower_portal/       ← {name}.pdf + {name}_meta.json
+            los_encompass/         ← {los_id}_batch_{date}.json (JSON array;
+                                     plus sibling {doc_id}.pdf for
+                                     format-renderable batch entries)
             vendor_equifax/        ← {type}_{los_id}_{date}.json
             vendor_corelogic/      ← {type}_{los_id}_{date}.json
-            vendor_title/          ← {name}.pdf.b64 + {name}_meta.json
-            shared_drive/          ← scan_{ts}.pdf.b64 (NO metadata)
+            vendor_title/          ← {name}.pdf + {name}_meta.json
+            shared_drive/          ← scan_{ts}.pdf (NO metadata)
             ai_chat/               ← chat_{los_id}_{date}.json
         2026-01-02/
             ...
@@ -21,7 +25,7 @@ per source-system pattern)::
 Documents intentionally vary in shape:
 
 - ``edms_pull/`` — structured JSON only (FileNet/EDMS connector pull)
-- ``email_inbox/`` — base64-encoded PDF + meta JSON pair
+- ``email_inbox/`` — raw PDF + meta JSON pair
 - ``borrower_portal/`` — same pair shape but with ``uploaded_by`` field
 - ``los_encompass/`` — batched JSON array (multiple docs in one file)
 - ``vendor_equifax/`` / ``vendor_corelogic/`` — single JSON per call
@@ -42,7 +46,6 @@ CLI:
 from __future__ import annotations
 
 import argparse
-import base64
 import io
 import json
 import os
@@ -800,18 +803,18 @@ def _extracted_fields(
 
 
 # ===========================================================================
-# PDF + base64 helpers — dispatch through ``pdf_formats`` so each loan
-# gets a format-appropriate layout (ADP / Paychex / Gusto W-2, Chase /
-# Wells / BOA bank statements, etc.). Multi-page docs fan out within
-# the renderer; the meta.json and the rendered PDF stay in lockstep.
+# PDF helpers — dispatch through ``pdf_formats`` so each loan gets a
+# format-appropriate layout (ADP / Paychex / Gusto W-2, Chase / Wells /
+# BOA bank statements, etc.). PDFs are written as raw binary ``.pdf``
+# files so they can be downloaded from S3 and opened directly. The
+# meta.json and the rendered PDF stay in lockstep on field values.
 # ===========================================================================
 
 
-def _pdf_b64(
+def _pdf_bytes(
     doc_type: str, fields: dict, los_id: str, role: str = "primary",
-) -> str:
-    pdf_bytes = pdf_formats.make_pdf(doc_type, fields, los_id, role)
-    return base64.b64encode(pdf_bytes).decode("ascii")
+) -> bytes:
+    return pdf_formats.make_pdf(doc_type, fields, los_id, role)
 
 
 # ===========================================================================
@@ -898,16 +901,16 @@ def _write_edms_pull(out, los_id, doc_type, role, day, hour, extras, start_date)
     written = 1
     # When a format-aware renderer exists for this doc type (W-2, paystub,
     # bank stmt, credit report, appraisal, title), also drop a sibling
-    # ``.pdf.b64`` so the rendered PDF is available for AI-Vision
-    # verification + visual review. The connector keys on ``.json`` and
-    # ignores the sibling, so this is purely additive — the JSON record
-    # remains the source of truth indexed by the connector.
+    # ``.pdf`` (raw binary, openable as-is) so the rendered PDF is
+    # available for AI-Vision verification + visual review. The
+    # connector keys on ``.json`` and ignores the sibling, so this is
+    # purely additive — the JSON record remains the source of truth
+    # indexed by the connector.
     fmt = pdf_formats.format_for(doc_type, los_id, role)
     if fmt is not None:
-        pdf_bytes = pdf_formats.make_pdf(doc_type, fields, los_id, role)
-        sibling = folder / f"{doc['document_id']}.pdf.b64"
-        sibling.write_text(
-            base64.b64encode(pdf_bytes).decode("ascii"), encoding="ascii",
+        sibling = folder / f"{doc['document_id']}.pdf"
+        sibling.write_bytes(
+            pdf_formats.make_pdf(doc_type, fields, los_id, role)
         )
         written += 1
     return written
@@ -918,9 +921,10 @@ def _write_email_inbox(out, los_id, doc_type, role, day, hour, extras, start_dat
     suffix = extras.get("doc_id_suffix", "")
     doc_id = _doc_id("email_inbox", los_id, doc_type, day, hour, suffix)
     fields = _extracted_fields(doc_type, los_id, role, day, extras)
-    pdf_b64 = _pdf_b64(doc_type, fields, los_id, role)
     base = f"{doc_id}_email"
-    (folder / f"{base}.pdf.b64").write_text(pdf_b64, encoding="ascii")
+    (folder / f"{base}.pdf").write_bytes(
+        _pdf_bytes(doc_type, fields, los_id, role)
+    )
     meta = {
         "document_id":         doc_id,
         "los_id":              los_id,
@@ -944,10 +948,15 @@ def _write_borrower_portal(out, los_id, doc_type, role, day, hour, extras, start
     folder = _channel_dir(out, day, "borrower_portal", start_date)
     doc_id = _doc_id("borrower_portal", los_id, doc_type, day, hour)
     fields = _extracted_fields(doc_type, los_id, role, day, extras)
-    fmt = extras.get("format", "pdf")
+    # ``original_filename`` records the borrower's purported source
+    # extension (.jpg for DL / passport, .pdf for everything else) —
+    # purely descriptive metadata. The on-disk evidence is always a real
+    # PDF so it can be opened directly when downloaded.
+    declared_ext = extras.get("format", "pdf")
     base = f"{doc_id}_upload"
-    pdf_b64 = _pdf_b64(doc_type, fields, los_id, role)
-    (folder / f"{base}.{fmt}.b64").write_text(pdf_b64, encoding="ascii")
+    (folder / f"{base}.pdf").write_bytes(
+        _pdf_bytes(doc_type, fields, los_id, role)
+    )
     p = LOAN_PROFILES[los_id]
     uploaded_by = (
         p.get("co_name", p["primary_name"]) if role == "co_borrower"
@@ -960,7 +969,7 @@ def _write_borrower_portal(out, los_id, doc_type, role, day, hour, extras, start
         "source_channel":    "borrower_portal",
         "uploaded_by":       uploaded_by,
         "received_at":       _received_at(start_date, day, hour),
-        "original_filename": f"{doc_type.lower()}.{fmt}",
+        "original_filename": f"{doc_type.lower()}.{declared_ext}",
         "document_type":     doc_type,
         "category":          _category_for(doc_type),
         "borrower_role":     role,
@@ -994,20 +1003,19 @@ def _write_los_encompass_batch(out, los_id, doc_types, role, day, hour, extras,
     written = 1
     # For each batch entry that has a format-aware renderer (CREDIT_REPORT
     # is the main one — Encompass batches it together with URLA + AUS
-    # findings), drop a sibling ``.pdf.b64`` named by document_id so the
+    # findings), drop a sibling ``.pdf`` named by document_id so the
     # rendered PDF is on disk for AI-Vision verification + visual review.
-    # Connector ignores .pdf.b64 (suffix mismatch on the json scan), so
+    # Connector ignores ``.pdf`` (suffix mismatch on the json scan), so
     # this stays additive.
     for d in docs:
         fmt = pdf_formats.format_for(d["document_type"], los_id, role)
         if fmt is None:
             continue
-        pdf_bytes = pdf_formats.make_pdf(
-            d["document_type"], d["extracted_fields"], los_id, role,
-        )
-        sibling = folder / f"{d['document_id']}.pdf.b64"
-        sibling.write_text(
-            base64.b64encode(pdf_bytes).decode("ascii"), encoding="ascii",
+        sibling = folder / f"{d['document_id']}.pdf"
+        sibling.write_bytes(
+            pdf_formats.make_pdf(
+                d["document_type"], d["extracted_fields"], los_id, role,
+            )
         )
         written += 1
     return written
@@ -1059,9 +1067,10 @@ def _write_vendor_title(out, los_id, doc_type, role, day, hour, extras, start_da
     folder = _channel_dir(out, day, "vendor_title", start_date)
     doc_id = _doc_id("vendor_title", los_id, doc_type, day, hour)
     fields = _extracted_fields(doc_type, los_id, role, day, extras)
-    pdf_b64 = _pdf_b64(doc_type, fields, los_id, role)
     base = f"{doc_id}_title"
-    (folder / f"{base}.pdf.b64").write_text(pdf_b64, encoding="ascii")
+    (folder / f"{base}.pdf").write_bytes(
+        _pdf_bytes(doc_type, fields, los_id, role)
+    )
     meta = {
         "document_id":         doc_id,
         "los_id":              los_id,
@@ -1085,12 +1094,14 @@ def _write_vendor_title(out, los_id, doc_type, role, day, hour, extras, start_da
 def _write_shared_drive(out, day, hour, scan_text, variant_idx, start_date):
     """Render a shared-drive scan with a real-world artifact (rotation /
     landscape / two-docs-per-page / faded photocopy) — variant_idx
-    cycles through the four artifact styles deterministically."""
+    cycles through the four artifact styles deterministically. Output
+    is a raw binary ``.pdf`` so it can be opened directly when
+    downloaded from S3."""
     folder = _channel_dir(out, day, "shared_drive", start_date)
     ts = (start_date + timedelta(days=day - 1)).strftime("%Y%m%d") + f"-{hour:02d}{15:02d}"
-    pdf_bytes = pdf_formats.make_shared_drive_scan(scan_text, variant_idx)
-    pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
-    (folder / f"scan_{ts}.pdf.b64").write_text(pdf_b64, encoding="ascii")
+    (folder / f"scan_{ts}.pdf").write_bytes(
+        pdf_formats.make_shared_drive_scan(scan_text, variant_idx)
+    )
     return 1
 
 
