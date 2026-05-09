@@ -266,7 +266,7 @@ async def deactivate_api_key(request: Request, api_key: str):
 
 
 @router.post(
-    "/admin/reset",
+    "/reset",
     summary="DESTRUCTIVE — wipe all loan data for a clean slate",
     description=(
         "TRUNCATEs every loan-data table (entity_states, snapshots, "
