@@ -52,7 +52,7 @@ schedule:
     # local dev keeps the filesystem path; the ECS task definition
     # injects ``S3_SIMULATION_SOURCE=s3://edms-simulator-loans/s3_simulation``
     # so prod walks the real bucket.
-    source: "${S3_SIMULATION_SOURCE:-local_storage/s3_simulation}"
+    source: "${S3_SIMULATION_SOURCE:-local_storage/s3_simulation_v2}"
 
   builder:
     max_docs_per_build: 500    # safety cap per build run (advisory; future use)

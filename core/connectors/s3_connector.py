@@ -1,21 +1,42 @@
 """S3 (or local-filesystem) EDMS connector.
 
-Walks date-folder layout::
+Walks a date-folder layout and yields one ``dict`` per document, ready
+to feed the incremental graph builder. Two layouts are supported:
+
+**v2 (channel-segmented)** — the production layout::
+
+    s3://bucket/prefix/2026-01-01/
+        edms_pull/             ← individual .json (one doc each)
+        los_encompass/         ← batch .json (a JSON array of docs)
+        email_inbox/           ← {name}.pdf.b64 + {name}_meta.json pairs
+        borrower_portal/       ← {name}.{pdf,jpg}.b64 + {name}_meta.json pairs
+        vendor_equifax/        ← individual .json
+        vendor_corelogic/      ← individual .json
+        vendor_title/          ← .pdf.b64 + _meta.json pairs
+        shared_drive/          ← raw .pdf.b64 only (NO metadata)
+        ai_chat/               ← individual .json
+
+**v1 (legacy flat)** — kept for backwards compat with older buckets::
 
     s3://bucket/prefix/2026-01-01/LOS-001/W2_CURRENT.json
-    s3://bucket/prefix/2026-01-02/LOS-001/PAYSTUB_CURRENT.json
-    ...
+                                  /LOS-001/PAYSTUB_CURRENT.json
+                                  /LOS-002/...
 
-Skip folders dated before the watermark; for in-window folders, read
-each ``.json`` and filter on ``received_at`` so an intraday build tick
-sees only the docs that arrived between two clock points.
+Detection is automatic per date-folder: if any immediate sub-folder name
+is in the known-channel set, the v2 dispatcher runs. Otherwise the
+legacy path does a recursive ``.json`` scan and treats each file as a
+single document — same behaviour the connector had before this change.
+
+Skip folders dated before the watermark; for in-window folders, filter
+each doc on ``received_at`` so an intraday build tick sees only the docs
+that arrived between two clock points.
 
 Two source modes:
 - **Local filesystem** — ``source`` is a path on disk. Used by the
   backtest harness + local development.
 - **S3** — ``source`` is ``s3://bucket/prefix``. Production path:
   the ECS task definition injects
-  ``S3_SIMULATION_SOURCE=s3://edms-simulator-loans/s3_simulation``
+  ``S3_SIMULATION_SOURCE=s3://edms-simulator-loans/s3_simulation_v2``
   via the YAML's ``${VAR:-default}`` indirection.
 """
 from __future__ import annotations
@@ -26,7 +47,7 @@ import logging
 import os
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from core.connectors.base_connector import BaseEDMSConnector
 
@@ -35,6 +56,25 @@ logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "s3_edms_connector"
 _WATERMARK_EPOCH = "1970-01-01T00:00:00+00:00"
+
+# Channel dispatch — keep these as constants so a v2 backwards-compat
+# extension only requires one edit.
+_INDIVIDUAL_JSON_CHANNELS = {
+    "edms_pull", "vendor_equifax", "vendor_corelogic", "ai_chat",
+}
+_BATCH_JSON_CHANNELS = {"los_encompass"}
+_META_PAIR_CHANNELS  = {"email_inbox", "borrower_portal", "vendor_title"}
+_RAW_SCAN_CHANNELS   = {"shared_drive"}
+_KNOWN_CHANNELS = (
+    _INDIVIDUAL_JSON_CHANNELS
+    | _BATCH_JSON_CHANNELS
+    | _META_PAIR_CHANNELS
+    | _RAW_SCAN_CHANNELS
+)
+# Suffixes the meta-pair + raw-scan handlers treat as "evidence files"
+# (the actual document binary, separate from the JSON metadata).
+_EVIDENCE_SUFFIXES = (".pdf.b64", ".jpg.b64", ".jpeg.b64", ".png.b64",
+                      ".pdf", ".jpg", ".jpeg", ".png")
 
 
 def _parse_iso(value: str) -> datetime:
@@ -156,7 +196,7 @@ class S3EDMSConnector(BaseEDMSConnector):
         watermark: str,
         until: Optional[str] = None,
     ) -> list[dict]:
-        """Walk every date folder >= watermark, read every .json file,
+        """Walk every date folder >= watermark, dispatch by channel,
         filter on ``received_at`` ∈ (watermark, until]. The actual
         listing + reads happen on a thread executor in S3 mode so the
         event loop doesn't stall during multi-second boto3 calls."""
@@ -194,6 +234,7 @@ class S3EDMSConnector(BaseEDMSConnector):
         filtered_pre   = 0
         filtered_post  = 0
         no_received_at = 0
+        by_channel: dict[str, int] = {}
 
         docs: list[dict] = []
         for folder_date, folder_path in self._iter_date_folders():
@@ -206,42 +247,37 @@ class S3EDMSConnector(BaseEDMSConnector):
 
             folder_files    = 0
             folder_accepted = 0
-            for file_path in self._iter_files(folder_path):
-                folder_files  += 1
-                total_files   += 1
-                try:
-                    doc = self._read_json(file_path)
-                except Exception as exc:
-                    read_failed += 1
-                    # Inline the path + error in the message so the
-                    # production stdlib formatter surfaces it in
-                    # CloudWatch (extra={} is dropped by the default
-                    # formatter).
-                    logger.warning(
-                        f"connector_doc_read_failed "
-                        f"path={file_path} "
-                        f"error_type={type(exc).__name__} "
-                        f"error={str(exc)[:300]}"
-                    )
-                    continue
+            for channel_name, channel_path in self._iter_channels(folder_path):
+                for doc, source_path in self._iter_channel_docs(
+                    channel_name, channel_path, folder_date,
+                ):
+                    folder_files += 1
+                    total_files  += 1
+                    if doc is None:
+                        # Reader already logged; bump counter and move on.
+                        read_failed += 1
+                        continue
 
-                received_str = doc.get("received_at")
-                if not received_str:
-                    no_received_at += 1
-                    continue
-                try:
-                    received_dt = _parse_iso(received_str)
-                except Exception:
-                    no_received_at += 1
-                    continue
-                if received_dt <= wm:
-                    filtered_pre += 1
-                    continue
-                if upper is not None and received_dt > upper:
-                    filtered_post += 1
-                    continue
-                docs.append(doc)
-                folder_accepted += 1
+                    received_str = doc.get("received_at")
+                    if not received_str:
+                        no_received_at += 1
+                        continue
+                    try:
+                        received_dt = _parse_iso(received_str)
+                    except Exception:
+                        no_received_at += 1
+                        continue
+                    if received_dt <= wm:
+                        filtered_pre += 1
+                        continue
+                    if upper is not None and received_dt > upper:
+                        filtered_post += 1
+                        continue
+                    docs.append(doc)
+                    folder_accepted += 1
+                    by_channel[channel_name] = (
+                        by_channel.get(channel_name, 0) + 1
+                    )
 
             logger.info(
                 f"connector_folder_scanned date={folder_date.isoformat()} "
@@ -250,10 +286,10 @@ class S3EDMSConnector(BaseEDMSConnector):
             )
 
         docs.sort(key=lambda d: (d.get("received_at"), d.get("document_id")))
-        # Embed the funnel stats directly in the message string so the
-        # default stdlib formatter (used in the production container)
-        # surfaces them in CloudWatch — ``extra={}`` keys are dropped
-        # by the default formatter and won't show up in log output.
+        # Inline funnel + by_channel stats so the production stdlib
+        # formatter surfaces them in CloudWatch — ``extra={}`` is dropped
+        # by the default formatter and won't show up there.
+        chan_str = ",".join(f"{k}={v}" for k, v in sorted(by_channel.items())) or "-"
         logger.info(
             "connector_pull_complete "
             f"folders_total={folder_count} folders_in_win={in_window} "
@@ -261,6 +297,7 @@ class S3EDMSConnector(BaseEDMSConnector):
             f"no_received_at={no_received_at} "
             f"filtered_pre_wm={filtered_pre} filtered_post={filtered_post} "
             f"accepted={len(docs)} "
+            f"by_channel={chan_str} "
             f"bucket={getattr(self, '_bucket', None)} "
             f"prefix={getattr(self, '_prefix', None)} "
             f"watermark={wm.isoformat()}"
@@ -268,8 +305,7 @@ class S3EDMSConnector(BaseEDMSConnector):
         return docs
 
     # ------------------------------------------------------------------
-    # Iterators — S3 helpers RAISE on errors (vs swallowing) so the
-    # outer build records a failed run rather than silently zero docs.
+    # Date-folder + channel iteration
     # ------------------------------------------------------------------
 
     def _iter_date_folders(self) -> Iterable[tuple[date, Any]]:
@@ -335,37 +371,226 @@ class S3EDMSConnector(BaseEDMSConnector):
             f"common_prefixes={common_prefix_count} date_folders={len(seen)}"
         )
 
-    def _iter_files(self, folder_path: Any) -> Iterable[Any]:
-        """In local mode yields ``Path``; in S3 mode yields S3 keys.
-        ``_read_json`` knows how to read both."""
+    def _iter_channels(self, folder_path: Any) -> Iterable[tuple[str, Any]]:
+        """Yield ``(channel_name, channel_path)`` pairs for each known
+        channel sub-folder within a date folder.
+
+        If no known-channel sub-folder is found the date folder is
+        treated as v1 legacy: a single ``("legacy", folder_path)`` pair
+        is yielded so the dispatcher can recursively scan ``.json``
+        files (the original behaviour pre-channel-dispatch)."""
         if self.is_local:
-            for root, _dirs, files in os.walk(folder_path):
-                for fn in files:
-                    if fn.endswith(".json"):
+            sub_dirs = [
+                c for c in sorted(Path(folder_path).iterdir()) if c.is_dir()
+            ]
+            known = [c for c in sub_dirs if c.name in _KNOWN_CHANNELS]
+            if known:
+                for c in known:
+                    yield c.name, c
+            else:
+                yield "legacy", folder_path
+            return
+
+        # S3 mode: list common prefixes under the date folder.
+        s3 = self._s3()
+        prefix = str(folder_path)
+        if not prefix.endswith("/"):
+            prefix += "/"
+        try:
+            result = s3.list_objects_v2(
+                Bucket=self._bucket, Prefix=prefix, Delimiter="/",
+            )
+        except Exception:
+            raise
+
+        sub_prefixes = [
+            cp.get("Prefix", "") for cp in (result.get("CommonPrefixes") or [])
+        ]
+        known: list[tuple[str, str]] = []
+        for sp in sub_prefixes:
+            name = sp.rstrip("/").rsplit("/", 1)[-1]
+            if name in _KNOWN_CHANNELS:
+                known.append((name, sp))
+        if known:
+            for chan, p in known:
+                yield chan, p
+        else:
+            # No channel sub-folders — fall back to legacy recursive
+            # scan rooted at the date folder itself.
+            yield "legacy", folder_path
+
+    def _iter_channel_docs(
+        self,
+        channel_name: str,
+        channel_path: Any,
+        folder_date: date,
+    ) -> Iterator[tuple[Optional[dict], Any]]:
+        """Channel-format-aware reader. Yields ``(doc | None, src_path)``;
+        ``None`` signals a read/parse failure (caller bumps the counter).
+
+        Every yielded doc is tagged with ``source_channel`` so downstream
+        consumers can distinguish, e.g., an Encompass batch from an EDMS
+        pull even when both produced the same ``document_type``."""
+        if (channel_name in _INDIVIDUAL_JSON_CHANNELS
+                or channel_name == "legacy"):
+            for f in self._iter_files_with_suffix(channel_path, ".json"):
+                # Legacy may be the meta side of a v2 pair if a layout is
+                # mixed by accident — skip those so we don't double-read.
+                fname = self._basename(f)
+                if channel_name == "legacy" and fname.endswith("_meta.json"):
+                    continue
+                payload = self._safe_read_json(f)
+                if payload is None:
+                    yield None, f
+                    continue
+                if isinstance(payload, dict):
+                    payload["source_channel"] = (
+                        payload.get("source_channel") or channel_name
+                    )
+                    yield payload, f
+                elif isinstance(payload, list):
+                    # Defensive: someone dropped a batch into an
+                    # individual-JSON channel. Explode it rather than
+                    # silently dropping — log a debug note.
+                    logger.debug(
+                        "connector_unexpected_array",
+                        extra={"path": str(f), "channel": channel_name,
+                               "count": len(payload)},
+                    )
+                    for item in payload:
+                        if isinstance(item, dict):
+                            item["source_channel"] = (
+                                item.get("source_channel") or channel_name
+                            )
+                            yield item, f
+                else:
+                    yield None, f
+            return
+
+        if channel_name in _BATCH_JSON_CHANNELS:
+            for f in self._iter_files_with_suffix(channel_path, ".json"):
+                payload = self._safe_read_json(f)
+                if payload is None:
+                    yield None, f
+                    continue
+                if isinstance(payload, list):
+                    for item in payload:
+                        if isinstance(item, dict):
+                            item["source_channel"] = (
+                                item.get("source_channel") or channel_name
+                            )
+                            yield item, f
+                elif isinstance(payload, dict):
+                    # Single-doc batch file — still valid.
+                    payload["source_channel"] = (
+                        payload.get("source_channel") or channel_name
+                    )
+                    yield payload, f
+                else:
+                    yield None, f
+            return
+
+        if channel_name in _META_PAIR_CHANNELS:
+            for f in self._iter_files_with_suffix(channel_path, "_meta.json"):
+                payload = self._safe_read_json(f)
+                if payload is None:
+                    yield None, f
+                    continue
+                if not isinstance(payload, dict):
+                    yield None, f
+                    continue
+                payload["source_channel"] = (
+                    payload.get("source_channel") or channel_name
+                )
+                # Attach a hint to the sibling evidence binary so a future
+                # AI-vision step can fetch it. We don't probe S3 — just
+                # build the conventional path (the generator strips the
+                # _meta.json suffix and appends the binary extension).
+                if not payload.get("evidence_file"):
+                    base = str(f)[:-len("_meta.json")]
+                    # Convention from generate_realworld_simulation.py:
+                    # email/title use .pdf.b64; portal may use .jpg.b64.
+                    payload["evidence_file"] = base + ".pdf.b64"
+                yield payload, f
+            return
+
+        if channel_name in _RAW_SCAN_CHANNELS:
+            for f in self._iter_evidence_files(channel_path):
+                yield self._synthesize_unclassified_doc(
+                    f, folder_date, channel_name,
+                ), f
+            return
+
+        # Unknown channel — log + skip rather than fail loudly.
+        logger.debug(
+            "connector_unknown_channel",
+            extra={"channel": channel_name, "path": str(channel_path)},
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # File listing helpers
+    # ------------------------------------------------------------------
+
+    def _iter_files_with_suffix(
+        self, channel_path: Any, suffix: str,
+    ) -> Iterable[Any]:
+        """Yield Paths/keys whose names end with ``suffix``."""
+        if self.is_local:
+            for root, _dirs, files in os.walk(channel_path):
+                for fn in sorted(files):
+                    if fn.endswith(suffix):
                         yield Path(root) / fn
             return
 
         s3 = self._s3()
         paginator = s3.get_paginator("list_objects_v2")
-        prefix = str(folder_path)
-        keys_yielded = 0
+        prefix = str(channel_path)
+        if not prefix.endswith("/"):
+            prefix += "/"
         for page in paginator.paginate(
             Bucket=self._bucket, Prefix=prefix,
         ):
             for obj in page.get("Contents") or []:
                 key = obj.get("Key", "")
-                if key.endswith(".json"):
-                    keys_yielded += 1
+                if key.endswith(suffix):
                     yield key
-        logger.debug(
-            "s3_list_files_complete",
-            extra={"bucket": self._bucket, "prefix": prefix,
-                   "json_keys": keys_yielded},
-        )
 
-    def _read_json(self, path: Any) -> dict:
+    def _iter_evidence_files(self, channel_path: Any) -> Iterable[Any]:
+        """Yield raw-scan file paths/keys for the shared_drive channel.
+        Tries every known evidence suffix so a future generator that
+        switches PDFs to PNGs / JPGs Just Works."""
+        seen: set[str] = set()
+        for ext in _EVIDENCE_SUFFIXES:
+            for f in self._iter_files_with_suffix(channel_path, ext):
+                key = str(f)
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield f
+
+    @staticmethod
+    def _basename(path: Any) -> str:
+        s = str(path)
+        return s.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+    def _safe_read_json(self, path: Any) -> Any:
+        """Wrap ``_read_json`` with the standard error-surfacing path so
+        every channel handler routes failures the same way."""
+        try:
+            return self._read_json(path)
+        except Exception as exc:
+            logger.warning(
+                f"connector_doc_read_failed "
+                f"path={path} "
+                f"error_type={type(exc).__name__} "
+                f"error={str(exc)[:300]}"
+            )
+            return None
+
+    def _read_json(self, path: Any) -> Any:
         """``path`` is a ``Path`` in local mode and an S3 key string in
-        S3 mode. Returns the parsed doc dict."""
+        S3 mode. Returns the parsed payload (dict or list)."""
         if self.is_local:
             with Path(path).open("r", encoding="utf-8") as f:
                 return json.load(f)
@@ -373,3 +598,32 @@ class S3EDMSConnector(BaseEDMSConnector):
         obj = s3.get_object(Bucket=self._bucket, Key=str(path))
         body = obj["Body"].read()
         return json.loads(body.decode("utf-8"))
+
+    # ------------------------------------------------------------------
+    # Synthesised records for raw scans
+    # ------------------------------------------------------------------
+
+    def _synthesize_unclassified_doc(
+        self, evidence_path: Any, folder_date: date, channel_name: str,
+    ) -> dict:
+        """Build a minimal doc dict for a shared-drive scan that arrived
+        without metadata. The downstream builder will see
+        ``los_id="UNCLASSIFIED"``, fail to resolve to an applicant, and
+        skip persistence — but the file is still surfaced in the funnel
+        stats so an operator can chase it down."""
+        fname = self._basename(evidence_path)
+        # Use a deterministic doc_id so re-pulls don't manufacture new
+        # rows on every tick.
+        return {
+            "document_id":           f"SCAN-{fname}-{folder_date.isoformat()}",
+            "document_type":         "UNKNOWN",
+            "category":              "unknown",
+            "los_id":                "UNCLASSIFIED",
+            "source_system":         "SHARED_DRIVE",
+            "source_channel":        channel_name,
+            "received_at":           f"{folder_date.isoformat()}T12:00:00Z",
+            "extracted_fields":      {},
+            "requires_classification": True,
+            "evidence_file":         str(evidence_path),
+            "status":                "pending_classification",
+        }

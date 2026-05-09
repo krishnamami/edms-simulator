@@ -139,6 +139,52 @@ class IncrementalGraphBuilder:
             )
             return stats
 
+        # ── Step 2.5: resolve los_id → applicant_id ──────────────────
+        # The v2 connector emits docs that carry only ``los_id`` (the
+        # generators don't know which APL-XXXXX-P the API minted). Look
+        # up each unique los_id once and stamp applicant_id +
+        # application_id onto every doc that lacks them. Docs whose
+        # los_id can't be resolved get skipped further down because
+        # the persist loop refuses any doc without applicant_id. The
+        # ``UNCLASSIFIED`` los_id (synthesised by shared_drive scans)
+        # also ends up here and is skipped — exactly what we want.
+        los_cache: dict[str, Optional[dict]] = {}
+        for doc in new_docs:
+            if doc.get("applicant_id"):
+                continue
+            los_id = doc.get("los_id")
+            if not los_id:
+                continue
+            if los_id not in los_cache:
+                try:
+                    los_cache[los_id] = await self.pg.get_application_by_los_id(
+                        los_id, tenant_id=tenant_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "los_id_lookup_failed",
+                        extra={"los_id": los_id, "error": str(exc)[:200]},
+                    )
+                    los_cache[los_id] = None
+            app = los_cache[los_id]
+            if app:
+                # The role tells us which applicant_id maps in: primary →
+                # applicant_id; co_borrower → co_applicant_id (with
+                # primary fallback when no co_applicant exists).
+                role = doc.get("borrower_role", "primary")
+                if role == "co_borrower" and app.get("co_applicant_id"):
+                    doc["applicant_id"] = app["co_applicant_id"]
+                else:
+                    doc["applicant_id"] = app["applicant_id"]
+                doc["application_id"] = app["application_id"]
+            else:
+                logger.warning(
+                    "unknown_los_id",
+                    extra={"los_id": los_id,
+                           "doc_id": doc.get("document_id"),
+                           "channel": doc.get("source_channel")},
+                )
+
         # ── Step 3: persist docs ─────────────────────────────────────
         wm_to = wm_from
         affected: dict[str, dict] = {}     # applicant_id → first-doc
