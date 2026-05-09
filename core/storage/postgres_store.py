@@ -286,6 +286,55 @@ class PostgresStore:
             "status":          "active",
         }, tenant_id=tenant_id)
 
+        # v4: stamp the URLA / event's stated values onto applications
+        # so /context can show "stated $125k vs verified $123k". The
+        # builder fills verified_* later as docs flow in.
+        b = event.get("borrower", {})
+        co = event.get("co_borrower") or {}
+        prop = event.get("property", {})
+        try:
+            primary_inc = float(b.get("stated_income") or 0)
+        except (TypeError, ValueError):
+            primary_inc = 0.0
+        try:
+            co_inc = float(co.get("stated_income") or 0)
+        except (TypeError, ValueError):
+            co_inc = 0.0
+        await self.update_application_stated_fields(
+            application_id,
+            {
+                "stated_income":         (primary_inc + co_inc) or None,
+                "stated_property_value": prop.get("estimated_value")
+                                            or prop.get("purchase_price"),
+                "stated_assets":         b.get("stated_assets"),
+                "stated_employer":       b.get("stated_employer"),
+            },
+            tenant_id=tenant_id,
+        )
+
+        # Seed the initial entity_states row so /entity/{id}/state
+        # returns a body the moment the URLA lands — even before any
+        # post-application doc has been processed. Every JSONB section
+        # is empty, every flag is False, status is
+        # ``application_received``. The builder overwrites this row on
+        # the first build that pulls docs for this loan.
+        try:
+            await self.upsert_entity_state(
+                application_id,
+                {
+                    "los_id":     los_id,
+                    "legacy_ids": {**(event.get("legacy_ids") or {}),
+                                   "los_id": los_id},
+                    "status":     "application_received",
+                },
+                tenant_id=tenant_id,
+            )
+        except Exception:
+            # Don't let an entity_states-shaped quirk fail the
+            # application creation. The builder will recreate the row
+            # on its next tick.
+            pass
+
         return {
             "application_id":  application_id,
             "applicant_id":    applicant_id,
@@ -1035,14 +1084,16 @@ class PostgresStore:
         await db.execute(
             """
             INSERT INTO document_relationships (
-                relationship_id, applicant_id, source_doc_id, target_doc_id,
+                relationship_id, applicant_id, application_id,
+                source_doc_id, target_doc_id,
                 relationship_type, field_name, source_value, target_value,
                 delta_pct, confidence, reasoning, created_by, tenant_id
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb,$9,$10,$11,$12,$13)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10,$11,$12,$13,$14)
             ON CONFLICT (relationship_id) DO NOTHING
             """,
             rel["relationship_id"],
             rel["applicant_id"],
+            rel.get("application_id"),
             rel["source_doc_id"],
             rel["target_doc_id"],
             rel["relationship_type"],
@@ -2323,63 +2374,160 @@ class PostgresStore:
 
     async def upsert_entity_state(
         self,
-        entity_id: str,
-        entity_type: str,
         application_id: str,
-        state: dict,
-        document_count: int = 0,
-        graph_edge_count: int = 0,
-        conflict_count: int = 0,
-        completeness_pct: float = 0.0,
+        state_data: dict,
         tenant_id: str = "default",
-        legacy_ids: Optional[dict] = None,
     ) -> None:
-        # ``legacy_ids`` is JSONB-merged on conflict (existing || new), so
-        # caller can pass just the IDs that arrived this tick and the
-        # accumulator grows over time. Pass ``{}`` (default) to leave the
-        # existing value untouched.
+        """v4 upsert — one row per ``application_id`` carrying the full
+        verified golden record. ``state_data`` keys map 1:1 to the
+        entity_states columns; any column the caller doesn't set keeps
+        its prior value (or default). ``legacy_ids`` is JSONB-merged on
+        conflict so the accumulator grows over ticks; every other JSONB
+        column is a full replacement.
+
+        Required key: nothing strictly. The builder constructs the full
+        dict; tests can pass minimal fragments. Missing keys default
+        to NULL / {} / [] / 0 / FALSE per the schema.
+        """
+        s = state_data
         await db.execute(
             """
             INSERT INTO entity_states (
-                entity_id, entity_type, application_id, tenant_id,
-                state, document_count, graph_edge_count, conflict_count,
-                completeness_pct, legacy_ids, last_updated, created_at
+                application_id, tenant_id, los_id, legacy_ids,
+                borrower, co_borrowers, property, loan_terms, verifications,
+                mid_credit_score, qualifying_monthly,
+                co_borrower_qualifying_monthly, combined_monthly_income,
+                total_liquid_assets,
+                appraised_value, purchase_price,
+                loan_amount, interest_rate, ltv,
+                dti_front, dti_back, piti_monthly, monthly_obligations,
+                document_count, graph_edge_count, conflict_count,
+                critical_conflict_count, completeness_pct,
+                status, last_decision_by, last_decision_at, decision_trail,
+                income_verified, employment_verified, credit_pulled,
+                assets_verified, identity_complete, appraisal_complete,
+                title_clear, insurance_bound, aus_approved,
+                rate_locked, conditions_cleared, clear_to_close,
+                last_updated, created_at
             ) VALUES (
-                $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9,
-                $10::jsonb, NOW(), NOW()
+                $1, $2, $3, $4::jsonb,
+                $5::jsonb, $6::jsonb, $7::jsonb, $8::jsonb, $9::jsonb,
+                $10, $11, $12, $13, $14,
+                $15, $16, $17, $18, $19,
+                $20, $21, $22, $23,
+                $24, $25, $26, $27, $28,
+                $29, $30, $31, $32::jsonb,
+                $33, $34, $35, $36, $37, $38, $39, $40, $41,
+                $42, $43, $44,
+                NOW(), NOW()
             )
-            ON CONFLICT (entity_id) DO UPDATE SET
-                entity_type      = EXCLUDED.entity_type,
-                application_id   = EXCLUDED.application_id,
-                tenant_id        = EXCLUDED.tenant_id,
-                state            = EXCLUDED.state,
-                document_count   = EXCLUDED.document_count,
-                graph_edge_count = EXCLUDED.graph_edge_count,
-                conflict_count   = EXCLUDED.conflict_count,
-                completeness_pct = EXCLUDED.completeness_pct,
-                legacy_ids       = entity_states.legacy_ids
-                                     || EXCLUDED.legacy_ids,
-                last_updated     = NOW()
+            ON CONFLICT (application_id) DO UPDATE SET
+                tenant_id                       = EXCLUDED.tenant_id,
+                los_id                          = COALESCE(EXCLUDED.los_id,
+                                                            entity_states.los_id),
+                legacy_ids                      = entity_states.legacy_ids
+                                                    || EXCLUDED.legacy_ids,
+                borrower                        = EXCLUDED.borrower,
+                co_borrowers                    = EXCLUDED.co_borrowers,
+                property                        = EXCLUDED.property,
+                loan_terms                      = EXCLUDED.loan_terms,
+                verifications                   = EXCLUDED.verifications,
+                mid_credit_score                = EXCLUDED.mid_credit_score,
+                qualifying_monthly              = EXCLUDED.qualifying_monthly,
+                co_borrower_qualifying_monthly  = EXCLUDED.co_borrower_qualifying_monthly,
+                combined_monthly_income         = EXCLUDED.combined_monthly_income,
+                total_liquid_assets             = EXCLUDED.total_liquid_assets,
+                appraised_value                 = EXCLUDED.appraised_value,
+                purchase_price                  = EXCLUDED.purchase_price,
+                loan_amount                     = EXCLUDED.loan_amount,
+                interest_rate                   = EXCLUDED.interest_rate,
+                ltv                             = EXCLUDED.ltv,
+                dti_front                       = EXCLUDED.dti_front,
+                dti_back                        = EXCLUDED.dti_back,
+                piti_monthly                    = EXCLUDED.piti_monthly,
+                monthly_obligations             = EXCLUDED.monthly_obligations,
+                document_count                  = EXCLUDED.document_count,
+                graph_edge_count                = EXCLUDED.graph_edge_count,
+                conflict_count                  = EXCLUDED.conflict_count,
+                critical_conflict_count         = EXCLUDED.critical_conflict_count,
+                completeness_pct                = EXCLUDED.completeness_pct,
+                status                          = EXCLUDED.status,
+                last_decision_by                = COALESCE(EXCLUDED.last_decision_by,
+                                                            entity_states.last_decision_by),
+                last_decision_at                = COALESCE(EXCLUDED.last_decision_at,
+                                                            entity_states.last_decision_at),
+                decision_trail                  = EXCLUDED.decision_trail,
+                income_verified                 = EXCLUDED.income_verified,
+                employment_verified             = EXCLUDED.employment_verified,
+                credit_pulled                   = EXCLUDED.credit_pulled,
+                assets_verified                 = EXCLUDED.assets_verified,
+                identity_complete               = EXCLUDED.identity_complete,
+                appraisal_complete              = EXCLUDED.appraisal_complete,
+                title_clear                     = EXCLUDED.title_clear,
+                insurance_bound                 = EXCLUDED.insurance_bound,
+                aus_approved                    = EXCLUDED.aus_approved,
+                rate_locked                     = EXCLUDED.rate_locked,
+                conditions_cleared              = EXCLUDED.conditions_cleared,
+                clear_to_close                  = EXCLUDED.clear_to_close,
+                last_updated                    = NOW()
             """,
-            entity_id, entity_type, application_id, tenant_id,
-            _to_jsonb(state),
-            int(document_count), int(graph_edge_count),
-            int(conflict_count), float(completeness_pct),
-            _to_jsonb(legacy_ids or {}),
+            application_id, tenant_id,
+            s.get("los_id"),
+            _to_jsonb(s.get("legacy_ids") or {}),
+            _to_jsonb(s.get("borrower") or {}),
+            _to_jsonb(s.get("co_borrowers") or []),
+            _to_jsonb(s.get("property") or {}),
+            _to_jsonb(s.get("loan_terms") or {}),
+            _to_jsonb(s.get("verifications") or {}),
+            s.get("mid_credit_score"),
+            s.get("qualifying_monthly"),
+            s.get("co_borrower_qualifying_monthly"),
+            s.get("combined_monthly_income"),
+            s.get("total_liquid_assets"),
+            s.get("appraised_value"),
+            s.get("purchase_price"),
+            s.get("loan_amount"),
+            s.get("interest_rate"),
+            s.get("ltv"),
+            s.get("dti_front"),
+            s.get("dti_back"),
+            s.get("piti_monthly"),
+            s.get("monthly_obligations"),
+            int(s.get("document_count") or 0),
+            int(s.get("graph_edge_count") or 0),
+            int(s.get("conflict_count") or 0),
+            int(s.get("critical_conflict_count") or 0),
+            float(s.get("completeness_pct") or 0.0),
+            s.get("status") or "application_received",
+            s.get("last_decision_by"),
+            s.get("last_decision_at"),
+            _to_jsonb(s.get("decision_trail") or []),
+            bool(s.get("income_verified")),
+            bool(s.get("employment_verified")),
+            bool(s.get("credit_pulled")),
+            bool(s.get("assets_verified")),
+            bool(s.get("identity_complete")),
+            bool(s.get("appraisal_complete")),
+            bool(s.get("title_clear")),
+            bool(s.get("insurance_bound")),
+            bool(s.get("aus_approved")),
+            bool(s.get("rate_locked")),
+            bool(s.get("conditions_cleared")),
+            bool(s.get("clear_to_close")),
         )
 
     async def get_entity_state(
-        self, entity_id: str, tenant_id: str = "default",
+        self, application_id: str, tenant_id: str = "default",
     ) -> Optional[dict]:
+        """v4 — keyed by ``application_id``. Returns the full row with
+        every JSONB section + every indexed column + every flag."""
         row = await db.fetchrow(
             """
-            SELECT entity_id, entity_type, application_id, tenant_id,
-                   state, document_count, graph_edge_count, conflict_count,
-                   completeness_pct, legacy_ids, last_updated, created_at
+            SELECT *
               FROM entity_states
-             WHERE entity_id = $1 AND tenant_id = $2
+             WHERE application_id = $1 AND tenant_id = $2
             """,
-            entity_id, tenant_id,
+            application_id, tenant_id,
         )
         return _row_to_dict(row)
 
@@ -2428,34 +2576,59 @@ class PostgresStore:
         snapshot_date,
         tenant_id: str = "default",
     ) -> int:
-        """Copy every ``entity_states`` row for ``tenant_id`` into
-        ``entity_snapshots`` keyed on ``snapshot_date``. ``ON CONFLICT``
-        re-writes the row so re-running EOD is idempotent — last write
-        within the day wins. Returns the count of entities snapshotted."""
+        """v4 — copy every ``entity_states`` row for ``tenant_id`` into
+        ``entity_snapshots`` keyed on ``(snapshot_date,
+        application_id)``. ``ON CONFLICT`` re-writes so re-running EOD
+        is idempotent — last write within the day wins. Returns the
+        count of applications snapshotted."""
         val = await db.fetchval(
             """
             WITH inserted AS (
                 INSERT INTO entity_snapshots (
-                    snapshot_date, entity_id, entity_type, application_id,
-                    tenant_id, state, document_count, graph_edge_count,
-                    conflict_count, completeness_pct, snapshot_taken_at
+                    snapshot_date, application_id, tenant_id, los_id,
+                    legacy_ids, borrower, co_borrowers, property,
+                    loan_terms, verifications,
+                    mid_credit_score, qualifying_monthly,
+                    combined_monthly_income, ltv, dti_front, dti_back,
+                    document_count, completeness_pct, status,
+                    income_verified, credit_pulled, appraisal_complete,
+                    title_clear, clear_to_close, snapshot_taken_at
                 )
-                SELECT $1::date, entity_id, entity_type, application_id,
-                       tenant_id, state, document_count, graph_edge_count,
-                       conflict_count, completeness_pct, NOW()
+                SELECT $1::date, application_id, tenant_id, los_id,
+                       legacy_ids, borrower, co_borrowers, property,
+                       loan_terms, verifications,
+                       mid_credit_score, qualifying_monthly,
+                       combined_monthly_income, ltv, dti_front, dti_back,
+                       document_count, completeness_pct, status,
+                       income_verified, credit_pulled, appraisal_complete,
+                       title_clear, clear_to_close, NOW()
                   FROM entity_states
                  WHERE tenant_id = $2
-                ON CONFLICT (snapshot_date, entity_id) DO UPDATE SET
-                    entity_type      = EXCLUDED.entity_type,
-                    application_id   = EXCLUDED.application_id,
+                ON CONFLICT (snapshot_date, application_id) DO UPDATE SET
                     tenant_id        = EXCLUDED.tenant_id,
-                    state            = EXCLUDED.state,
+                    los_id           = EXCLUDED.los_id,
+                    legacy_ids       = EXCLUDED.legacy_ids,
+                    borrower         = EXCLUDED.borrower,
+                    co_borrowers     = EXCLUDED.co_borrowers,
+                    property         = EXCLUDED.property,
+                    loan_terms       = EXCLUDED.loan_terms,
+                    verifications    = EXCLUDED.verifications,
+                    mid_credit_score        = EXCLUDED.mid_credit_score,
+                    qualifying_monthly      = EXCLUDED.qualifying_monthly,
+                    combined_monthly_income = EXCLUDED.combined_monthly_income,
+                    ltv              = EXCLUDED.ltv,
+                    dti_front        = EXCLUDED.dti_front,
+                    dti_back         = EXCLUDED.dti_back,
                     document_count   = EXCLUDED.document_count,
-                    graph_edge_count = EXCLUDED.graph_edge_count,
-                    conflict_count   = EXCLUDED.conflict_count,
                     completeness_pct = EXCLUDED.completeness_pct,
-                    snapshot_taken_at = NOW()
-                RETURNING entity_id
+                    status           = EXCLUDED.status,
+                    income_verified     = EXCLUDED.income_verified,
+                    credit_pulled       = EXCLUDED.credit_pulled,
+                    appraisal_complete  = EXCLUDED.appraisal_complete,
+                    title_clear         = EXCLUDED.title_clear,
+                    clear_to_close      = EXCLUDED.clear_to_close,
+                    snapshot_taken_at   = NOW()
+                RETURNING application_id
             )
             SELECT COUNT(*) FROM inserted
             """,
@@ -2464,18 +2637,18 @@ class PostgresStore:
         return int(val or 0)
 
     async def get_entity_timeline(
-        self, entity_id: str, tenant_id: str = "default",
+        self, application_id: str, tenant_id: str = "default",
     ) -> list:
+        """v4 — keyed by ``application_id``. Returns every snapshot for
+        the loan in ``snapshot_date`` ascending order."""
         rows = await db.fetch(
             """
-            SELECT id, snapshot_date, entity_id, entity_type, application_id,
-                   tenant_id, state, document_count, graph_edge_count,
-                   conflict_count, completeness_pct, snapshot_taken_at
+            SELECT *
               FROM entity_snapshots
-             WHERE entity_id = $1 AND tenant_id = $2
+             WHERE application_id = $1 AND tenant_id = $2
              ORDER BY snapshot_date ASC
             """,
-            entity_id, tenant_id,
+            application_id, tenant_id,
         )
         return [_row_to_dict(r) for r in rows]
 
@@ -2573,6 +2746,220 @@ class PostgresStore:
             applicant_id, tenant_id,
         )
         return int(val or 0)
+
+    # ---------------- v4 application-scoped helpers ----------------
+    # The new entity_states is keyed by application_id, so the
+    # builder needs to fetch every doc + applicant + edge that belongs
+    # to a given loan (across primary + co-borrowers). These wrap the
+    # JOIN logic so callers don't have to.
+
+    async def get_documents_for_application(
+        self, application_id: str, tenant_id: str = "default",
+    ) -> list:
+        """Every document tied to an application, joined through
+        applicants so docs filed under either the primary or co-borrower
+        roll up to the same loan."""
+        rows = await db.fetch(
+            """
+            SELECT d.*
+              FROM document_index d
+             WHERE d.tenant_id = $2
+               AND (d.application_id = $1
+                    OR d.applicant_id IN (
+                        SELECT applicant_id FROM applications
+                         WHERE application_id = $1 AND tenant_id = $2
+                        UNION
+                        SELECT co_applicant_id FROM applications
+                         WHERE application_id = $1 AND tenant_id = $2
+                           AND co_applicant_id IS NOT NULL))
+               AND d.is_current = TRUE
+            """,
+            application_id, tenant_id,
+        )
+        return [_row_to_dict(r) for r in rows]
+
+    async def get_applicants_for_application(
+        self, application_id: str, tenant_id: str = "default",
+    ) -> list:
+        """Return every applicant tied to an application (primary +
+        co-borrower) as a list with a ``role`` field set to 'primary'
+        or 'co_borrower' so the builder can split them."""
+        app = await self.get_application(application_id, tenant_id=tenant_id)
+        if not app:
+            return []
+        out: list = []
+        primary_id = app.get("applicant_id")
+        co_id      = app.get("co_applicant_id")
+        if primary_id:
+            primary = await self.find_by_applicant_id(
+                primary_id, tenant_id=tenant_id,
+            )
+            if primary:
+                primary["role"] = "primary"
+                out.append(primary)
+        if co_id:
+            co = await self.find_by_applicant_id(co_id, tenant_id=tenant_id)
+            if co:
+                co["role"] = "co_borrower"
+                out.append(co)
+        return out
+
+    async def count_docs_for_application(
+        self, application_id: str, tenant_id: str = "default",
+    ) -> int:
+        val = await db.fetchval(
+            """
+            SELECT COUNT(*)
+              FROM document_index d
+             WHERE d.tenant_id = $2
+               AND (d.application_id = $1
+                    OR d.applicant_id IN (
+                        SELECT applicant_id FROM applications
+                         WHERE application_id = $1 AND tenant_id = $2
+                        UNION
+                        SELECT co_applicant_id FROM applications
+                         WHERE application_id = $1 AND tenant_id = $2
+                           AND co_applicant_id IS NOT NULL))
+               AND d.is_current = TRUE
+            """,
+            application_id, tenant_id,
+        )
+        return int(val or 0)
+
+    async def count_edges_for_application(
+        self, application_id: str, tenant_id: str = "default",
+    ) -> int:
+        val = await db.fetchval(
+            """
+            SELECT COUNT(*)
+              FROM document_relationships
+             WHERE application_id = $1 AND tenant_id = $2
+            """,
+            application_id, tenant_id,
+        )
+        return int(val or 0)
+
+    async def count_conflicts_for_application(
+        self, application_id: str, tenant_id: str = "default",
+        critical_only: bool = False,
+    ) -> int:
+        if critical_only:
+            sql = """
+                SELECT COUNT(*) FROM document_relationships
+                 WHERE application_id = $1 AND tenant_id = $2
+                   AND relationship_type = 'contradicts'
+                   AND COALESCE(delta_pct, 0) >= 5.0
+            """
+        else:
+            sql = """
+                SELECT COUNT(*) FROM document_relationships
+                 WHERE application_id = $1 AND tenant_id = $2
+                   AND relationship_type = 'contradicts'
+            """
+        val = await db.fetchval(sql, application_id, tenant_id)
+        return int(val or 0)
+
+    async def update_application_verified_fields(
+        self, application_id: str, fields: dict,
+        tenant_id: str = "default",
+    ) -> None:
+        """Patch the ``verified_*`` columns on the applications row.
+        Caller passes a dict with any subset of: ``verified_income``,
+        ``verified_property_value``, ``verified_assets``,
+        ``verified_employer``. Other keys are ignored."""
+        whitelist = (
+            "verified_income", "verified_property_value",
+            "verified_assets", "verified_employer",
+        )
+        sets = []
+        args: list = []
+        for i, k in enumerate(whitelist, start=3):
+            if k in fields:
+                sets.append(f"{k} = ${i}")
+                args.append(fields[k])
+        if not sets:
+            return
+        await db.execute(
+            f"""
+            UPDATE applications
+               SET {', '.join(sets)}
+             WHERE application_id = $1 AND tenant_id = $2
+            """,
+            application_id, tenant_id, *args,
+        )
+
+    async def update_application_stated_fields(
+        self, application_id: str, fields: dict,
+        tenant_id: str = "default",
+    ) -> None:
+        """Same shape as ``update_application_verified_fields`` but
+        for the stated_* columns — used by the connector's
+        loan_origination handler to record what the borrower /
+        URLA reported at submission time."""
+        whitelist = (
+            "stated_income", "stated_property_value",
+            "stated_assets", "stated_employer",
+        )
+        sets = []
+        args: list = []
+        for i, k in enumerate(whitelist, start=3):
+            if k in fields:
+                sets.append(f"{k} = ${i}")
+                args.append(fields[k])
+        if not sets:
+            return
+        await db.execute(
+            f"""
+            UPDATE applications
+               SET {', '.join(sets)}
+             WHERE application_id = $1 AND tenant_id = $2
+            """,
+            application_id, tenant_id, *args,
+        )
+
+    async def log_entity_state_event(
+        self,
+        application_id: str,
+        event_type: str,
+        field_path: Optional[str] = None,
+        old_value=None,
+        new_value=None,
+        triggered_by: Optional[str] = None,
+        document_id: Optional[str] = None,
+        tenant_id: str = "default",
+    ) -> None:
+        """Append an entity_state_events row. Used by the builder to
+        record meaningful state transitions (status flips, flag
+        changes, key-field updates) so /entity/{id}/events can replay
+        the diff over time without scanning snapshots."""
+        await db.execute(
+            """
+            INSERT INTO entity_state_events (
+                application_id, tenant_id, event_type, field_path,
+                old_value, new_value, triggered_by, document_id
+            ) VALUES (
+                $1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8
+            )
+            """,
+            application_id, tenant_id, event_type, field_path,
+            _to_jsonb(old_value), _to_jsonb(new_value),
+            triggered_by, document_id,
+        )
+
+    async def get_entity_state_events(
+        self, application_id: str, limit: int = 50,
+        tenant_id: str = "default",
+    ) -> list:
+        rows = await db.fetch(
+            """
+            SELECT * FROM entity_state_events
+             WHERE application_id = $1 AND tenant_id = $2
+             ORDER BY created_at DESC
+             LIMIT $3
+            """,
+            application_id, tenant_id, limit,
+        )
+        return [_row_to_dict(r) for r in rows]
 
     # ---------------- entity-state lookup helpers -----------------
     #

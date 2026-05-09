@@ -398,6 +398,41 @@ async def get_entity_state(request: Request, entity_id: str):
 
 
 @router.get(
+    "/entity/{application_id}/events",
+    dependencies=[Depends(verify_api_key)],
+    summary="Append-only state-change log for an application",
+    description=(
+        "Returns ``entity_state_events`` rows for this application in "
+        "reverse-chronological order. Each row records a meaningful "
+        "state transition (status flip, completed verification, doc-"
+        "driven field change) so a Decision-OS audit trail can replay "
+        "how the row evolved without diff-scanning snapshots."
+    ),
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        404: {"description": "No events recorded for this application."},
+    },
+)
+async def get_entity_events_endpoint(
+    request: Request, application_id: str, limit: int = 50,
+):
+    pg  = request.app.state.postgres_store
+    tid = get_tenant_id(request)
+    rows = await pg.get_entity_state_events(
+        application_id, limit=limit, tenant_id=tid,
+    )
+    if not rows:
+        raise HTTPException(
+            status_code=404, detail="No events for application",
+        )
+    return {
+        "application_id": application_id,
+        "events":         rows,
+        "count":          len(rows),
+    }
+
+
+@router.get(
     "/entity/{entity_id}/timeline",
     dependencies=[Depends(verify_api_key)],
     summary="EOD snapshot timeline for an entity",

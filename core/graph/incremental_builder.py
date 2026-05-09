@@ -54,6 +54,551 @@ def _slot_received(slot: dict, have: set[str]) -> bool:
     return any(alt in have for alt in (slot.get("alternates") or []))
 
 
+# ===========================================================================
+# v4 per-borrower fold helpers — turn a set of indexed doc rows into the
+# nested JSONB blocks ``entity_states`` carries. Each helper takes a list
+# of doc dicts (already PG-shape: ``document_type`` + ``extracted_fields``
+# + ``source_document_id`` + ``received_at``) and returns one dict.
+# ===========================================================================
+
+
+def _f(d: dict, *keys, default=None):
+    """Pull a field from ``d['extracted_fields']`` or top-level d, in
+    that order. Returns ``default`` if all keys miss."""
+    fields = d.get("extracted_fields") or {}
+    for k in keys:
+        if k in fields and fields[k] not in (None, ""):
+            return fields[k]
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return default
+
+
+def _doc(docs: list, doc_type: str, *alts) -> dict | None:
+    """Return the most recent doc whose ``document_type`` matches one
+    of the supplied types, or ``None``."""
+    types = {doc_type, *alts}
+    matches = [d for d in docs if d.get("document_type") in types]
+    if not matches:
+        return None
+    matches.sort(key=lambda x: x.get("received_at") or "", reverse=True)
+    return matches[0]
+
+
+def _all_docs(docs: list, *doc_types) -> list:
+    types = set(doc_types)
+    return [d for d in docs if d.get("document_type") in types]
+
+
+def _income_block(docs: list) -> dict:
+    w2  = _doc(docs, "W2_CURRENT", "W2_PRIOR")
+    ps  = _doc(docs, "PAYSTUB_CURRENT", "PAYSTUB_PRIOR", "PAYSTUB")
+    irs = _doc(docs, "IRS_TRANSCRIPT")
+    ssa = _doc(docs, "SSA_AWARD_LETTER")
+    pen = _doc(docs, "PENSION_LETTER")
+    sch_c = _doc(docs, "SCHEDULE_C")
+
+    annual = None
+    sources = []
+    src_doc_ids = []
+    if w2:
+        annual = float(_f(w2, "box1_wages") or 0) or annual
+        sources.append("W2_SALARIED")
+        src_doc_ids.append(w2.get("source_document_id"))
+    if sch_c:
+        sc_inc = float(_f(sch_c, "net_profit") or 0)
+        annual = (annual or 0) + sc_inc if sc_inc else annual
+        sources.append("SCHEDULE_C")
+        src_doc_ids.append(sch_c.get("source_document_id"))
+    if ssa:
+        m = float(_f(ssa, "monthly_benefit") or 0)
+        if m:
+            annual = (annual or 0) + m * 12
+            sources.append("SSA")
+            src_doc_ids.append(ssa.get("source_document_id"))
+    if pen:
+        m = float(_f(pen, "monthly_benefit") or 0)
+        if m:
+            annual = (annual or 0) + m * 12
+            sources.append("PENSION")
+            src_doc_ids.append(pen.get("source_document_id"))
+    if not annual and irs:
+        annual = float(_f(irs, "agi") or _f(irs, "wages_salaries") or 0) or None
+        if annual:
+            sources.append("IRS_TRANSCRIPT")
+            src_doc_ids.append(irs.get("source_document_id"))
+
+    qualifying_monthly = round(annual / 12, 2) if annual else None
+    verified_at = (w2 or ps or irs or ssa or pen or sch_c or {}).get("received_at")
+    return {
+        "qualifying_monthly": qualifying_monthly,
+        "annual":             annual,
+        "sources":            sources,
+        "source_docs":        [s for s in src_doc_ids if s],
+        "verified":           bool(annual),
+        "verified_at":        verified_at,
+    }
+
+
+def _employment_block(docs: list) -> dict:
+    voe = _doc(docs, "VOE_TWN", "VOE_EQUIFAX", "VOE")
+    if not voe:
+        # Fall back to the W-2's employer_name so we have at least
+        # *something* to surface in /context — but mark unverified.
+        w2 = _doc(docs, "W2_CURRENT", "W2_PRIOR")
+        if w2:
+            return {
+                "employer":      _f(w2, "employer_name"),
+                "status":        None,
+                "verified":      False,
+                "source_doc":    None,
+                "verified_at":   None,
+            }
+        return {"verified": False}
+    return {
+        "employer":          _f(voe, "employer_name"),
+        "status":            _f(voe, "employment_status"),
+        "hire_date":         _f(voe, "hire_date"),
+        "position":          _f(voe, "position"),
+        "income_amount":     _f(voe, "income_amount"),
+        "verification_date": _f(voe, "verification_date"),
+        "source_doc":        voe.get("source_document_id"),
+        "verified":          True,
+        "verified_at":       voe.get("received_at"),
+    }
+
+
+def _credit_block(docs: list) -> dict:
+    cr = _doc(docs, "CREDIT_REPORT")
+    if not cr:
+        return {"verified": False}
+    return {
+        "mid_score":           _f(cr, "mid_score"),
+        "equifax":             _f(cr, "equifax_score"),
+        "experian":            _f(cr, "experian_score"),
+        "transunion":          _f(cr, "transunion_score"),
+        "credit_band":         _f(cr, "credit_band"),
+        "monthly_obligations": _f(cr, "total_monthly_obligations",
+                                  "total_monthly_payments"),
+        "tradeline_count":     _f(cr, "tradeline_count"),
+        "hard_inquiries_12mo": _f(cr, "hard_inquiries_12mo"),
+        "source_doc":          cr.get("source_document_id"),
+        "verified":            True,
+        "verified_at":         cr.get("received_at"),
+    }
+
+
+def _assets_block(docs: list) -> dict:
+    bank_stmts = _all_docs(docs, "BANK_STATEMENT_M1", "BANK_STATEMENT_M2",
+                           "BANK_STATEMENT_M3", "GIFT_FUNDS_TRAIL")
+    retirement = _doc(docs, "RETIREMENT_ACCOUNT", "ASSET_STATEMENT_RETIREMENT")
+    gift       = _doc(docs, "GIFT_LETTER")
+
+    total_liquid = 0.0
+    src_ids: list = []
+    for s in bank_stmts:
+        bal = _f(s, "ending_balance")
+        try:
+            total_liquid += float(bal or 0)
+        except (TypeError, ValueError):
+            pass
+        if s.get("source_document_id"):
+            src_ids.append(s["source_document_id"])
+
+    retirement_balance = None
+    if retirement:
+        try:
+            retirement_balance = float(_f(retirement, "balance") or 0) or None
+        except (TypeError, ValueError):
+            retirement_balance = None
+        if retirement.get("source_document_id"):
+            src_ids.append(retirement["source_document_id"])
+
+    gift_amount = None
+    if gift:
+        try:
+            gift_amount = float(_f(gift, "gift_amount") or 0) or None
+        except (TypeError, ValueError):
+            gift_amount = None
+
+    latest_at = max(
+        (s.get("received_at") for s in bank_stmts if s.get("received_at")),
+        default=None,
+    )
+    return {
+        "total_liquid":  total_liquid or None,
+        "retirement":    retirement_balance,
+        "gift_funds":    gift_amount,
+        "source_docs":   src_ids,
+        "verified":      bool(bank_stmts),
+        "verified_at":   latest_at,
+    }
+
+
+def _identity_block(docs: list) -> dict:
+    dl  = _doc(docs, "DRIVERS_LICENSE", "IDENTITY_DL")
+    ssn = _doc(docs, "SSN_VALIDATION")
+    of  = _doc(docs, "OFAC_CHECK", "OFAC_REPORT")
+    dl_ok  = bool(dl)
+    ssn_ok = bool(ssn) and bool(_f(ssn, "ssn_valid"))
+    of_ok  = bool(of)  and bool(_f(of,  "ofac_clear"))
+    latest_at = max(
+        (d.get("received_at") for d in (dl, ssn, of) if d and d.get("received_at")),
+        default=None,
+    )
+    return {
+        "dl_verified":  dl_ok,
+        "ssn_verified": ssn_ok,
+        "ofac_clear":   of_ok,
+        "complete":     dl_ok and ssn_ok and of_ok,
+        "verified_at":  latest_at,
+    }
+
+
+def _property_block(all_docs: list) -> dict:
+    appr = _doc(all_docs, "APPRAISAL_URAR", "APPRAISAL_URAR_1073",
+                "APPRAISAL_UPDATE")
+    avm  = _doc(all_docs, "AVM_REPORT")
+    tc   = _doc(all_docs, "TITLE_COMMITMENT")
+    ti   = _doc(all_docs, "TITLE_INSURANCE")
+    hoi  = _doc(all_docs, "HOI_BINDER", "HOI_BINDER_HO6", "HOI_DECLARATIONS")
+    flood = _doc(all_docs, "FLOOD_CERT")
+    wind  = _doc(all_docs, "WIND_HAIL_INSURANCE")
+    tax   = _doc(all_docs, "PROPERTY_TAX_BILL")
+    hoa   = _doc(all_docs, "HOA_CERT")
+    wdo   = _doc(all_docs, "WDO_REPORT")
+    well  = _doc(all_docs, "WELL_SEPTIC_INSPECTION")
+
+    appr_value = float(_f(appr, "appraised_value") or 0) or None if appr else None
+    avm_value  = float(_f(avm,  "avm_value")       or 0) or None if avm  else None
+    delta_pct  = None
+    if appr_value and avm_value:
+        delta_pct = round(abs(appr_value - avm_value) / appr_value * 100, 2)
+
+    valuation = {}
+    if appr or avm:
+        valuation = {
+            "appraised_value":  appr_value,
+            "avm_value":        avm_value,
+            "delta_pct":        delta_pct,
+            "condition":        _f(appr, "condition_rating") if appr else None,
+            "gla_sqft":         _f(appr, "gla_sqft") if appr else None,
+            "year_built":       _f(appr, "year_built") if appr else None,
+            "bedrooms":         _f(appr, "bedrooms") if appr else None,
+            "bathrooms":        _f(appr, "bathrooms") if appr else None,
+            "comparable_1":     _f(appr, "comparable_1_price") if appr else None,
+            "comparable_2":     _f(appr, "comparable_2_price") if appr else None,
+            "comparable_3":     _f(appr, "comparable_3_price") if appr else None,
+            "source_doc":       (appr or {}).get("source_document_id"),
+            "verified":         bool(appr),
+            "verified_at":      (appr or {}).get("received_at"),
+        }
+
+    title = {}
+    if tc or ti:
+        title = {
+            "committed":          bool(tc),
+            "insured":            bool(ti),
+            "commitment_number":  _f(tc, "commitment_number") if tc else None,
+            "policy_amount":      _f(tc, "policy_amount") if tc else None,
+            "exceptions_count":   _f(tc, "exceptions_count") if tc else None,
+            "tax_lien_clear":     _f(tc, "tax_lien_clear") if tc else None,
+            "judgment_lien_clear":_f(tc, "judgment_lien_clear") if tc else None,
+            "vesting":            _f(tc, "vesting") if tc else None,
+            "source_doc":         (tc or {}).get("source_document_id"),
+            "verified":           bool(tc) and bool(ti),
+            "commitment_date":    (tc or {}).get("received_at"),
+            "insurance_date":     (ti or {}).get("received_at"),
+        }
+
+    insurance = {}
+    if hoi or flood or wind:
+        insurance = {
+            "hoi_premium_annual":  _f(hoi, "annual_premium") if hoi else None,
+            "hoi_carrier":         _f(hoi, "carrier") if hoi else None,
+            "flood_zone":          _f(flood, "flood_zone") if flood else None,
+            "flood_insurance_required": (
+                _f(flood, "requires_insurance") if flood else None
+            ),
+            "wind_hail_premium":   _f(wind, "annual_premium") if wind else None,
+            "source_doc":          (hoi or {}).get("source_document_id"),
+            "verified":            bool(hoi),
+            "verified_at":         (hoi or {}).get("received_at"),
+        }
+
+    tax_block = {}
+    if tax:
+        tax_block = {
+            "annual_tax":     _f(tax, "annual_tax"),
+            "assessed_value": _f(tax, "assessed_value"),
+            "verified":       True,
+            "verified_at":    tax.get("received_at"),
+        }
+
+    inspections = {}
+    if hoa or wdo or well:
+        inspections = {
+            "pest_clear":        (str(_f(wdo, "findings") or "").lower() == "clear")
+                                  if wdo else None,
+            "well_septic":       _f(well, "septic_condition") if well else None,
+            "hoa_dues_monthly":  _f(hoa, "monthly_dues") if hoa else None,
+            "verified":          bool(hoa or wdo or well),
+        }
+
+    prop_doc_types = sorted({
+        d.get("document_type") for d in all_docs
+        if d.get("category") == "property" and d.get("document_type")
+    })
+    return {
+        "valuation":   valuation,
+        "title":       title,
+        "insurance":   insurance,
+        "tax":         tax_block,
+        "inspections": inspections,
+        "doc_types":   prop_doc_types,
+        "doc_count":   sum(1 for d in all_docs if d.get("category") == "property"),
+    }
+
+
+def _loan_terms_block(all_docs: list) -> dict:
+    urla = _doc(all_docs, "URLA_1003", "URLA_MISMO_3.4")
+    pa   = _doc(all_docs, "PURCHASE_AGREEMENT")
+    rl   = _doc(all_docs, "RATE_LOCK")
+    aus  = _doc(all_docs, "AUS_DU_FINDINGS", "AUS_LP_FINDINGS")
+    cd   = _doc(all_docs, "CLOSING_DISCLOSURE")
+
+    return {
+        "loan_amount":   (_f(urla, "loan_amount")
+                          or (_f(rl, "loan_amount") if rl else None)),
+        "interest_rate": (_f(rl, "locked_rate") if rl else None)
+                          or _f(urla, "interest_rate"),
+        "term_months":   _f(urla, "loan_term_months") or 360,
+        "purpose":       _f(urla, "loan_purpose"),
+        "occupancy":     _f(urla, "occupancy"),
+        "property_type": _f(urla, "property_type"),
+        "loan_program":  (_f(rl, "loan_program") if rl else None)
+                          or "Conv 30yr Fixed",
+        "purchase_agreement": ({
+            "purchase_price":    _f(pa, "purchase_price"),
+            "earnest_money":     _f(pa, "earnest_money"),
+            "closing_date":      _f(pa, "closing_date"),
+            "source_doc":        pa.get("source_document_id"),
+            "verified":          True,
+            "verified_at":       pa.get("received_at"),
+        } if pa else {}),
+        "rate_lock": ({
+            "locked_rate":   _f(rl, "locked_rate"),
+            "lock_expiry":   _f(rl, "lock_expiry"),
+            "lock_days":     _f(rl, "lock_days"),
+            "loan_amount":   _f(rl, "loan_amount"),
+            "loan_program":  _f(rl, "loan_program"),
+            "source_doc":    rl.get("source_document_id"),
+            "verified":      True,
+            "verified_at":   rl.get("received_at"),
+        } if rl else {}),
+        "aus": ({
+            "recommendation":   _f(aus, "recommendation"),
+            "risk_class":       _f(aus, "risk_class"),
+            "casefile_id":      _f(aus, "casefile_id"),
+            "conditions_count": _f(aus, "conditions_count"),
+            "ltv":              _f(aus, "ltv"),
+            "dti":              _f(aus, "dti"),
+            "source_doc":       aus.get("source_document_id"),
+            "verified":         True,
+            "verified_at":      aus.get("received_at"),
+        } if aus else {}),
+        "closing_disclosure": ({
+            "closing_date":     _f(cd, "closing_date"),
+            "loan_amount":      _f(cd, "loan_amount"),
+            "interest_rate":    _f(cd, "interest_rate"),
+            "cash_to_close":    _f(cd, "cash_to_close"),
+            "verified":         True,
+            "verified_at":      cd.get("received_at"),
+        } if cd else {}),
+    }
+
+
+def _build_verifications(
+    borrower: dict, co_borrowers: list, property_block: dict,
+    loan_terms: dict, combined_income: float, total_liquid: float,
+    piti_monthly, mid_credit_score, monthly_obligations: float,
+) -> dict:
+    """Persona-ready verifications block with summary text + status
+    flags. Each top-level key gives a Decision-OS persona enough info
+    to render a card without reading any other field."""
+    def _safe(v: dict, *keys):
+        for k in keys:
+            v = (v or {}).get(k)
+        return v
+
+    income_status = bool(borrower.get("income", {}).get("verified")) and all(
+        cb.get("income", {}).get("verified") for cb in co_borrowers
+    )
+    employer = _safe(borrower, "employment", "employer") or "?"
+    primary_annual = _safe(borrower, "income", "annual") or 0
+    income_summary = f"Primary {employer} ${primary_annual / 1000:.0f}k"
+    for cb in co_borrowers:
+        co_emp  = _safe(cb, "employment", "employer") or "?"
+        co_ann  = _safe(cb, "income", "annual") or 0
+        income_summary += f" + Co {co_emp} ${co_ann / 1000:.0f}k"
+
+    employment_status = bool(_safe(borrower, "employment", "verified")) and all(
+        _safe(cb, "employment", "verified") for cb in co_borrowers
+    )
+
+    credit_status = bool(_safe(borrower, "credit", "verified"))
+    credit_summary = (
+        f"Qualifying mid {mid_credit_score} (lower of all borrowers), "
+        f"obligations ${monthly_obligations:,.0f}"
+        if mid_credit_score else "Credit not yet pulled"
+    )
+
+    assets_status = bool(_safe(borrower, "assets", "verified"))
+    months_reserves = (
+        round(total_liquid / piti_monthly, 1)
+        if total_liquid and piti_monthly else None
+    )
+    assets_summary = (
+        f"${total_liquid:,.0f} liquid"
+        + (f" ({months_reserves}mo reserves)" if months_reserves else "")
+        if total_liquid else "Assets not yet verified"
+    )
+
+    identity_status = bool(_safe(borrower, "identity", "complete")) and all(
+        _safe(cb, "identity", "complete") for cb in co_borrowers
+    )
+
+    appraisal_status = bool(_safe(property_block, "valuation", "verified"))
+    appraised = _safe(property_block, "valuation", "appraised_value")
+    appraisal_summary = (
+        f"${appraised:,.0f} appraised"
+        if appraised else "Appraisal pending"
+    )
+
+    title_status = bool(_safe(property_block, "title", "verified"))
+    excs = _safe(property_block, "title", "exceptions_count")
+    title_summary = (
+        f"{_safe(property_block, 'title', 'vesting') or 'Fee Simple'}, "
+        f"{excs or 0} exceptions, liens clear"
+        if title_status else "Title not yet bound"
+    )
+
+    insurance_status = bool(_safe(property_block, "insurance", "verified"))
+    carrier = _safe(property_block, "insurance", "hoi_carrier")
+    premium = _safe(property_block, "insurance", "hoi_premium_annual")
+    flood   = _safe(property_block, "insurance", "flood_zone")
+    insurance_summary = (
+        f"{carrier or '?'} ${premium or 0:,.0f}/yr, flood zone {flood or '?'}"
+        if insurance_status else "HOI not yet bound"
+    )
+
+    aus_status = bool(_safe(loan_terms, "aus", "verified")) and \
+        (_safe(loan_terms, "aus", "recommendation")
+         in ("approve_eligible", "accept", "approve"))
+    aus_recommendation = _safe(loan_terms, "aus", "recommendation") or "?"
+    aus_count = _safe(loan_terms, "aus", "conditions_count") or 0
+    aus_summary = (
+        f"DU {aus_recommendation}, {aus_count} conditions"
+        if _safe(loan_terms, "aus", "verified")
+        else "AUS not yet run"
+    )
+
+    rate_locked_status = bool(_safe(loan_terms, "rate_lock", "verified"))
+    rate_summary = (
+        f"{_safe(loan_terms, 'rate_lock', 'locked_rate')}% locked, "
+        f"expires {_safe(loan_terms, 'rate_lock', 'lock_expiry')}"
+        if rate_locked_status else "Rate not yet locked"
+    )
+
+    # conditions_cleared = AUS approved + every condition tracked clear.
+    # For now: any AUS approval with conditions_count == 0 is "cleared"
+    # — richer per-condition tracking can grow here.
+    conditions_cleared = aus_status and (aus_count == 0)
+
+    # clear_to_close — every gate above plus rate lock.
+    blocking = []
+    flags_for_ctc = {
+        "income_verified":     income_status,
+        "employment_verified": employment_status,
+        "credit_pulled":       credit_status,
+        "assets_verified":     assets_status,
+        "identity_complete":   identity_status,
+        "appraisal_complete":  appraisal_status,
+        "title_clear":         title_status,
+        "insurance_bound":     insurance_status,
+        "aus_approved":        aus_status,
+        "rate_locked":         rate_locked_status,
+        "conditions_cleared":  conditions_cleared,
+    }
+    blocking = [k for k, v in flags_for_ctc.items() if not v]
+    ctc_status = not blocking
+    ctc_summary = (
+        "All verifications complete" if ctc_status
+        else "Blocking: " + ", ".join(blocking[:5])
+    )
+
+    return {
+        "income_verified": {
+            "status": income_status, "summary": income_summary,
+            "verified_at": _safe(borrower, "income", "verified_at"),
+        },
+        "employment_verified": {
+            "status": employment_status,
+            "summary": (
+                f"{employer}"
+                + (f" + Co {_safe(co_borrowers[0], 'employment', 'employer')}"
+                   if co_borrowers else "")
+            ),
+            "verified_at": _safe(borrower, "employment", "verified_at"),
+        },
+        "credit_pulled": {
+            "status":  credit_status, "summary": credit_summary,
+            "verified_at": _safe(borrower, "credit", "verified_at"),
+        },
+        "assets_verified": {
+            "status":  assets_status, "summary": assets_summary,
+            "verified_at": _safe(borrower, "assets", "verified_at"),
+        },
+        "identity_complete": {
+            "status": identity_status,
+            "summary": ("All borrowers DL + SSN + OFAC clear"
+                        if identity_status else "Identity incomplete"),
+            "verified_at": _safe(borrower, "identity", "verified_at"),
+        },
+        "appraisal_complete": {
+            "status":  appraisal_status, "summary": appraisal_summary,
+            "verified_at": _safe(property_block, "valuation", "verified_at"),
+        },
+        "title_clear": {
+            "status":  title_status, "summary": title_summary,
+            "commitment_date": _safe(property_block, "title", "commitment_date"),
+            "insurance_date":  _safe(property_block, "title", "insurance_date"),
+        },
+        "insurance_bound": {
+            "status":  insurance_status, "summary": insurance_summary,
+            "verified_at": _safe(property_block, "insurance", "verified_at"),
+        },
+        "aus_approved": {
+            "status":  aus_status, "summary": aus_summary,
+            "verified_at": _safe(loan_terms, "aus", "verified_at"),
+        },
+        "rate_locked": {
+            "status":  rate_locked_status, "summary": rate_summary,
+            "verified_at": _safe(loan_terms, "rate_lock", "verified_at"),
+        },
+        "conditions_cleared": {
+            "status": conditions_cleared,
+            "summary": (f"{aus_count} conditions cleared"
+                        if conditions_cleared else "Conditions outstanding"),
+        },
+        "clear_to_close": {
+            "status":         ctc_status,
+            "summary":        ctc_summary,
+            "blocking_items": blocking,
+        },
+    }
+
+
 class IncrementalGraphBuilder:
     """Single-tick driver: pull → save → reconcile → assemble → upsert."""
 
@@ -258,10 +803,11 @@ class IncrementalGraphBuilder:
 
         # ── Step 3: persist docs ─────────────────────────────────────
         wm_to = wm_from
-        affected: dict[str, dict] = {}     # applicant_id → first-doc
+        affected_apps: dict[str, str] = {}  # application_id → los_id
         for doc in new_docs:
             doc_id = doc.get("document_id")
             applicant_id = doc.get("applicant_id")
+            application_id = doc.get("application_id")
             if not doc_id or not applicant_id:
                 stats["documents_skipped"] += 1
                 continue
@@ -288,114 +834,114 @@ class IncrementalGraphBuilder:
             received = doc.get("received_at") or wm_to
             if received and received > (wm_to or ""):
                 wm_to = received
-            affected.setdefault(applicant_id, doc)
+            if application_id:
+                affected_apps.setdefault(application_id, doc.get("los_id") or "")
 
-        # ── Step 4: re-assemble + reconcile + upsert per entity ─────
-        for applicant_id, first_doc in affected.items():
-            application_id = first_doc.get("application_id") or ""
-            entity_type    = self._classify_entity(first_doc)
-
-            # Trigger the canonical assembly path so income / credit /
-            # property / asset / identity caches all refresh. The service
-            # owns its own locking + Redis write-through.
-            if self.aggregation_service is not None:
+        # ── Step 4: reconcile (scoped per-doc) ─────────────────────
+        # Edges still come out of the existing reconciler — we just
+        # stamp ``application_id`` on each row so a workbench query
+        # can scope edges to a single loan.
+        if self.reconciler is not None:
+            for doc in new_docs:
+                applicant_id   = doc.get("applicant_id")
+                application_id = doc.get("application_id")
+                if not applicant_id:
+                    continue
+                save_doc = self._build_save_doc(doc)
                 try:
-                    await self.aggregation_service._run_assembly(
-                        applicant_id=applicant_id,
-                        application_id=application_id,
-                        co_applicant_id=None,
-                        documents=[],     # already in PG; assembler reads
-                        loan_data={},
+                    edges = await self.reconciler.reconcile(
+                        applicant_id, save_doc,
                     )
                 except Exception as exc:
                     logger.warning(
-                        "incremental_assembly_failed",
-                        extra={"applicant_id": applicant_id,
-                               "error": str(exc)[:200]},
+                        f"incremental_reconcile_failed "
+                        f"applicant_id={applicant_id} "
+                        f"error={str(exc)[:200]}"
                     )
-
-            # Reconcile: emit graph edges from each new doc against the
-            # full doc set. Uses the same DocumentReconciler.reconcile()
-            # the AggregationService uses on document upload.
-            new_for_aid = [
-                d for d in new_docs if d.get("applicant_id") == applicant_id
-            ]
-            if self.reconciler is not None and new_for_aid:
-                try:
-                    for d in new_for_aid:
-                        save_doc = self._build_save_doc(d)
-                        edges = await self.reconciler.reconcile(
-                            applicant_id, save_doc,
+                    continue
+                for edge in edges or []:
+                    try:
+                        row = (edge.model_dump()
+                               if hasattr(edge, "model_dump")
+                               else dict(edge))
+                        if application_id:
+                            row["application_id"] = application_id
+                        await self.pg.save_relationship(
+                            row, tenant_id=tenant_id,
                         )
-                        for edge in edges or []:
-                            try:
-                                row = edge.model_dump() if hasattr(edge, "model_dump") else dict(edge)
-                                await self.pg.save_relationship(
-                                    row, tenant_id=tenant_id,
-                                )
-                                stats["edges_created"] += 1
-                            except Exception as exc:
-                                logger.debug(
-                                    "incremental_edge_persist_failed",
-                                    extra={"error": str(exc)[:200]},
-                                )
-                except Exception as exc:
-                    logger.warning(
-                        "incremental_reconcile_failed",
-                        extra={"applicant_id": applicant_id,
-                               "error": str(exc)[:200]},
-                    )
+                        stats["edges_created"] += 1
+                    except Exception as exc:
+                        logger.debug(
+                            "incremental_edge_persist_failed",
+                            extra={"error": str(exc)[:200]},
+                        )
 
-            # ── Compose entity_states.state summary ──────────────────
-            state, doc_count, completeness = await self._compose_state(
-                applicant_id, application_id, tenant_id,
-            )
-
+        # ── Step 5: assemble golden record per application ───────
+        for application_id, los_id in affected_apps.items():
             try:
-                edge_count     = await self.pg.count_edges_for_entity(
-                    applicant_id, tenant_id=tenant_id,
-                )
-                conflict_count = await self.pg.count_conflicts_for_entity(
-                    applicant_id, tenant_id=tenant_id,
-                )
-            except Exception:
-                edge_count = conflict_count = 0
-
-            # Accumulate legacy_ids for this applicant from (a) the
-            # loan_origination event's encompass IDs (when the same
-            # los_id surfaced earlier in this tick) and (b) every
-            # source_document_id docs in ``new_docs`` carry. PG merges
-            # via JSONB ``||`` so the column grows over time.
-            los_id_for_entity = first_doc.get("los_id")
-            legacy_for_entity: dict = {}
-            if los_id_for_entity and los_id_for_entity in legacy_ids_by_los:
-                legacy_for_entity.update(legacy_ids_by_los[los_id_for_entity])
-            src_ids = sorted({
-                d.get("source_document_id") for d in new_docs
-                if d.get("applicant_id") == applicant_id
-                and d.get("source_document_id")
-            })
-            if src_ids:
-                legacy_for_entity["source_document_ids"] = src_ids
-            try:
-                await self.pg.upsert_entity_state(
-                    entity_id=applicant_id,
-                    entity_type=entity_type,
+                state_data = await self._assemble_application_state(
                     application_id=application_id,
-                    state=state,
-                    document_count=doc_count,
-                    graph_edge_count=edge_count,
-                    conflict_count=conflict_count,
-                    completeness_pct=completeness,
+                    los_id=los_id,
+                    legacy_ids=legacy_ids_by_los.get(los_id, {}),
+                    new_docs_for_app=[
+                        d for d in new_docs
+                        if d.get("application_id") == application_id
+                    ],
                     tenant_id=tenant_id,
-                    legacy_ids=legacy_for_entity,
+                )
+                await self.pg.upsert_entity_state(
+                    application_id, state_data, tenant_id=tenant_id,
                 )
                 stats["entities_updated"] += 1
+
+                # Update applications.verified_* so /context can show
+                # stated-vs-verified side by side.
+                borrower = state_data.get("borrower") or {}
+                prop     = state_data.get("property") or {}
+                await self.pg.update_application_verified_fields(
+                    application_id,
+                    {
+                        "verified_income": (
+                            (borrower.get("income") or {}).get("annual")
+                        ),
+                        "verified_property_value": (
+                            ((prop.get("valuation") or {}).get("appraised_value"))
+                        ),
+                        "verified_assets": (
+                            (borrower.get("assets") or {}).get("total_liquid")
+                        ),
+                        "verified_employer": (
+                            (borrower.get("employment") or {}).get("employer")
+                        ),
+                    },
+                    tenant_id=tenant_id,
+                )
+
+                # Append a coarse-grained build_complete event so
+                # /entity/{id}/events shows the per-tick rhythm.
+                # Field-level diff logging is left for the upsert
+                # observers — coarse log keeps the table from
+                # exploding on every doc.
+                try:
+                    await self.pg.log_entity_state_event(
+                        application_id=application_id,
+                        event_type="build_complete",
+                        triggered_by=f"build:{build_date}-{build_number}",
+                        new_value={
+                            "status":           state_data.get("status"),
+                            "document_count":   state_data.get("document_count"),
+                            "completeness_pct": state_data.get("completeness_pct"),
+                        },
+                        tenant_id=tenant_id,
+                    )
+                except Exception:
+                    pass
             except Exception as exc:
                 logger.warning(
-                    "incremental_upsert_state_failed",
-                    extra={"applicant_id": applicant_id,
-                           "error": str(exc)[:200]},
+                    "incremental_assemble_failed "
+                    f"application_id={application_id} "
+                    f"error_type={type(exc).__name__} "
+                    f"error={str(exc)[:200]}"
                 )
 
         # ── Step 5: advance watermark ────────────────────────────────
@@ -418,6 +964,238 @@ class IncrementalGraphBuilder:
             **stats,
         })
         return stats
+
+    # ------------------------------------------------------------------
+    # Per-application golden-record assembly (v4)
+    # ------------------------------------------------------------------
+
+    async def _assemble_application_state(
+        self,
+        application_id: str,
+        los_id: str,
+        legacy_ids: dict,
+        new_docs_for_app: list,
+        tenant_id: str,
+    ) -> dict:
+        """Build the full ``entity_states`` row for an application.
+
+        Steps:
+          1. Fetch every doc + applicant tied to this application.
+          2. Group docs by applicant_id; build per-borrower JSONB
+             (income / employment / credit / assets / identity).
+          3. Build property + loan_terms JSONB from property + loan_terms
+             docs across the application.
+          4. Compute indexed columns (LTV / DTI / PITI / mid score).
+          5. Build a verifications JSONB block with persona-ready
+             summaries + boolean flags.
+          6. Determine status from the flag stack.
+          7. Merge accumulating legacy_ids.
+        """
+        all_docs   = await self.pg.get_documents_for_application(
+            application_id, tenant_id=tenant_id,
+        )
+        applicants = await self.pg.get_applicants_for_application(
+            application_id, tenant_id=tenant_id,
+        )
+        primary    = next((a for a in applicants if a.get("role") == "primary"), None)
+        co_list    = [a for a in applicants if a.get("role") != "primary"]
+
+        # --- per-borrower fold ----------------------------------------
+        def _fold_borrower(applicant: dict) -> dict:
+            aid    = applicant.get("applicant_id")
+            ad     = [d for d in all_docs if d.get("applicant_id") == aid]
+            return {
+                "applicant_id": aid,
+                "name": (
+                    f"{applicant.get('first_name', '')} "
+                    f"{applicant.get('last_name', '')}"
+                ).strip(),
+                "role":      applicant.get("role"),
+                "income":    _income_block(ad),
+                "employment": _employment_block(ad),
+                "credit":    _credit_block(ad),
+                "assets":    _assets_block(ad),
+                "identity":  _identity_block(ad),
+                "doc_types": sorted({
+                    d.get("document_type") for d in ad if d.get("document_type")
+                }),
+                "doc_count": len(ad),
+            }
+
+        borrower     = _fold_borrower(primary) if primary else {}
+        co_borrowers = [_fold_borrower(co) for co in co_list]
+
+        # --- property + loan_terms ------------------------------------
+        property_block   = _property_block(all_docs)
+        loan_terms_block = _loan_terms_block(all_docs)
+
+        # --- indexed columns ------------------------------------------
+        all_scores = []
+        for b in [borrower, *co_borrowers]:
+            ms = (b.get("credit") or {}).get("mid_score")
+            if ms:
+                all_scores.append(int(ms))
+        mid_credit_score = min(all_scores) if all_scores else None
+
+        primary_qm = (borrower.get("income") or {}).get("qualifying_monthly") or 0
+        co_qm_total = sum(
+            (cb.get("income") or {}).get("qualifying_monthly") or 0
+            for cb in co_borrowers
+        )
+        combined_monthly_income = primary_qm + co_qm_total
+
+        total_liquid = (borrower.get("assets") or {}).get("total_liquid") or 0
+        for cb in co_borrowers:
+            total_liquid += (cb.get("assets") or {}).get("total_liquid") or 0
+
+        monthly_obligations = (borrower.get("credit") or {}).get(
+            "monthly_obligations") or 0
+        for cb in co_borrowers:
+            monthly_obligations += (cb.get("credit") or {}).get(
+                "monthly_obligations") or 0
+
+        appraised_value = (
+            (property_block.get("valuation") or {}).get("appraised_value")
+        )
+        purchase_price = (
+            (loan_terms_block.get("purchase_agreement") or {}).get("purchase_price")
+        )
+        loan_amount   = loan_terms_block.get("loan_amount")
+        interest_rate = loan_terms_block.get("interest_rate")
+        term_months   = loan_terms_block.get("term_months") or 360
+
+        ltv = None
+        if appraised_value and (purchase_price or appraised_value):
+            denom = min(filter(None, [appraised_value, purchase_price]))
+            if denom and loan_amount:
+                ltv = round(loan_amount / denom * 100, 2)
+
+        annual_tax = (
+            (property_block.get("tax") or {}).get("annual_tax")
+        )
+        annual_hoi = (
+            (property_block.get("insurance") or {}).get("hoi_premium_annual")
+        )
+        piti_monthly = None
+        if loan_amount and interest_rate and annual_tax and annual_hoi:
+            try:
+                rate_m = float(interest_rate) / 100 / 12
+                n      = int(term_months)
+                if rate_m > 0:
+                    pi = (float(loan_amount) * (rate_m * (1 + rate_m) ** n)
+                          / ((1 + rate_m) ** n - 1))
+                else:
+                    pi = float(loan_amount) / max(n, 1)
+                piti_monthly = round(
+                    pi + float(annual_tax) / 12 + float(annual_hoi) / 12, 2,
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                piti_monthly = None
+
+        dti_front = dti_back = None
+        if combined_monthly_income and combined_monthly_income > 0 and piti_monthly:
+            dti_front = round(piti_monthly / combined_monthly_income * 100, 2)
+            dti_back  = round(
+                (piti_monthly + monthly_obligations) / combined_monthly_income * 100, 2,
+            )
+
+        # --- verifications block --------------------------------------
+        verifications = _build_verifications(
+            borrower, co_borrowers, property_block, loan_terms_block,
+            combined_monthly_income, total_liquid, piti_monthly, mid_credit_score,
+            monthly_obligations,
+        )
+
+        # --- flags (mirror verifications.*.status) --------------------
+        flags = {
+            k: bool((verifications.get(k) or {}).get("status"))
+            for k in (
+                "income_verified", "employment_verified", "credit_pulled",
+                "assets_verified", "identity_complete", "appraisal_complete",
+                "title_clear", "insurance_bound", "aus_approved",
+                "rate_locked", "conditions_cleared", "clear_to_close",
+            )
+        }
+
+        # --- status flip ----------------------------------------------
+        if flags["clear_to_close"]:
+            status = "clear_to_close"
+        elif flags["conditions_cleared"]:
+            status = "conditions_cleared"
+        elif flags["aus_approved"]:
+            status = "approved_with_conditions"
+        elif flags["credit_pulled"] and flags["income_verified"]:
+            status = "in_underwriting"
+        elif len(all_docs) > 0:
+            status = "docs_collecting"
+        else:
+            status = "application_received"
+
+        # --- counts ---------------------------------------------------
+        try:
+            edge_count = await self.pg.count_edges_for_application(
+                application_id, tenant_id=tenant_id,
+            )
+        except Exception:
+            edge_count = 0
+        try:
+            conflict_count = await self.pg.count_conflicts_for_application(
+                application_id, tenant_id=tenant_id,
+            )
+            critical_conflict_count = (
+                await self.pg.count_conflicts_for_application(
+                    application_id, tenant_id=tenant_id, critical_only=True,
+                )
+            )
+        except Exception:
+            conflict_count = critical_conflict_count = 0
+
+        # --- completeness (verified-blocks ratio) --------------------
+        verified_blocks = sum(1 for v in verifications.values()
+                              if isinstance(v, dict) and v.get("status"))
+        total_blocks    = len(verifications) or 1
+        completeness_pct = round(verified_blocks / total_blocks * 100, 1)
+
+        # --- legacy_ids accumulator ----------------------------------
+        legacy = dict(legacy_ids or {})
+        legacy.setdefault("los_id", los_id)
+        src_ids = sorted({
+            d.get("source_document_id") for d in new_docs_for_app
+            if d.get("source_document_id")
+        })
+        if src_ids:
+            legacy["source_document_ids"] = src_ids
+
+        return {
+            "los_id":        los_id,
+            "legacy_ids":    legacy,
+            "borrower":      borrower,
+            "co_borrowers":  co_borrowers,
+            "property":      property_block,
+            "loan_terms":    loan_terms_block,
+            "verifications": verifications,
+            "mid_credit_score":              mid_credit_score,
+            "qualifying_monthly":            primary_qm or None,
+            "co_borrower_qualifying_monthly": co_qm_total or None,
+            "combined_monthly_income":       combined_monthly_income or None,
+            "total_liquid_assets":           total_liquid or None,
+            "appraised_value":               appraised_value,
+            "purchase_price":                purchase_price,
+            "loan_amount":                   loan_amount,
+            "interest_rate":                 interest_rate,
+            "ltv":                           ltv,
+            "dti_front":                     dti_front,
+            "dti_back":                      dti_back,
+            "piti_monthly":                  piti_monthly,
+            "monthly_obligations":           monthly_obligations or None,
+            "document_count":                len(all_docs),
+            "graph_edge_count":              edge_count,
+            "conflict_count":                conflict_count,
+            "critical_conflict_count":       critical_conflict_count,
+            "completeness_pct":              completeness_pct,
+            "status":                        status,
+            **flags,
+        }
 
     # ------------------------------------------------------------------
 

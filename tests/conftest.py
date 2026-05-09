@@ -235,36 +235,146 @@ class FakePostgresStore:
         ]
 
     async def upsert_entity_state(
-        self, entity_id, entity_type, application_id, state,
-        document_count=0, graph_edge_count=0, conflict_count=0,
-        completeness_pct=0.0, tenant_id="default",
-        legacy_ids=None,
+        self, application_id, state_data=None, tenant_id="default",
     ):
+        """v4 — keyed by ``application_id``, ``state_data`` is a dict
+        whose keys map 1:1 to the entity_states columns. Mirrors the
+        PG-side ``legacy_ids`` JSONB merge."""
+        from datetime import datetime, timezone
         if not hasattr(self, "_entity_states"):
             self._entity_states = {}
-        from datetime import datetime, timezone
-        # Mirror production's JSONB ``||`` merge so test code observes
-        # the same accumulator semantics — new keys win, but existing
-        # keys not in the new dict are preserved across upserts.
-        prior = self._entity_states.get(entity_id, {})
+        prior = self._entity_states.get(application_id, {})
+        s = state_data or {}
         merged_legacy = dict(prior.get("legacy_ids") or {})
-        merged_legacy.update(legacy_ids or {})
-        self._entity_states[entity_id] = {
-            "entity_id":        entity_id,
-            "entity_type":      entity_type,
+        merged_legacy.update(s.get("legacy_ids") or {})
+        self._entity_states[application_id] = {
+            **prior,
             "application_id":   application_id,
             "tenant_id":        tenant_id,
-            "state":            state,
-            "document_count":   int(document_count),
-            "graph_edge_count": int(graph_edge_count),
-            "conflict_count":   int(conflict_count),
-            "completeness_pct": float(completeness_pct),
+            "los_id":           s.get("los_id") or prior.get("los_id"),
             "legacy_ids":       merged_legacy,
-            "last_updated":     datetime.now(timezone.utc),
+            "borrower":         s.get("borrower")     or prior.get("borrower")     or {},
+            "co_borrowers":     s.get("co_borrowers") or prior.get("co_borrowers") or [],
+            "property":         s.get("property")     or prior.get("property")     or {},
+            "loan_terms":       s.get("loan_terms")   or prior.get("loan_terms")   or {},
+            "verifications":    s.get("verifications") or prior.get("verifications") or {},
+            "mid_credit_score":              s.get("mid_credit_score"),
+            "qualifying_monthly":            s.get("qualifying_monthly"),
+            "co_borrower_qualifying_monthly": s.get("co_borrower_qualifying_monthly"),
+            "combined_monthly_income":       s.get("combined_monthly_income"),
+            "total_liquid_assets":           s.get("total_liquid_assets"),
+            "appraised_value":               s.get("appraised_value"),
+            "purchase_price":                s.get("purchase_price"),
+            "loan_amount":                   s.get("loan_amount"),
+            "interest_rate":                 s.get("interest_rate"),
+            "ltv":                           s.get("ltv"),
+            "dti_front":                     s.get("dti_front"),
+            "dti_back":                      s.get("dti_back"),
+            "piti_monthly":                  s.get("piti_monthly"),
+            "monthly_obligations":           s.get("monthly_obligations"),
+            "document_count":                int(s.get("document_count") or 0),
+            "graph_edge_count":              int(s.get("graph_edge_count") or 0),
+            "conflict_count":                int(s.get("conflict_count") or 0),
+            "critical_conflict_count":       int(s.get("critical_conflict_count") or 0),
+            "completeness_pct":              float(s.get("completeness_pct") or 0.0),
+            "status":                        s.get("status") or "application_received",
+            "income_verified":               bool(s.get("income_verified")),
+            "employment_verified":           bool(s.get("employment_verified")),
+            "credit_pulled":                 bool(s.get("credit_pulled")),
+            "assets_verified":               bool(s.get("assets_verified")),
+            "identity_complete":             bool(s.get("identity_complete")),
+            "appraisal_complete":            bool(s.get("appraisal_complete")),
+            "title_clear":                   bool(s.get("title_clear")),
+            "insurance_bound":               bool(s.get("insurance_bound")),
+            "aus_approved":                  bool(s.get("aus_approved")),
+            "rate_locked":                   bool(s.get("rate_locked")),
+            "conditions_cleared":            bool(s.get("conditions_cleared")),
+            "clear_to_close":                bool(s.get("clear_to_close")),
+            "last_updated":                  datetime.now(timezone.utc),
         }
 
-    async def get_entity_state(self, entity_id, tenant_id="default"):
-        row = getattr(self, "_entity_states", {}).get(entity_id)
+    async def get_documents_for_application(self, application_id, tenant_id="default"):
+        return [d for d in self.documents
+                if d.get("application_id") == application_id
+                and d.get("tenant_id", "default") == tenant_id]
+
+    async def get_applicants_for_application(self, application_id, tenant_id="default"):
+        app = await self.get_application(application_id, tenant_id=tenant_id)
+        if not app:
+            return []
+        out = []
+        for aid, role in [(app.get("applicant_id"), "primary"),
+                          (app.get("co_applicant_id"), "co_borrower")]:
+            if not aid:
+                continue
+            applicant = self.applicants.get(aid)
+            if applicant:
+                out.append({**applicant, "role": role})
+        return out
+
+    async def count_docs_for_application(self, application_id, tenant_id="default"):
+        return len(await self.get_documents_for_application(application_id, tenant_id))
+
+    async def count_edges_for_application(self, application_id, tenant_id="default"):
+        return len([r for r in self.relationships
+                    if r.get("application_id") == application_id])
+
+    async def count_conflicts_for_application(
+        self, application_id, tenant_id="default", critical_only=False,
+    ):
+        return len([
+            r for r in self.relationships
+            if r.get("application_id") == application_id
+            and r.get("relationship_type") == "contradicts"
+        ])
+
+    async def update_application_verified_fields(
+        self, application_id, fields, tenant_id="default",
+    ):
+        app = self.applications.get(application_id)
+        if not app:
+            return
+        for k in ("verified_income", "verified_property_value",
+                  "verified_assets", "verified_employer"):
+            if k in fields:
+                app[k] = fields[k]
+
+    async def update_application_stated_fields(
+        self, application_id, fields, tenant_id="default",
+    ):
+        app = self.applications.get(application_id)
+        if not app:
+            return
+        for k in ("stated_income", "stated_property_value",
+                  "stated_assets", "stated_employer"):
+            if k in fields:
+                app[k] = fields[k]
+
+    async def log_entity_state_event(self, application_id, event_type,
+                                     field_path=None, old_value=None,
+                                     new_value=None, triggered_by=None,
+                                     document_id=None, tenant_id="default"):
+        if not hasattr(self, "_entity_state_events"):
+            self._entity_state_events = []
+        from datetime import datetime, timezone
+        self._entity_state_events.append({
+            "application_id": application_id,
+            "event_type":     event_type,
+            "field_path":     field_path,
+            "old_value":      old_value,
+            "new_value":      new_value,
+            "triggered_by":   triggered_by,
+            "document_id":    document_id,
+            "created_at":     datetime.now(timezone.utc),
+        })
+
+    async def get_entity_state_events(self, application_id, limit=50,
+                                      tenant_id="default"):
+        evs = getattr(self, "_entity_state_events", [])
+        return [e for e in evs if e["application_id"] == application_id][:limit]
+
+    async def get_entity_state(self, application_id, tenant_id="default"):
+        row = getattr(self, "_entity_states", {}).get(application_id)
         if row and row.get("tenant_id", "default") != tenant_id:
             return None
         return row

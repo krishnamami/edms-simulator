@@ -597,61 +597,158 @@ VALUES ('edms_dev_key', 'default', 'Development Key', 'read,write,admin')
 ON CONFLICT (api_key) DO NOTHING;
 
 -- =====================================================================
--- Incremental knowledge-graph backtest layer.
+-- v4 — entity_states is THE verified knowledge graph (one row per loan).
 --
--- The S3 → connector → builder pipeline pulls new docs incrementally
--- via watermarks, indexes them, runs assemblers + reconciler, and
--- updates entity_states *in place* (one row per applicant / property).
--- An EOD scheduler copies the current entity_states into entity_snapshots
--- so a Decision-OS lineage view can replay how an entity evolved day
--- by day. graph_build_runs records every builder execution with the
--- watermark trail for ops + audit.
+-- Old shape: 4 rows per loan (borrower / co-borrower / property /
+-- loan_terms entities), keyed by entity_id. Mid-flight refactor flips
+-- to ONE row per ``application_id`` carrying every borrower (primary
+-- + co-borrowers as a JSONB array), property, loan_terms, and a
+-- ``verifications`` block with persona-ready summaries. Indexed
+-- columns (mid_credit_score, ltv, dti_back, etc.) make workbench
+-- queries (``WHERE mid_credit_score >= 700 AND completeness_pct >=
+-- 80 AND NOT clear_to_close``) sub-millisecond.
+--
+-- entity_states is fully derived from document_index + applicants +
+-- applications. We therefore DROP+CREATE on every container boot —
+-- next build re-assembles from source. The historical
+-- entity_snapshots table is also dropped here (lineage rebuilds at
+-- the next EOD tick); set ``DISABLE_V4_ENTITY_RESET=true`` if you
+-- need the old data preserved across a deploy.
 -- =====================================================================
-CREATE TABLE IF NOT EXISTS entity_states (
-    entity_id          VARCHAR(100) PRIMARY KEY,
-    entity_type        VARCHAR(50) NOT NULL,
-    application_id     VARCHAR(100) NOT NULL,
-    tenant_id          VARCHAR(50) NOT NULL DEFAULT 'default',
-    state              JSONB NOT NULL DEFAULT '{}',
-    document_count     INT  NOT NULL DEFAULT 0,
-    graph_edge_count   INT  NOT NULL DEFAULT 0,
-    conflict_count     INT  NOT NULL DEFAULT 0,
-    completeness_pct   FLOAT NOT NULL DEFAULT 0.0,
-    last_updated       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_entity_states_app
-    ON entity_states(application_id);
-CREATE INDEX IF NOT EXISTS idx_entity_states_updated
-    ON entity_states(last_updated);
-CREATE INDEX IF NOT EXISTS idx_entity_states_tenant
-    ON entity_states(tenant_id);
-CREATE INDEX IF NOT EXISTS idx_entity_states_type
-    ON entity_states(entity_type, tenant_id);
 
--- One row per (snapshot_date, entity_id) — EOD copy of entity_states.
--- Powers /entity/{id}/timeline and the lineage view.
-CREATE TABLE IF NOT EXISTS entity_snapshots (
-    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    snapshot_date      DATE NOT NULL,
-    entity_id          VARCHAR(100) NOT NULL,
-    entity_type        VARCHAR(50) NOT NULL,
-    application_id     VARCHAR(100) NOT NULL,
-    tenant_id          VARCHAR(50) NOT NULL DEFAULT 'default',
-    state              JSONB NOT NULL,
-    document_count     INT  NOT NULL DEFAULT 0,
-    graph_edge_count   INT  NOT NULL DEFAULT 0,
-    conflict_count     INT  NOT NULL DEFAULT 0,
-    completeness_pct   FLOAT NOT NULL DEFAULT 0.0,
-    snapshot_taken_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (snapshot_date, entity_id)
+DROP TABLE IF EXISTS entity_state_events;
+DROP TABLE IF EXISTS entity_snapshots;
+DROP TABLE IF EXISTS entity_states;
+
+CREATE TABLE entity_states (
+    application_id            VARCHAR(100) PRIMARY KEY,
+    tenant_id                 VARCHAR(50) NOT NULL DEFAULT 'default',
+    los_id                    VARCHAR(100),
+    legacy_ids                JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Verified golden record — the structured detail behind the
+    -- indexed columns. JSONB so /entity/{id}/state can return rich
+    -- nested data without joining 6 tables.
+    borrower                  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    co_borrowers              JSONB DEFAULT '[]'::jsonb,
+    property                  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    loan_terms                JSONB NOT NULL DEFAULT '{}'::jsonb,
+    verifications             JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Indexed columns — duplicated from the JSONB so workbench filters
+    -- (``WHERE mid_credit_score >= 700 AND ltv < 80 AND …``) hit a
+    -- B-tree instead of pumping JSONB through every row.
+    mid_credit_score          INT,
+    qualifying_monthly        FLOAT,
+    co_borrower_qualifying_monthly FLOAT,
+    combined_monthly_income   FLOAT,
+    total_liquid_assets       FLOAT,
+    appraised_value           FLOAT,
+    purchase_price            FLOAT,
+    loan_amount               FLOAT,
+    interest_rate             FLOAT,
+    ltv                       FLOAT,
+    dti_front                 FLOAT,
+    dti_back                  FLOAT,
+    piti_monthly              FLOAT,
+    monthly_obligations       FLOAT,
+
+    -- Counts
+    document_count            INT NOT NULL DEFAULT 0,
+    graph_edge_count          INT NOT NULL DEFAULT 0,
+    conflict_count            INT NOT NULL DEFAULT 0,
+    critical_conflict_count   INT NOT NULL DEFAULT 0,
+    completeness_pct          FLOAT NOT NULL DEFAULT 0.0,
+
+    -- Decision tracking
+    status                    VARCHAR(50) NOT NULL DEFAULT 'application_received',
+    last_decision_by          VARCHAR(100),
+    last_decision_at          TIMESTAMPTZ,
+    decision_trail            JSONB NOT NULL DEFAULT '[]'::jsonb,
+
+    -- Verification flags — boolean-indexed for fast filtering. Each
+    -- one mirrors the ``status`` field of the matching verifications
+    -- block; redundant on purpose so SQL can predicate without parsing
+    -- JSONB.
+    income_verified           BOOLEAN NOT NULL DEFAULT FALSE,
+    employment_verified       BOOLEAN NOT NULL DEFAULT FALSE,
+    credit_pulled             BOOLEAN NOT NULL DEFAULT FALSE,
+    assets_verified           BOOLEAN NOT NULL DEFAULT FALSE,
+    identity_complete         BOOLEAN NOT NULL DEFAULT FALSE,
+    appraisal_complete        BOOLEAN NOT NULL DEFAULT FALSE,
+    title_clear               BOOLEAN NOT NULL DEFAULT FALSE,
+    insurance_bound           BOOLEAN NOT NULL DEFAULT FALSE,
+    aus_approved              BOOLEAN NOT NULL DEFAULT FALSE,
+    rate_locked               BOOLEAN NOT NULL DEFAULT FALSE,
+    conditions_cleared        BOOLEAN NOT NULL DEFAULT FALSE,
+    clear_to_close            BOOLEAN NOT NULL DEFAULT FALSE,
+
+    last_updated              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_snapshots_date
-    ON entity_snapshots(snapshot_date);
-CREATE INDEX IF NOT EXISTS idx_snapshots_entity
-    ON entity_snapshots(entity_id, snapshot_date);
-CREATE INDEX IF NOT EXISTS idx_snapshots_tenant
-    ON entity_snapshots(tenant_id, snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_es_tenant       ON entity_states(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_es_los          ON entity_states(los_id);
+CREATE INDEX IF NOT EXISTS idx_es_status       ON entity_states(status, tenant_id);
+CREATE INDEX IF NOT EXISTS idx_es_updated      ON entity_states(last_updated);
+CREATE INDEX IF NOT EXISTS idx_es_score        ON entity_states(mid_credit_score);
+CREATE INDEX IF NOT EXISTS idx_es_ltv          ON entity_states(ltv);
+CREATE INDEX IF NOT EXISTS idx_es_dti          ON entity_states(dti_back);
+CREATE INDEX IF NOT EXISTS idx_es_completeness ON entity_states(completeness_pct);
+CREATE INDEX IF NOT EXISTS idx_es_clear        ON entity_states(clear_to_close);
+
+-- One row per (snapshot_date, application_id) — EOD copy of
+-- entity_states. Powers /entity/{id}/timeline + lineage replay.
+CREATE TABLE entity_snapshots (
+    id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    snapshot_date             DATE NOT NULL,
+    application_id            VARCHAR(100) NOT NULL,
+    tenant_id                 VARCHAR(50) NOT NULL DEFAULT 'default',
+    los_id                    VARCHAR(100),
+    legacy_ids                JSONB NOT NULL DEFAULT '{}'::jsonb,
+    borrower                  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    co_borrowers              JSONB DEFAULT '[]'::jsonb,
+    property                  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    loan_terms                JSONB NOT NULL DEFAULT '{}'::jsonb,
+    verifications             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    mid_credit_score          INT,
+    qualifying_monthly        FLOAT,
+    combined_monthly_income   FLOAT,
+    ltv                       FLOAT,
+    dti_front                 FLOAT,
+    dti_back                  FLOAT,
+    document_count            INT NOT NULL DEFAULT 0,
+    completeness_pct          FLOAT NOT NULL DEFAULT 0.0,
+    status                    VARCHAR(50),
+    income_verified           BOOLEAN,
+    credit_pulled             BOOLEAN,
+    appraisal_complete        BOOLEAN,
+    title_clear               BOOLEAN,
+    clear_to_close            BOOLEAN,
+    snapshot_taken_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (snapshot_date, application_id)
+);
+CREATE INDEX IF NOT EXISTS idx_snap_date  ON entity_snapshots(snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_snap_app   ON entity_snapshots(application_id, snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_snap_tenant ON entity_snapshots(tenant_id, snapshot_date);
+
+-- Append-only event log for state-level changes (status flips,
+-- new doc-driven field updates, condition cleared, etc.). The builder
+-- writes these alongside the upsert so /entity/{id}/events surfaces a
+-- granular history without diff-scanning snapshots.
+CREATE TABLE entity_state_events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    application_id  VARCHAR(100) NOT NULL,
+    tenant_id       VARCHAR(50) NOT NULL DEFAULT 'default',
+    event_type      VARCHAR(50) NOT NULL,
+    field_path      VARCHAR(200),
+    old_value       JSONB,
+    new_value       JSONB,
+    triggered_by    VARCHAR(200),
+    document_id     VARCHAR(200),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ese_app
+    ON entity_state_events(application_id, created_at);
 
 -- One row per builder execution. The watermark trail
 -- (watermark_from → watermark_to) shows where the incremental pull
@@ -681,18 +778,12 @@ CREATE INDEX IF NOT EXISTS idx_graph_build_runs_tenant
     ON graph_build_runs(tenant_id, build_date DESC);
 
 -- =====================================================================
--- v3 additions — legacy_ids accumulator on entity rows so a
--- multi-system reconciliation can stitch back to the originating IDs
--- (encompass_loan_number, MERC-RPT-2026-1019, FA-TC-2026-78901, …).
--- ``source_document_id`` + ``source_channel`` on document_index let a
--- downstream consumer trace each row to the system that emitted it.
--- All four ALTERs are additive + idempotent — safe to re-run on every
+-- v3 additions — source_document_id + source_channel on document_index
+-- so a downstream consumer can trace each row back to the system that
+-- emitted it (ADP-W2-2025-4567, MERC-RPT-2026-1019, FA-TC-2026-78901,
+-- ENC-2026-12345, …). Idempotent ALTERs — safe to re-run on every
 -- container boot via core.storage.migrations.apply_schema().
 -- =====================================================================
-ALTER TABLE entity_states
-    ADD COLUMN IF NOT EXISTS legacy_ids JSONB NOT NULL DEFAULT '{}'::jsonb;
-ALTER TABLE entity_snapshots
-    ADD COLUMN IF NOT EXISTS legacy_ids JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE document_index
     ADD COLUMN IF NOT EXISTS source_document_id VARCHAR(200);
 ALTER TABLE document_index
@@ -700,6 +791,28 @@ ALTER TABLE document_index
 CREATE INDEX IF NOT EXISTS idx_doc_source_channel
     ON document_index(source_channel)
     WHERE source_channel IS NOT NULL;
+
+-- =====================================================================
+-- v4 additions — applications tracks stated (from URLA) vs verified
+-- (from documents) values side by side, so /application/{id}/context
+-- can surface "stated $125k income, verified $123k via W-2" without
+-- joining 5 tables. Reconciler edges now carry application_id so a
+-- workbench query can scope edges to a single loan.
+-- =====================================================================
+ALTER TABLE applications
+    ADD COLUMN IF NOT EXISTS stated_income           FLOAT,
+    ADD COLUMN IF NOT EXISTS verified_income         FLOAT,
+    ADD COLUMN IF NOT EXISTS stated_property_value   FLOAT,
+    ADD COLUMN IF NOT EXISTS verified_property_value FLOAT,
+    ADD COLUMN IF NOT EXISTS stated_assets           FLOAT,
+    ADD COLUMN IF NOT EXISTS verified_assets         FLOAT,
+    ADD COLUMN IF NOT EXISTS stated_employer         VARCHAR(200),
+    ADD COLUMN IF NOT EXISTS verified_employer       VARCHAR(200);
+
+ALTER TABLE document_relationships
+    ADD COLUMN IF NOT EXISTS application_id VARCHAR(100);
+CREATE INDEX IF NOT EXISTS idx_dr_app
+    ON document_relationships(application_id);
 
 -- =====================================================================
 -- Webhook outbox — async delivery decouples upload latency from
