@@ -668,6 +668,19 @@ class S3EDMSConnector(BaseEDMSConnector):
         body = obj["Body"].read()
         return json.loads(body.decode("utf-8"))
 
+    def get_evidence_bytes(self, path: Any) -> bytes:
+        """Return the raw bytes of an evidence file (PDF / JPG) referenced
+        by a meta-pair record's ``evidence_file`` hint or a synthesised
+        shared-drive doc. Mirrors ``_read_json`` — in local mode ``path``
+        is a filesystem Path, in S3 mode it's an object key. Raises on
+        S3 errors so the caller can decide whether to skip Vision
+        classification or surface the failure."""
+        if self.is_local:
+            return Path(path).read_bytes()
+        s3 = self._s3()
+        obj = s3.get_object(Bucket=self._bucket, Key=str(path))
+        return obj["Body"].read()
+
     # ------------------------------------------------------------------
     # Synthesised records for raw scans
     # ------------------------------------------------------------------

@@ -76,6 +76,13 @@ _EXPECTED_FIELDS: dict[str, str] = {
     "AVM_REPORT":                "avm_value, confidence_score, model_name, effective_date",
     "CREDIT_EXPLANATION":        "explanation_type, creditor, reason, resolved",
     "CREDIT_EXPLANATION_LETTER": "explanation_type, creditor, reason, resolved",
+    # UNKNOWN — used by the builder to classify a shared-drive scan that
+    # arrived without metadata. We ask Claude to first identify the doc
+    # type (so the synthesised UNCLASSIFIED stub can be re-routed) AND
+    # to return whatever loan-identifying fields are visible (los_id,
+    # borrower name + SSN-last4) so a downstream lookup can stitch the
+    # scan back to an existing applicant.
+    "UNKNOWN":                   "document_type, los_id, borrower_name, employee_name, employer_name, employee_ssn_last4, dob, property_address, document_date, key_value_pairs",
     # Income — W-2 / paystub
     "W2_CURRENT":                "box1_wages, box2_federal_tax, employer_name, employer_ein, employee_name, employee_ssn_last4, tax_year, state, state_wages, state_tax",
     "W2_PRIOR":                  "box1_wages, box2_federal_tax, employer_name, employer_ein, employee_name, tax_year, state, state_wages",

@@ -14,6 +14,7 @@ stays bounded.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import date, datetime, timezone
@@ -98,12 +99,13 @@ class IncrementalGraphBuilder:
         t0         = time.perf_counter()
 
         stats = {
-            "documents_pulled":  0,
-            "documents_new":     0,
-            "documents_skipped": 0,
-            "entities_updated":  0,
-            "edges_created":     0,
-            "duration_ms":       0,
+            "documents_pulled":     0,
+            "documents_new":        0,
+            "documents_skipped":    0,
+            "documents_classified": 0,    # AI-Vision step 2.4 successes
+            "entities_updated":     0,
+            "edges_created":        0,
+            "duration_ms":          0,
         }
 
         wm_from = await self.connector.get_watermark()
@@ -138,6 +140,21 @@ class IncrementalGraphBuilder:
                 stats, started_at, tenant_id=tenant_id,
             )
             return stats
+
+        # ── Step 2.4: AI-Vision classify shared-drive scans ──────────
+        # Connector synthesises ``UNKNOWN`` docs with
+        # ``requires_classification=True`` for every raw scan that
+        # arrived without metadata. Fetch each PDF, run Claude Vision
+        # with the UNKNOWN field hint (asks for document_type +
+        # los_id + borrower-identifying fields), and merge whatever
+        # came back onto the doc. If Vision returned a recognisable
+        # document_type and/or los_id, the doc rolls forward into the
+        # los_id-resolution step below and may now resolve to a real
+        # applicant; if not, it stays unclassified and falls out at
+        # the persist gate (no FK violation, just a documents_skipped).
+        # All-graceful: extract_with_claude returns ({}, 0.5) on any
+        # missing key / disabled flag / network error.
+        await self._classify_unknown_docs(new_docs, stats)
 
         # ── Step 2.5: resolve los_id → applicant_id ──────────────────
         # The v2 connector emits docs that carry only ``los_id`` (the
@@ -330,6 +347,109 @@ class IncrementalGraphBuilder:
             **stats,
         })
         return stats
+
+    # ------------------------------------------------------------------
+
+    async def _classify_unknown_docs(
+        self, new_docs: list[dict], stats: dict,
+    ) -> None:
+        """Run Claude Vision on every doc carrying
+        ``requires_classification=True``. Updates the doc in-place when
+        Vision returned actionable fields:
+
+        - ``document_type`` from the model overrides ``UNKNOWN`` so the
+          downstream graph reconciler treats the doc as the right kind.
+        - ``los_id`` (if visible on the doc) overrides ``UNCLASSIFIED``
+          so the next step can resolve it to a real applicant.
+        - All extracted fields merge into ``extracted_fields``.
+        - ``extraction_method='ai_vision'`` records provenance for the
+          ``/applicant/.../graph/summary`` extraction breakdown.
+
+        Vision-failure or empty-response leaves the doc untouched —
+        it still falls through to the los_id-resolution step and (with
+        ``los_id='UNCLASSIFIED'``) gets skipped at the persist gate.
+        """
+        candidates = [d for d in new_docs if d.get("requires_classification")]
+        if not candidates:
+            return
+
+        try:
+            from core.documents.extractors.claude_extractor import (
+                extract_with_claude,
+            )
+        except Exception as exc:    # pragma: no cover — import-only failure
+            logger.warning(
+                "vision_extractor_unavailable",
+                extra={"error": str(exc)[:200]},
+            )
+            return
+
+        connector_get_bytes = getattr(
+            self.connector, "get_evidence_bytes", None,
+        )
+        if connector_get_bytes is None:
+            logger.warning(
+                "vision_classify_skipped reason=connector_lacks_get_evidence_bytes "
+                f"connector={type(self.connector).__name__}"
+            )
+            return
+
+        for doc in candidates:
+            evidence_path = doc.get("evidence_file")
+            if not evidence_path:
+                continue
+            try:
+                # connector.get_evidence_bytes is sync (boto3 / Path)
+                # so wrap in a thread executor to keep the event loop
+                # unblocked on multi-megabyte PDFs from S3.
+                pdf_bytes = await asyncio.to_thread(
+                    connector_get_bytes, evidence_path,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"vision_evidence_fetch_failed "
+                    f"doc_id={doc.get('document_id')} "
+                    f"evidence={evidence_path} "
+                    f"error_type={type(exc).__name__} "
+                    f"error={str(exc)[:200]}"
+                )
+                continue
+            if not pdf_bytes:
+                continue
+
+            extracted, conf = await extract_with_claude(pdf_bytes, "UNKNOWN")
+            if not extracted:
+                logger.info(
+                    f"vision_classify_empty doc_id={doc.get('document_id')} "
+                    f"evidence={evidence_path}"
+                )
+                continue
+
+            new_type = extracted.get("document_type")
+            new_los  = extracted.get("los_id")
+            if new_type:
+                doc["document_type"] = new_type
+                # Re-derive category so the entity classifier + graph
+                # downstream see a valid bucket.
+                doc["category"] = doc.get("category") or "income"
+            if new_los:
+                doc["los_id"] = new_los
+            doc["extracted_fields"] = {
+                **(doc.get("extracted_fields") or {}),
+                **{k: v for k, v in extracted.items()
+                   if k not in ("document_type", "los_id")},
+            }
+            doc["extraction_method"]      = "ai_vision"
+            doc["confidence_score"]       = conf
+            doc["requires_classification"] = False
+            stats["documents_classified"] += 1
+
+            logger.info(
+                f"vision_classified doc_id={doc.get('document_id')} "
+                f"new_type={new_type or '?'} new_los_id={new_los or '?'} "
+                f"fields_extracted={len(extracted)} "
+                f"confidence={conf}"
+            )
 
     # ------------------------------------------------------------------
 
