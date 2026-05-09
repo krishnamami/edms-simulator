@@ -1207,8 +1207,15 @@ def generate(
 
 
 def s3_sync(local_dir: Path, s3_target: str, dry_run: bool = False) -> int:
-    """Run ``aws s3 sync`` as a subprocess. Returns exit code."""
-    cmd = ["aws", "s3", "sync", str(local_dir), s3_target]
+    """Run ``aws s3 sync`` as a subprocess. Returns exit code.
+
+    Forces ``--sse AES256`` so the put-side encryption overrides the
+    bucket's default KMS encryption (the ECS task role has S3 access
+    but no ``kms:Decrypt`` on the bucket-default key, so KMS-encrypted
+    objects come back as 403/AccessDenied at GetObject time and the
+    connector reads zero docs)."""
+    cmd = ["aws", "s3", "sync", str(local_dir), s3_target,
+           "--sse", "AES256"]
     if dry_run:
         cmd.append("--dryrun")
     print(f"\n+ {' '.join(cmd)}")
