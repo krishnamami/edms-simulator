@@ -520,11 +520,17 @@ def upload_to_s3(local_dir: Path, dest: str, dry_run: bool = False) -> dict:
                 print(f"  [dry-run] would put: s3://{bucket}/{key} ({size} B)")
             else:
                 with path.open("rb") as f:
+                    # Force ``AES256`` (SSE-S3) so ``GetObject`` from the
+                    # ECS task role doesn't require ``kms:Decrypt``.
+                    # The bucket's default encryption is KMS, but the
+                    # explicit ServerSideEncryption header overrides
+                    # the bucket default per object.
                     s3.put_object(
                         Bucket=bucket,
                         Key=key,
                         Body=f.read(),
                         ContentType="application/json",
+                        ServerSideEncryption="AES256",
                     )
             uploaded += 1
             bytes_total += size
