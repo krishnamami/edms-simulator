@@ -62,6 +62,51 @@ class FakePostgresStore:
                 return app
         return None
 
+    async def create_application_from_event(self, event, tenant_id="default"):
+        """In-memory mirror of the PG helper. Idempotent on los_id."""
+        los_id = event["los_id"]
+        existing = await self.get_application_by_los_id(los_id, tenant_id=tenant_id)
+        if existing:
+            return {
+                "application_id":  existing["application_id"],
+                "applicant_id":    existing["applicant_id"],
+                "co_applicant_id": existing.get("co_applicant_id"),
+                "los_id":          los_id,
+            }
+        seq = await self.next_sequence()
+        applicant_id = f"APL-{seq:05d}-P"
+        b = event["borrower"]
+        await self.save_golden_record({
+            "applicant_id": applicant_id, "full_name": f"{b['first_name']} {b['last_name']}",
+            "first_name": b["first_name"], "last_name": b["last_name"],
+            "dob": b["dob"], "ssn_hash": f"hash-{b.get('ssn_last4', '0000')}",
+            "ssn_last4": b.get("ssn_last4"), "email": b.get("email"),
+            "status": "active",
+        }, tenant_id=tenant_id)
+        co_applicant_id = None
+        if event.get("co_borrower"):
+            co_seq = await self.next_sequence()
+            co_applicant_id = f"APL-{co_seq:05d}-P"
+            cb = event["co_borrower"]
+            await self.save_golden_record({
+                "applicant_id": co_applicant_id,
+                "full_name": f"{cb['first_name']} {cb['last_name']}",
+                "first_name": cb["first_name"], "last_name": cb["last_name"],
+                "dob": cb["dob"], "ssn_hash": f"hash-{cb.get('ssn_last4', '0000')}",
+                "ssn_last4": cb.get("ssn_last4"), "email": cb.get("email"),
+                "status": "active",
+            }, tenant_id=tenant_id)
+        application_id = f"APP-{los_id}"
+        await self.save_application({
+            "application_id": application_id, "applicant_id": applicant_id,
+            "co_applicant_id": co_applicant_id, "los_id": los_id,
+            "status": "active",
+        }, tenant_id=tenant_id)
+        return {
+            "application_id": application_id, "applicant_id": applicant_id,
+            "co_applicant_id": co_applicant_id, "los_id": los_id,
+        }
+
     async def get_application(self, application_id, tenant_id="default"):
         app = self.applications.get(application_id)
         if app and app.get("tenant_id", "default") != tenant_id:
@@ -191,10 +236,17 @@ class FakePostgresStore:
         self, entity_id, entity_type, application_id, state,
         document_count=0, graph_edge_count=0, conflict_count=0,
         completeness_pct=0.0, tenant_id="default",
+        legacy_ids=None,
     ):
         if not hasattr(self, "_entity_states"):
             self._entity_states = {}
         from datetime import datetime, timezone
+        # Mirror production's JSONB ``||`` merge so test code observes
+        # the same accumulator semantics — new keys win, but existing
+        # keys not in the new dict are preserved across upserts.
+        prior = self._entity_states.get(entity_id, {})
+        merged_legacy = dict(prior.get("legacy_ids") or {})
+        merged_legacy.update(legacy_ids or {})
         self._entity_states[entity_id] = {
             "entity_id":        entity_id,
             "entity_type":      entity_type,
@@ -205,6 +257,7 @@ class FakePostgresStore:
             "graph_edge_count": int(graph_edge_count),
             "conflict_count":   int(conflict_count),
             "completeness_pct": float(completeness_pct),
+            "legacy_ids":       merged_legacy,
             "last_updated":     datetime.now(timezone.utc),
         }
 

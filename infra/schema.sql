@@ -681,6 +681,27 @@ CREATE INDEX IF NOT EXISTS idx_graph_build_runs_tenant
     ON graph_build_runs(tenant_id, build_date DESC);
 
 -- =====================================================================
+-- v3 additions — legacy_ids accumulator on entity rows so a
+-- multi-system reconciliation can stitch back to the originating IDs
+-- (encompass_loan_number, MERC-RPT-2026-1019, FA-TC-2026-78901, …).
+-- ``source_document_id`` + ``source_channel`` on document_index let a
+-- downstream consumer trace each row to the system that emitted it.
+-- All four ALTERs are additive + idempotent — safe to re-run on every
+-- container boot via core.storage.migrations.apply_schema().
+-- =====================================================================
+ALTER TABLE entity_states
+    ADD COLUMN IF NOT EXISTS legacy_ids JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE entity_snapshots
+    ADD COLUMN IF NOT EXISTS legacy_ids JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE document_index
+    ADD COLUMN IF NOT EXISTS source_document_id VARCHAR(200);
+ALTER TABLE document_index
+    ADD COLUMN IF NOT EXISTS source_channel VARCHAR(100);
+CREATE INDEX IF NOT EXISTS idx_doc_source_channel
+    ON document_index(source_channel)
+    WHERE source_channel IS NOT NULL;
+
+-- =====================================================================
 -- Webhook outbox — async delivery decouples upload latency from
 -- subscriber availability. Every assembly fan-out writes a row here;
 -- a background worker (core/webhooks/delivery_worker.py) polls

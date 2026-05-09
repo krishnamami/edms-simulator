@@ -99,13 +99,14 @@ class IncrementalGraphBuilder:
         t0         = time.perf_counter()
 
         stats = {
-            "documents_pulled":     0,
-            "documents_new":        0,
-            "documents_skipped":    0,
-            "documents_classified": 0,    # AI-Vision step 2.4 successes
-            "entities_updated":     0,
-            "edges_created":        0,
-            "duration_ms":          0,
+            "documents_pulled":      0,
+            "documents_new":         0,
+            "documents_skipped":     0,
+            "documents_classified":  0,    # AI-Vision step 2.4 successes
+            "applications_created":  0,    # v3 step 2.0 (loan_origination)
+            "entities_updated":      0,
+            "edges_created":         0,
+            "duration_ms":           0,
         }
 
         wm_from = await self.connector.get_watermark()
@@ -140,6 +141,59 @@ class IncrementalGraphBuilder:
                 stats, started_at, tenant_id=tenant_id,
             )
             return stats
+
+        # ── Step 2.0: process v3 loan_application_submitted events ───
+        # The v3 simulator emits one ``loan_origination/{los_id}_
+        # application.json`` per loan with ``event_type ==
+        # 'loan_application_submitted'``. Process these BEFORE los_id
+        # resolution so the apps + applicants exist when the rest of
+        # the day's docs hit the resolver. Idempotent: PG helper checks
+        # for an existing row and returns it on re-pull, so resetting
+        # the watermark + replaying the bucket doesn't double-create.
+        application_events = [
+            d for d in new_docs
+            if d.get("event_type") == "loan_application_submitted"
+        ]
+        legacy_ids_by_los: dict[str, dict] = {}
+        if application_events:
+            create_event = getattr(self.pg, "create_application_from_event", None)
+            for evt in application_events:
+                los_id = evt.get("los_id")
+                if not los_id:
+                    continue
+                # Stash the legacy_ids the event carries — the builder
+                # threads these into upsert_entity_state when the same
+                # los_id's docs land later in this same tick.
+                legacy = dict(evt.get("legacy_ids") or {})
+                legacy.setdefault("los_id", los_id)
+                legacy_ids_by_los[los_id] = legacy
+                if create_event is None:
+                    logger.debug(
+                        "create_application_from_event_unavailable "
+                        f"pg={type(self.pg).__name__}"
+                    )
+                    continue
+                try:
+                    result = await create_event(evt, tenant_id=tenant_id)
+                    stats["applications_created"] += 1
+                    logger.info(
+                        f"application_created los_id={los_id} "
+                        f"applicant_id={result.get('applicant_id')} "
+                        f"co_applicant_id={result.get('co_applicant_id')} "
+                        f"application_id={result.get('application_id')}"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"create_application_failed los_id={los_id} "
+                        f"error_type={type(exc).__name__} "
+                        f"error={str(exc)[:200]}"
+                    )
+            # Drop the events from new_docs — they're not real documents
+            # and the persist gate would otherwise try to FK them.
+            new_docs = [
+                d for d in new_docs
+                if d.get("event_type") != "loan_application_submitted"
+            ]
 
         # ── Step 2.4: AI-Vision classify shared-drive scans ──────────
         # Connector synthesises ``UNKNOWN`` docs with
@@ -307,6 +361,22 @@ class IncrementalGraphBuilder:
             except Exception:
                 edge_count = conflict_count = 0
 
+            # Accumulate legacy_ids for this applicant from (a) the
+            # loan_origination event's encompass IDs (when the same
+            # los_id surfaced earlier in this tick) and (b) every
+            # source_document_id docs in ``new_docs`` carry. PG merges
+            # via JSONB ``||`` so the column grows over time.
+            los_id_for_entity = first_doc.get("los_id")
+            legacy_for_entity: dict = {}
+            if los_id_for_entity and los_id_for_entity in legacy_ids_by_los:
+                legacy_for_entity.update(legacy_ids_by_los[los_id_for_entity])
+            src_ids = sorted({
+                d.get("source_document_id") for d in new_docs
+                if d.get("applicant_id") == applicant_id
+                and d.get("source_document_id")
+            })
+            if src_ids:
+                legacy_for_entity["source_document_ids"] = src_ids
             try:
                 await self.pg.upsert_entity_state(
                     entity_id=applicant_id,
@@ -318,6 +388,7 @@ class IncrementalGraphBuilder:
                     conflict_count=conflict_count,
                     completeness_pct=completeness,
                     tenant_id=tenant_id,
+                    legacy_ids=legacy_for_entity,
                 )
                 stats["entities_updated"] += 1
             except Exception as exc:
@@ -465,19 +536,23 @@ class IncrementalGraphBuilder:
     def _build_save_doc(doc: dict) -> dict:
         """Coerce the connector's flat shape to the ``save_document``
         contract — the existing PG store expects ``document_category``,
-        ``borrower_role`` etc."""
+        ``borrower_role`` etc. v3 docs also carry ``source_document_id``
+        + ``source_channel`` which thread through to the new
+        ``document_index`` columns."""
         return {
-            "document_id":       doc.get("document_id"),
-            "applicant_id":      doc.get("applicant_id"),
-            "application_id":    doc.get("application_id"),
-            "document_type":     doc.get("document_type"),
-            "document_category": doc.get("category") or doc.get("document_category", "income"),
-            "borrower_role":     doc.get("borrower_role", "primary"),
-            "s3_key":            doc.get("s3_key"),
-            "status":            "indexed",
-            "extracted_fields":  doc.get("extracted_fields") or {},
-            "confidence_score":  doc.get("confidence_score") or 0.94,
-            "extraction_method": doc.get("extraction_method") or "caller_supplied",
+            "document_id":         doc.get("document_id"),
+            "applicant_id":        doc.get("applicant_id"),
+            "application_id":      doc.get("application_id"),
+            "document_type":       doc.get("document_type"),
+            "document_category":   doc.get("category") or doc.get("document_category", "income"),
+            "borrower_role":       doc.get("borrower_role", "primary"),
+            "s3_key":              doc.get("s3_key"),
+            "status":              "indexed",
+            "extracted_fields":    doc.get("extracted_fields") or {},
+            "confidence_score":    doc.get("confidence_score") or 0.94,
+            "extraction_method":   doc.get("extraction_method") or "caller_supplied",
+            "source_document_id":  doc.get("source_document_id"),
+            "source_channel":      doc.get("source_channel"),
         }
 
     async def _compose_state(

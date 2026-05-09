@@ -207,6 +207,85 @@ class PostgresStore:
         )
         return _row_to_dict(row)
 
+    async def create_application_from_event(
+        self, event: dict, tenant_id: str = "default",
+    ) -> dict:
+        """Idempotently create the applicant + (optional) co_applicant +
+        application rows from a v3 ``loan_application_submitted`` event.
+
+        Returns ``{"application_id", "applicant_id", "co_applicant_id",
+        "los_id"}``. If the application already exists for this
+        ``los_id`` + ``tenant_id``, returns the existing row without
+        re-inserting — re-pulls from S3 stay safe.
+
+        The connector hands this method the JSON parsed from
+        ``loan_origination/{los_id}_application.json``; the schema is
+        defined by ``scripts/generate_realworld_simulation_v3.py`` —
+        ``borrower`` is required, ``co_borrower`` may be ``null``.
+        """
+        import hashlib
+
+        los_id = event["los_id"]
+        existing = await self.get_application_by_los_id(los_id, tenant_id=tenant_id)
+        if existing:
+            return {
+                "application_id":  existing["application_id"],
+                "applicant_id":    existing["applicant_id"],
+                "co_applicant_id": existing.get("co_applicant_id"),
+                "los_id":          los_id,
+            }
+
+        def _ssn_hash(ssn4: str, dob: str, last_name: str) -> str:
+            seed = f"{ssn4}|{dob}|{last_name.lower()}"
+            return hashlib.sha256(seed.encode()).hexdigest()[:32]
+
+        async def _insert_borrower(b: dict) -> str:
+            seq = await self.next_sequence()
+            applicant_id = f"APL-{seq:05d}-P"
+            gr = {
+                "applicant_id": applicant_id,
+                "full_name":    f"{b['first_name']} {b['last_name']}",
+                "first_name":   b["first_name"],
+                "last_name":    b["last_name"],
+                "dob":          b["dob"],
+                "ssn_hash":     _ssn_hash(b.get("ssn_last4", "0000"),
+                                          b["dob"], b["last_name"]),
+                "ssn_last4":    b.get("ssn_last4"),
+                "email":        b.get("email"),
+                "phone":        b.get("phone"),
+                "address_current": (
+                    {"raw": b["current_address"]}
+                    if isinstance(b.get("current_address"), str)
+                    else b.get("current_address")
+                ),
+                "status":          "active",
+                "identity_xrefs":  [],
+                "application_ids": [],
+            }
+            await self.save_golden_record(gr, tenant_id=tenant_id)
+            return applicant_id
+
+        applicant_id    = await _insert_borrower(event["borrower"])
+        co_applicant_id = None
+        if event.get("co_borrower"):
+            co_applicant_id = await _insert_borrower(event["co_borrower"])
+
+        application_id = f"APP-{los_id}"
+        await self.save_application({
+            "application_id":  application_id,
+            "applicant_id":    applicant_id,
+            "co_applicant_id": co_applicant_id,
+            "los_id":          los_id,
+            "status":          "active",
+        }, tenant_id=tenant_id)
+
+        return {
+            "application_id":  application_id,
+            "applicant_id":    applicant_id,
+            "co_applicant_id": co_applicant_id,
+            "los_id":          los_id,
+        }
+
     async def get_application(
         self, application_id: str, tenant_id: str = "default",
     ) -> Optional[dict]:
@@ -705,10 +784,12 @@ class PostgresStore:
                 document_id, applicant_id, application_id, document_type,
                 document_category, borrower_role, s3_key, status,
                 expiry_date, is_current, extracted_fields, confidence_score,
-                extraction_method, tenant_id
+                extraction_method, tenant_id,
+                source_document_id, source_channel
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8,
-                $9::date, $10, $11::jsonb, $12, $13, $14
+                $9::date, $10, $11::jsonb, $12, $13, $14,
+                $15, $16
             )
             ON CONFLICT (document_id) DO UPDATE SET
                 applicant_id      = EXCLUDED.applicant_id,
@@ -723,6 +804,10 @@ class PostgresStore:
                 extracted_fields  = EXCLUDED.extracted_fields,
                 confidence_score  = EXCLUDED.confidence_score,
                 tenant_id         = EXCLUDED.tenant_id,
+                source_document_id = COALESCE(EXCLUDED.source_document_id,
+                                              document_index.source_document_id),
+                source_channel     = COALESCE(EXCLUDED.source_channel,
+                                              document_index.source_channel),
                 extraction_method = CASE
                     WHEN document_index.extraction_method = 'deterministic'
                          OR EXCLUDED.extraction_method = 'deterministic'
@@ -750,6 +835,8 @@ class PostgresStore:
             doc.get("confidence_score"),
             doc.get("extraction_method") or "none",
             tenant_id,
+            doc.get("source_document_id"),
+            doc.get("source_channel"),
         )
 
     async def get_document(self, document_id: str) -> Optional[dict]:
@@ -2238,15 +2325,21 @@ class PostgresStore:
         conflict_count: int = 0,
         completeness_pct: float = 0.0,
         tenant_id: str = "default",
+        legacy_ids: Optional[dict] = None,
     ) -> None:
+        # ``legacy_ids`` is JSONB-merged on conflict (existing || new), so
+        # caller can pass just the IDs that arrived this tick and the
+        # accumulator grows over time. Pass ``{}`` (default) to leave the
+        # existing value untouched.
         await db.execute(
             """
             INSERT INTO entity_states (
                 entity_id, entity_type, application_id, tenant_id,
                 state, document_count, graph_edge_count, conflict_count,
-                completeness_pct, last_updated, created_at
+                completeness_pct, legacy_ids, last_updated, created_at
             ) VALUES (
-                $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, NOW(), NOW()
+                $1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9,
+                $10::jsonb, NOW(), NOW()
             )
             ON CONFLICT (entity_id) DO UPDATE SET
                 entity_type      = EXCLUDED.entity_type,
@@ -2257,12 +2350,15 @@ class PostgresStore:
                 graph_edge_count = EXCLUDED.graph_edge_count,
                 conflict_count   = EXCLUDED.conflict_count,
                 completeness_pct = EXCLUDED.completeness_pct,
+                legacy_ids       = entity_states.legacy_ids
+                                     || EXCLUDED.legacy_ids,
                 last_updated     = NOW()
             """,
             entity_id, entity_type, application_id, tenant_id,
             _to_jsonb(state),
             int(document_count), int(graph_edge_count),
             int(conflict_count), float(completeness_pct),
+            _to_jsonb(legacy_ids or {}),
         )
 
     async def get_entity_state(
@@ -2272,7 +2368,7 @@ class PostgresStore:
             """
             SELECT entity_id, entity_type, application_id, tenant_id,
                    state, document_count, graph_edge_count, conflict_count,
-                   completeness_pct, last_updated, created_at
+                   completeness_pct, legacy_ids, last_updated, created_at
               FROM entity_states
              WHERE entity_id = $1 AND tenant_id = $2
             """,

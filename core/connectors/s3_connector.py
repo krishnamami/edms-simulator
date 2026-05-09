@@ -46,6 +46,7 @@ Two source modes:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -64,17 +65,52 @@ _WATERMARK_EPOCH = "1970-01-01T00:00:00+00:00"
 # Channel dispatch — keep these as constants so a v2 backwards-compat
 # extension only requires one edit.
 _INDIVIDUAL_JSON_CHANNELS = {
+    # v2 channels
     "edms_pull", "vendor_equifax", "vendor_corelogic", "ai_chat",
+    # v3 additions — every JSON-only system feed
+    "los_openclose",
+    "vendor_experian", "vendor_transunion", "vendor_lexisnexis",
+    "vendor_finicity", "vendor_plaid",
+    "vendor_mi_mgic", "vendor_mi_radian",
+    "employer_adp", "employer_paychex", "employer_gusto", "employer_workday",
+    "ssa_gov", "va_gov", "irs_ives",
+    "servicer_current", "compliance", "loan_officer_notes",
 }
 _BATCH_JSON_CHANNELS = {"los_encompass"}
-_META_PAIR_CHANNELS  = {"email_inbox", "borrower_portal", "vendor_title"}
-_RAW_SCAN_CHANNELS   = {"shared_drive"}
+_META_PAIR_CHANNELS  = {
+    # v2
+    "email_inbox", "borrower_portal", "vendor_title",
+    # v3 additions — every channel that drops .pdf + _meta.json pairs
+    "appraisal_mercury", "appraisal_corelogic_amc",
+    "title_first_american", "title_chicago", "title_stewart",
+    "insurance_statefarm", "insurance_allstate",
+    "insurance_flood_nfip", "insurance_wind_hail", "insurance_condo_ho6",
+    "closing_agent",
+    "hoa_management", "condo_project",
+    "conditions_response", "corrections", "attorney_legal",
+}
+_RAW_SCAN_CHANNELS   = {
+    "shared_drive",
+    # v3 PDF-only channels — no metadata, force AI Vision classification
+    "employer_manual",
+    "appraisal_manual", "title_manual_drop",
+    "insurance_manual_drop", "irs_manual",
+}
+_CSV_CHANNELS  = {"los_bytepro"}
+_XML_CHANNELS  = {"mismo_feed"}
+_APPLICATION_EVENT_CHANNELS = {"loan_origination"}
+
 _KNOWN_CHANNELS = (
     _INDIVIDUAL_JSON_CHANNELS
     | _BATCH_JSON_CHANNELS
     | _META_PAIR_CHANNELS
     | _RAW_SCAN_CHANNELS
+    | _CSV_CHANNELS
+    | _XML_CHANNELS
+    | _APPLICATION_EVENT_CHANNELS
 )
+_V3_STAGE_DIRS = {"loan_origination", "post_application"}
+
 # Suffixes the meta-pair + raw-scan handlers treat as "evidence files"
 # (the actual document binary, separate from the JSON metadata).
 _EVIDENCE_SUFFIXES = (".pdf", ".jpg", ".jpeg", ".png")
@@ -86,6 +122,21 @@ def _parse_iso(value: str) -> datetime:
     cleaned = value[:-1] + "+00:00" if value.endswith("Z") else value
     ts = datetime.fromisoformat(cleaned)
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def _coerce_num(value):
+    """Best-effort numeric coercion for fields parsed out of XML / CSV.
+    Returns ``None`` for empty / unparseable inputs (the assemblers'
+    ``_f()`` helper handles None safely)."""
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
 
 
 class S3EDMSConnector(BaseEDMSConnector):
@@ -402,14 +453,48 @@ class S3EDMSConnector(BaseEDMSConnector):
         """Yield ``(channel_name, channel_path)`` pairs for each known
         channel sub-folder within a date folder.
 
-        If no known-channel sub-folder is found the date folder is
-        treated as v1 legacy: a single ``("legacy", folder_path)`` pair
-        is yielded so the dispatcher can recursively scan ``.json``
-        files (the original behaviour pre-channel-dispatch)."""
+        Three layouts supported:
+
+        - **v3** — date folder contains ``loan_origination/`` and/or
+          ``post_application/`` sub-dirs. ``loan_origination/`` is yielded
+          first so the builder can create applications before docs land.
+          Then every channel sub-folder under ``post_application/`` is
+          yielded individually.
+        - **v2** — date folder contains channel sub-folders directly
+          (``edms_pull/``, ``los_encompass/``, ...). All known channels
+          are yielded.
+        - **legacy** — no known channel sub-folder found. A single
+          ``("legacy", folder_path)`` pair is yielded so the dispatcher
+          can recursively scan ``.json`` files (the original behaviour
+          pre-channel-dispatch)."""
         if self.is_local:
             sub_dirs = [
                 c for c in sorted(Path(folder_path).iterdir()) if c.is_dir()
             ]
+            sub_names = {c.name for c in sub_dirs}
+
+            # v3 detection — origination + post_application split
+            if sub_names & _V3_STAGE_DIRS:
+                # Yield loan_origination first so the builder creates apps
+                # before any post-application docs need los_id resolution.
+                for c in sub_dirs:
+                    if c.name == "loan_origination":
+                        yield c.name, c
+                # Walk post_application/{channel}/
+                for c in sub_dirs:
+                    if c.name != "post_application":
+                        continue
+                    for chan in sorted(d for d in c.iterdir() if d.is_dir()):
+                        if chan.name in _KNOWN_CHANNELS:
+                            yield chan.name, chan
+                        else:
+                            logger.debug(
+                                "v3_unknown_channel_subfolder",
+                                extra={"name": chan.name, "path": str(chan)},
+                            )
+                return
+
+            # v2 — flat known-channel sub-folders
             known = [c for c in sub_dirs if c.name in _KNOWN_CHANNELS]
             if known:
                 for c in known:
@@ -434,6 +519,46 @@ class S3EDMSConnector(BaseEDMSConnector):
             cp.get("Prefix", "") for cp in (result.get("CommonPrefixes") or [])
         ]
         sub_names = [sp.rstrip("/").rsplit("/", 1)[-1] for sp in sub_prefixes]
+        is_truncated = bool(result.get("IsTruncated"))
+        contents_count = len(result.get("Contents") or [])
+
+        # v3 detection on S3 — same idea as local mode but the channel
+        # sub-folders live under post_application/ which needs another
+        # list_objects_v2 call.
+        if set(sub_names) & _V3_STAGE_DIRS:
+            for sp, name in zip(sub_prefixes, sub_names):
+                if name == "loan_origination":
+                    yield name, sp
+            for sp, name in zip(sub_prefixes, sub_names):
+                if name != "post_application":
+                    continue
+                inner = s3.list_objects_v2(
+                    Bucket=self._bucket, Prefix=sp, Delimiter="/",
+                )
+                inner_prefixes = [
+                    cp.get("Prefix", "")
+                    for cp in (inner.get("CommonPrefixes") or [])
+                ]
+                inner_names = [
+                    p.rstrip("/").rsplit("/", 1)[-1] for p in inner_prefixes
+                ]
+                known_inner = [
+                    (n, p) for p, n in zip(inner_prefixes, inner_names)
+                    if n in _KNOWN_CHANNELS
+                ]
+                unknown_inner = [
+                    n for n in inner_names if n not in _KNOWN_CHANNELS
+                ]
+                logger.info(
+                    f"s3_iter_v3_channels prefix={sp!r} "
+                    f"channels={len(known_inner)} "
+                    f"known=[{','.join(n for n, _ in known_inner) or '-'}] "
+                    f"unknown=[{','.join(unknown_inner) or '-'}]"
+                )
+                for chan, p in known_inner:
+                    yield chan, p
+            return
+
         known: list[tuple[str, str]] = []
         unknown: list[str] = []
         for sp, name in zip(sub_prefixes, sub_names):
@@ -442,13 +567,6 @@ class S3EDMSConnector(BaseEDMSConnector):
             else:
                 unknown.append(name)
 
-        # Emit the channel-discovery diagnostic at INFO so CloudWatch
-        # surfaces it even with the default stdlib formatter. If
-        # ``common_prefixes`` is 0 here that's the smoking gun — the
-        # bucket contents under this date folder don't sit in immediate
-        # sub-folders, so the v1 legacy recursive scan kicks in.
-        is_truncated = bool(result.get("IsTruncated"))
-        contents_count = len(result.get("Contents") or [])
         known_str   = ",".join(n for n, _ in known) or "-"
         unknown_str = ",".join(unknown) or "-"
         logger.info(
@@ -578,6 +696,69 @@ class S3EDMSConnector(BaseEDMSConnector):
                 ), f
             return
 
+        if channel_name in _APPLICATION_EVENT_CHANNELS:
+            # ``loan_origination/{los_id}_application.json`` — yielded
+            # with ``event_type`` set so the builder can route it into
+            # ``pg.create_application_from_event`` BEFORE post_application
+            # docs need los_id resolution. We still pass through the
+            # standard funnel (received_at filter etc.); a missing /
+            # malformed received_at falls into the same no_received_at
+            # bucket as everything else.
+            for f in self._iter_files_with_suffix(channel_path, ".json"):
+                payload = self._safe_read_json(f)
+                if payload is None or not isinstance(payload, dict):
+                    yield None, f
+                    continue
+                payload["source_channel"] = (
+                    payload.get("source_channel") or channel_name
+                )
+                # Tag explicitly so the builder's step 2.0 picks it up
+                # even on shared funnel iteration.
+                payload.setdefault("event_type", "loan_application_submitted")
+                # Synthesise a document_id so downstream code paths that
+                # expect one (logs / dedup) don't choke.
+                if not payload.get("document_id"):
+                    payload["document_id"] = (
+                        f"APP-EVENT-{payload.get('los_id', 'UNKNOWN')}"
+                    )
+                # event_type docs aren't real documents; tag with a
+                # sentinel doc-type so the builder's persist gate skips
+                # them (no document_index row created).
+                payload.setdefault("document_type", "APPLICATION_EVENT")
+                payload.setdefault("category",      "process")
+                yield payload, f
+            return
+
+        if channel_name in _CSV_CHANNELS:
+            # BytePro snapshots — header + rows. Each row → one doc dict.
+            # Numeric columns are kept as strings; downstream consumers
+            # can coerce. CSV parse errors mark the file as read_failed.
+            for f in self._iter_files_with_suffix(channel_path, ".csv"):
+                rows = self._safe_read_csv(f)
+                if rows is None:
+                    yield None, f
+                    continue
+                for r in rows:
+                    if not r:
+                        continue
+                    doc = {**r, "source_channel": channel_name}
+                    if not doc.get("document_id"):
+                        doc["document_id"] = (
+                            f"{channel_name.upper()}-CSV-"
+                            f"{folder_date.isoformat()}-{r.get('los_id', '?')}"
+                        )
+                    yield doc, f
+            return
+
+        if channel_name in _XML_CHANNELS:
+            # MISMO 3.4 envelope — extract the LoanIdentifier + key terms.
+            # Returns one doc per envelope (each XML file is one loan
+            # message in our v3 generator).
+            for f in self._iter_files_with_suffix(channel_path, ".xml"):
+                doc = self._parse_mismo_xml(f, folder_date, channel_name)
+                yield doc, f      # doc is None on parse failure
+            return
+
         # Unknown channel — log + skip rather than fail loudly.
         logger.debug(
             "connector_unknown_channel",
@@ -667,6 +848,105 @@ class S3EDMSConnector(BaseEDMSConnector):
         obj = s3.get_object(Bucket=self._bucket, Key=str(path))
         body = obj["Body"].read()
         return json.loads(body.decode("utf-8"))
+
+    def _read_text(self, path: Any) -> str:
+        """Read CSV / XML / arbitrary text in either mode. Connector
+        callers already log + count failures, so we let exceptions
+        propagate up."""
+        if self.is_local:
+            return Path(path).read_text(encoding="utf-8")
+        s3 = self._s3()
+        obj = s3.get_object(Bucket=self._bucket, Key=str(path))
+        return obj["Body"].read().decode("utf-8")
+
+    def _safe_read_csv(self, path: Any) -> Optional[list[dict]]:
+        """Parse a CSV (header + rows). Returns one ``dict`` per row;
+        falls back to ``None`` on read failure (caller bumps the
+        ``read_failed`` counter)."""
+        try:
+            text = self._read_text(path)
+        except Exception as exc:
+            logger.warning(
+                f"connector_doc_read_failed format=csv path={path} "
+                f"error_type={type(exc).__name__} error={str(exc)[:300]}"
+            )
+            return None
+        try:
+            import csv as _csv
+            reader = _csv.DictReader(io.StringIO(text))
+            return [dict(row) for row in reader]
+        except Exception as exc:
+            logger.warning(
+                f"connector_csv_parse_failed path={path} "
+                f"error_type={type(exc).__name__} error={str(exc)[:300]}"
+            )
+            return None
+
+    def _parse_mismo_xml(
+        self, path: Any, folder_date: date, channel_name: str,
+    ) -> Optional[dict]:
+        """Parse a MISMO 3.4 envelope and emit one ``doc`` dict per
+        message with the loan/borrower fields the reconciler reads.
+
+        We intentionally only extract the keys the v3 generator writes
+        (LoanIdentifier, BaseLoanAmount, NoteRatePercent, FirstName/
+        LastName, LoanPurposeType, MessageDateTime). A richer mapping
+        can grow here as more upstream feeds appear; parse failures
+        return ``None`` so the caller marks the file ``read_failed``."""
+        try:
+            text = self._read_text(path)
+        except Exception as exc:
+            logger.warning(
+                f"connector_doc_read_failed format=xml path={path} "
+                f"error_type={type(exc).__name__} error={str(exc)[:300]}"
+            )
+            return None
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(text)
+        except Exception as exc:
+            logger.warning(
+                f"connector_xml_parse_failed path={path} "
+                f"error_type={type(exc).__name__} error={str(exc)[:300]}"
+            )
+            return None
+
+        # MISMO uses the residential 2009 namespace by convention. Use
+        # local-name() matching so we don't have to thread the namespace
+        # URI through every find().
+        def _f(elem, tag):
+            for child in elem.iter():
+                if child.tag.split("}")[-1] == tag:
+                    return (child.text or "").strip()
+            return None
+
+        los_id    = _f(root, "LoanIdentifier") or ""
+        loan_amt  = _f(root, "BaseLoanAmount")
+        rate      = _f(root, "NoteRatePercent")
+        first     = _f(root, "FirstName") or ""
+        last      = _f(root, "LastName") or ""
+        purpose   = _f(root, "LoanPurposeType") or ""
+        msg_dt    = root.attrib.get("MessageDateTime")
+        received  = msg_dt or f"{folder_date.isoformat()}T12:00:00Z"
+
+        fname = self._basename(path)
+        return {
+            "document_id":      f"MISMO-{fname}",
+            "document_type":    "URLA_MISMO_3.4",
+            "category":         "loan_terms",
+            "los_id":           los_id,
+            "borrower_role":    "primary",
+            "source_channel":   channel_name,
+            "source_system":    "MISMO_3.4",
+            "received_at":      received,
+            "extracted_fields": {
+                "borrower_first_name": first,
+                "borrower_last_name":  last,
+                "loan_amount":         _coerce_num(loan_amt),
+                "interest_rate":       _coerce_num(rate),
+                "loan_purpose":        purpose.lower() if purpose else None,
+            },
+        }
 
     def get_evidence_bytes(self, path: Any) -> bytes:
         """Return the raw bytes of an evidence file (PDF / JPG) referenced
