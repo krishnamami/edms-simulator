@@ -25,8 +25,9 @@
         {"name": "USE_LOCAL_STORAGE", "value": "false"},
         {"name": "USE_FAKE_REDIS", "value": "false"},
         {"name": "ENABLE_SCHEDULE_ENGINE", "value": "true"},
-        {"name": "S3_SIMULATION_SOURCE", "value": "s3://edms-simulator-loans/s3_simulation_v2"}
-
+        {"name": "S3_SIMULATION_SOURCE", "value": "s3://edms-simulator-loans/s3_simulation_v2"},
+        {"name": "ENABLE_AI_EXTRACTION", "value": "true"},
+        {"name": "AI_EXTRACTION_MAX_PAGES", "value": "3"}
       ],
       "secrets": [
         {
@@ -43,9 +44,8 @@
         },
         {
           "name": "ANTHROPIC_API_KEY",
-          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/anthropic/api-key-XXXXXX:ANTHROPIC_API_KEY::"
-  }
-
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/anthropic/api-key-aTldwm"
+        }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
