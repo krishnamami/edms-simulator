@@ -76,6 +76,47 @@ _EXPECTED_FIELDS: dict[str, str] = {
     "AVM_REPORT":                "avm_value, confidence_score, model_name, effective_date",
     "CREDIT_EXPLANATION":        "explanation_type, creditor, reason, resolved",
     "CREDIT_EXPLANATION_LETTER": "explanation_type, creditor, reason, resolved",
+    # Income — W-2 / paystub
+    "W2_CURRENT":                "box1_wages, box2_federal_tax, employer_name, employer_ein, employee_name, employee_ssn_last4, tax_year, state, state_wages, state_tax",
+    "W2_PRIOR":                  "box1_wages, box2_federal_tax, employer_name, employer_ein, employee_name, tax_year, state, state_wages",
+    "PAYSTUB_CURRENT":           "ytd_gross, pay_period_end, pay_frequency, employer_name, base_salary, net_pay, federal_tax_withheld, hours_worked",
+    "PAYSTUB":                   "ytd_gross, pay_period_end, pay_frequency, employer_name, base_salary, net_pay",
+    # Credit
+    "CREDIT_REPORT":             "mid_score, experian_score, transunion_score, equifax_score, tradeline_count, total_monthly_payments, derogatory_count, collections_count, active_bankruptcy, oldest_tradeline",
+    # Bank statements — multi-page so the field hint helps Claude know
+    # which numbers to surface (the running ledger easily distracts).
+    "BANK_STATEMENT_M1":         "ending_balance, beginning_balance, avg_daily_balance, total_deposits, total_withdrawals, institution, account_type, account_last4, statement_period_start, statement_period_end, nsf_count, largest_deposit",
+    "BANK_STATEMENT_M2":         "ending_balance, beginning_balance, avg_daily_balance, total_deposits, total_withdrawals, institution, account_type, statement_period_start, statement_period_end",
+    "BANK_STATEMENT_M3":         "ending_balance, beginning_balance, avg_daily_balance, total_deposits, total_withdrawals, institution, account_type",
+    # Property — appraisals + tax / HOA / condo addenda
+    "APPRAISAL_URAR":            "appraised_value, property_address, property_type, year_built, gla_sqft, lot_size_sqft, bedrooms, bathrooms, condition, quality, comparable_1_price, comparable_2_price, comparable_3_price, effective_date, market_trend",
+    "APPRAISAL_URAR_1073":       "appraised_value, property_address, property_type, year_built, gla_sqft, bedrooms, bathrooms, condition, effective_date",
+    "APPRAISAL_UPDATE":          "original_value, updated_value, update_date, days_since_original",
+    "TITLE_COMMITMENT":          "commitment_number, effective_date, policy_amount, vesting, exceptions_count, tax_lien_clear, judgment_lien_clear",
+    "TITLE_INSURANCE":           "policy_number, policy_amount, effective_date, insured_name",
+    "HOI_BINDER":                "policy_number, annual_premium, coverage_dwelling, deductible, carrier, effective_date",
+    "HOI_BINDER_HO6":            "policy_number, annual_premium, coverage_dwelling, deductible, carrier, effective_date",
+    "FLOOD_CERT":                "flood_zone, requires_insurance, firm_panel, determination_date",
+    "PROPERTY_TAX_BILL":         "annual_tax, assessed_value, tax_year, property_address",
+    # Vendor returns
+    "VOE_TWN":                   "employer_name, employment_status, hire_date, income_amount, income_frequency, position, verification_date",
+    "DRIVERS_LICENSE":           "dl_number, state, expiry_date, name, dob",
+    "SSN_VALIDATION":            "ssn_valid, name_match, dob_match, deceased_indicator",
+    "OFAC_CHECK":                "ofac_clear, sdn_match, pep_match, adverse_media",
+    "AUS_DU_FINDINGS":           "recommendation, risk_class, casefile_id, conditions_count",
+    # Fixed-income source docs
+    "SSA_AWARD_LETTER":          "monthly_benefit, effective_date, benefit_type",
+    "PENSION_LETTER":            "monthly_benefit, employer_name, retirement_date, benefit_type",
+    # Condo / HOA / inspection addenda
+    "HOA_CERT":                  "monthly_dues, special_assessments, reserve_balance, litigation_pending",
+    "CONDO_QUESTIONNAIRE":       "total_units, owner_occupied_pct, reserve_balance, litigation_pending, insurance_adequate",
+    "SURVEY":                    "lot_dimensions, easements, encroachments",
+    "WDO_REPORT":                "findings, treatment_required, structural_damage",
+    "WELL_SEPTIC_INSPECTION":    "well_flow_rate_gpm, water_quality, septic_condition, septic_type",
+    "WIND_HAIL_INSURANCE":       "annual_premium, carrier, deductible, coverage_amount",
+    # Other
+    "LEASE_AGREEMENT":           "monthly_rent, lease_start, lease_end, tenant_name, property_address",
+    "DIVORCE_DECREE":            "decree_date, alimony_amount, alimony_frequency, child_support_amount, division_of_assets",
 }
 
 
