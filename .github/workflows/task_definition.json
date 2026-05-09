@@ -40,7 +40,12 @@
         {
           "name": "API_KEY",
           "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/api/keys"
-        }
+        },
+        {
+          "name": "ANTHROPIC_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:621646470377:secret:edms/anthropic/api-key-XXXXXX:ANTHROPIC_API_KEY::"
+  }
+
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
