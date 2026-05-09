@@ -234,7 +234,8 @@ class S3EDMSConnector(BaseEDMSConnector):
         filtered_pre   = 0
         filtered_post  = 0
         no_received_at = 0
-        by_channel: dict[str, int] = {}
+        by_channel:      dict[str, int] = {}     # post-filter accept
+        by_channel_seen: dict[str, int] = {}     # pre-filter raw yields
 
         docs: list[dict] = []
         for folder_date, folder_path in self._iter_date_folders():
@@ -247,12 +248,20 @@ class S3EDMSConnector(BaseEDMSConnector):
 
             folder_files    = 0
             folder_accepted = 0
+            folder_by_channel:      dict[str, int] = {}    # raw yields
+            folder_by_channel_acc:  dict[str, int] = {}    # post-filter
             for channel_name, channel_path in self._iter_channels(folder_path):
                 for doc, source_path in self._iter_channel_docs(
                     channel_name, channel_path, folder_date,
                 ):
                     folder_files += 1
                     total_files  += 1
+                    folder_by_channel[channel_name] = (
+                        folder_by_channel.get(channel_name, 0) + 1
+                    )
+                    by_channel_seen[channel_name] = (
+                        by_channel_seen.get(channel_name, 0) + 1
+                    )
                     if doc is None:
                         # Reader already logged; bump counter and move on.
                         read_failed += 1
@@ -278,18 +287,25 @@ class S3EDMSConnector(BaseEDMSConnector):
                     by_channel[channel_name] = (
                         by_channel.get(channel_name, 0) + 1
                     )
+                    folder_by_channel_acc[channel_name] = (
+                        folder_by_channel_acc.get(channel_name, 0) + 1
+                    )
 
+            seen_brk = ",".join(f"{k}={v}" for k, v in sorted(folder_by_channel.items())) or "-"
+            acc_brk  = ",".join(f"{k}={v}" for k, v in sorted(folder_by_channel_acc.items())) or "-"
             logger.info(
                 f"connector_folder_scanned date={folder_date.isoformat()} "
                 f"files={folder_files} accepted={folder_accepted} "
-                f"folder={folder_path}"
+                f"folder={folder_path} "
+                f"by_channel_seen={seen_brk} by_channel_accepted={acc_brk}"
             )
 
         docs.sort(key=lambda d: (d.get("received_at"), d.get("document_id")))
         # Inline funnel + by_channel stats so the production stdlib
         # formatter surfaces them in CloudWatch — ``extra={}`` is dropped
         # by the default formatter and won't show up there.
-        chan_str = ",".join(f"{k}={v}" for k, v in sorted(by_channel.items())) or "-"
+        chan_acc  = ",".join(f"{k}={v}" for k, v in sorted(by_channel.items())) or "-"
+        chan_seen = ",".join(f"{k}={v}" for k, v in sorted(by_channel_seen.items())) or "-"
         logger.info(
             "connector_pull_complete "
             f"folders_total={folder_count} folders_in_win={in_window} "
@@ -297,10 +313,12 @@ class S3EDMSConnector(BaseEDMSConnector):
             f"no_received_at={no_received_at} "
             f"filtered_pre_wm={filtered_pre} filtered_post={filtered_post} "
             f"accepted={len(docs)} "
-            f"by_channel={chan_str} "
+            f"by_channel_seen={chan_seen} "
+            f"by_channel_accepted={chan_acc} "
             f"bucket={getattr(self, '_bucket', None)} "
             f"prefix={getattr(self, '_prefix', None)} "
-            f"watermark={wm.isoformat()}"
+            f"watermark={wm.isoformat()} "
+            f"until={(upper.isoformat() if upper else 'None')}"
         )
         return docs
 
@@ -336,12 +354,13 @@ class S3EDMSConnector(BaseEDMSConnector):
         # CommonPrefixes entry.
         base = (f"{self._prefix}/" if self._prefix else "")
         logger.info(
-            "s3_list_date_folders_start",
-            extra={"bucket": self._bucket, "prefix": base},
+            f"s3_list_date_folders_call bucket={self._bucket} "
+            f"prefix={base!r} delimiter=/"
         )
         s3 = self._s3()
         paginator = s3.get_paginator("list_objects_v2")
         seen: set[str] = set()
+        non_date_skipped: list[str] = []
         page_count = 0
         common_prefix_count = 0
         for page in paginator.paginate(
@@ -359,16 +378,21 @@ class S3EDMSConnector(BaseEDMSConnector):
                 try:
                     d = datetime.strptime(name, "%Y-%m-%d").date()
                 except ValueError:
-                    logger.debug(
-                        "s3_skip_non_date_folder",
-                        extra={"prefix": p, "name": name},
+                    # Surface the rejected sub-prefix at INFO so a
+                    # mis-shaped bucket (e.g. extra ``raw/`` directory
+                    # alongside the dated ones) is visible in CloudWatch.
+                    non_date_skipped.append(name)
+                    logger.info(
+                        f"s3_skip_non_date_folder prefix={p!r} name={name!r}"
                     )
                     continue
                 yield d, p  # full S3 prefix incl. trailing slash
+        skip_str = ",".join(non_date_skipped) or "-"
         logger.info(
             f"s3_list_date_folders_complete bucket={self._bucket} "
             f"prefix={base!r} pages={page_count} "
-            f"common_prefixes={common_prefix_count} date_folders={len(seen)}"
+            f"common_prefixes={common_prefix_count} date_folders={len(seen)} "
+            f"non_date_skipped=[{skip_str}]"
         )
 
     def _iter_channels(self, folder_path: Any) -> Iterable[tuple[str, Any]]:
@@ -406,17 +430,46 @@ class S3EDMSConnector(BaseEDMSConnector):
         sub_prefixes = [
             cp.get("Prefix", "") for cp in (result.get("CommonPrefixes") or [])
         ]
+        sub_names = [sp.rstrip("/").rsplit("/", 1)[-1] for sp in sub_prefixes]
         known: list[tuple[str, str]] = []
-        for sp in sub_prefixes:
-            name = sp.rstrip("/").rsplit("/", 1)[-1]
+        unknown: list[str] = []
+        for sp, name in zip(sub_prefixes, sub_names):
             if name in _KNOWN_CHANNELS:
                 known.append((name, sp))
+            else:
+                unknown.append(name)
+
+        # Emit the channel-discovery diagnostic at INFO so CloudWatch
+        # surfaces it even with the default stdlib formatter. If
+        # ``common_prefixes`` is 0 here that's the smoking gun — the
+        # bucket contents under this date folder don't sit in immediate
+        # sub-folders, so the v1 legacy recursive scan kicks in.
+        is_truncated = bool(result.get("IsTruncated"))
+        contents_count = len(result.get("Contents") or [])
+        known_str   = ",".join(n for n, _ in known) or "-"
+        unknown_str = ",".join(unknown) or "-"
+        logger.info(
+            f"s3_iter_channels prefix={prefix!r} delimiter=/ "
+            f"common_prefixes={len(sub_prefixes)} "
+            f"contents_at_root={contents_count} "
+            f"is_truncated={is_truncated} "
+            f"known_channels=[{known_str}] "
+            f"unknown_subfolders=[{unknown_str}]"
+        )
+
         if known:
             for chan, p in known:
                 yield chan, p
         else:
             # No channel sub-folders — fall back to legacy recursive
-            # scan rooted at the date folder itself.
+            # scan rooted at the date folder itself. Log the fallback
+            # explicitly so an operator scanning CloudWatch can tell at
+            # a glance that legacy mode kicked in for this folder.
+            logger.info(
+                f"s3_iter_channels_legacy_fallback prefix={prefix!r} "
+                f"reason=no_known_channel_subfolders "
+                f"unknown_subfolders=[{unknown_str}]"
+            )
             yield "legacy", folder_path
 
     def _iter_channel_docs(
@@ -535,7 +588,9 @@ class S3EDMSConnector(BaseEDMSConnector):
     def _iter_files_with_suffix(
         self, channel_path: Any, suffix: str,
     ) -> Iterable[Any]:
-        """Yield Paths/keys whose names end with ``suffix``."""
+        """Yield Paths/keys whose names end with ``suffix``. Emits an
+        INFO log per S3 call so the per-channel funnel (objects-listed
+        vs suffix-matched) is visible in CloudWatch."""
         if self.is_local:
             for root, _dirs, files in os.walk(channel_path):
                 for fn in sorted(files):
@@ -548,13 +603,23 @@ class S3EDMSConnector(BaseEDMSConnector):
         prefix = str(channel_path)
         if not prefix.endswith("/"):
             prefix += "/"
+        total_seen = 0
+        matched   = 0
+        pages     = 0
         for page in paginator.paginate(
             Bucket=self._bucket, Prefix=prefix,
         ):
+            pages += 1
             for obj in page.get("Contents") or []:
+                total_seen += 1
                 key = obj.get("Key", "")
                 if key.endswith(suffix):
+                    matched += 1
                     yield key
+        logger.info(
+            f"s3_iter_files prefix={prefix!r} suffix={suffix!r} "
+            f"pages={pages} keys_listed={total_seen} keys_matched={matched}"
+        )
 
     def _iter_evidence_files(self, channel_path: Any) -> Iterable[Any]:
         """Yield raw-scan file paths/keys for the shared_drive channel.
