@@ -432,10 +432,35 @@ class _APIClient:
 
 
 async def _api_bootstrap_loans(client: _APIClient) -> dict:
-    """Create one application per LOS via POST /loans. Returns
-    ``{los_id: (real_applicant_id, real_co_applicant_id_or_None,
-    real_application_id)}`` so the doc-upload step can rewrite the
-    placeholder applicant_ids the simulation embeds."""
+    """Resolve one ``(applicant_id, co_applicant_id, application_id)``
+    triple per LOS by POSTing ``/loans`` and trusting whatever the
+    resolver returns.
+
+    Why always POST instead of probing ``GET /loan/{los_id}/applicant-id``
+    first: that lookup hits Postgres directly and can return an
+    applicant_id that's *orphaned* from the in-memory XRefStore on the
+    serving container — e.g. APL-00009-P exists in the ``applicants``
+    table but XRefStore.hydrate_from_postgres silently skipped its row
+    at the latest container boot (a tiny GoldenRecord schema mismatch
+    is enough; the loader's except: continue swallows the error).
+    Subsequent ``POST /documents/upload`` for that applicant_id then
+    fails with ``ValueError: No golden record for: APL-00009-P``
+    because the service-layer find_by_applicant_id is in-memory only.
+
+    POST /loans avoids that hazard: the resolver's three-strategy
+    chain (deterministic SSN-hash → probabilistic name+DOB → new) is
+    in-memory too, but every code path that returns success has just
+    ``save(gr)``'d the GoldenRecord into XRefStore — so the returned
+    applicant_id is guaranteed XRefStore-resident. Worst case (SSN
+    hash drift between runs) the API mints a fresh APL-NNNNN-P, the
+    application row's applicant_id is updated via ON CONFLICT DO
+    UPDATE, and the old applicant becomes orphaned in PG. That's fine
+    — the simulation data is synthetic and one orphan per LOS per
+    deploy is the documented trade-off.
+
+    Returns ``{los_id: (applicant_id, co_applicant_id_or_None,
+    application_id)}``.
+    """
     mapping: dict = {}
     for los_id, prof in LOAN_PROFILES.items():
         body = {
@@ -469,23 +494,43 @@ async def _api_bootstrap_loans(client: _APIClient) -> dict:
                 f"{resp.status_code} {resp.text[:300]}"
             )
         data = resp.json()
-        mapping[los_id] = (
-            data["applicant_id"],
-            data.get("co_applicant_id"),
-            data["application_id"],
-        )
+        aid    = data["applicant_id"]
+        co_aid = data.get("co_applicant_id")
+        app_id = data["application_id"]
+        match  = data.get("match_method", "?")
+        is_new = data.get("is_new_record", True)
+        mapping[los_id] = (aid, co_aid, app_id)
+        verb = "created" if is_new else f"reused ({match})"
+        print(f"  {los_id}: {verb} → applicant {aid} (application {app_id})")
     return mapping
 
 
-def _to_upload_doc(sim_doc: dict, primary_role: bool = True) -> dict:
-    """Coerce the simulation doc shape to /documents/upload's
-    ``DocumentSchema`` — extracted_fields nested under the key the
-    schema expects."""
+def _to_upload_doc(
+    sim_doc: dict,
+    primary_aid: str,
+    co_aid: Optional[str],
+    app_id: str,
+) -> dict:
+    """Coerce the simulation doc to /documents/upload's
+    ``DocumentSchema`` shape AND rewrite every embedded ID field so
+    the doc that lands in document_index references the API-assigned
+    applicant_id, not the simulation's placeholder.
+
+    The existing /documents/upload route uses the outer-body
+    applicant_id for FK saves, so DocumentSchema-level rewriting is
+    technically belt-and-suspenders. But it also covers any future
+    code path that introspects the doc dict (the indexer, the graph
+    reconciler, downstream extractors) — those should all see the
+    same real applicant_id end-to-end."""
+    role = sim_doc.get("borrower_role", "primary")
+    target_aid = co_aid if (role == "co_borrower" and co_aid) else primary_aid
     return {
         "document_id":       sim_doc["document_id"],
         "document_type":     sim_doc["document_type"],
         "document_category": sim_doc.get("category") or "income",
-        "borrower_role":     sim_doc.get("borrower_role", "primary"),
+        "borrower_role":     role,
+        "applicant_id":      target_aid,
+        "application_id":    app_id,
         "status":            "indexed",
         "confidence_score":  0.94,
         "extracted_fields":  sim_doc.get("extracted_fields") or {},
@@ -508,11 +553,17 @@ async def _api_upload_window(
 
     uploaded = failed = 0
     for los, batch in by_los.items():
-        primary_aid, _co_aid, app_id = los_to_real[los]
+        primary_aid, co_aid, app_id = los_to_real[los]
+        # Outer body uses primary_aid; co-borrower docs are still
+        # filed under the primary by convention (the assembly path
+        # routes them via borrower_role internally).
         body = {
             "applicant_id":   primary_aid,
             "application_id": app_id,
-            "all_documents":  [_to_upload_doc(d) for d in batch],
+            "all_documents":  [
+                _to_upload_doc(d, primary_aid, co_aid, app_id)
+                for d in batch
+            ],
         }
         resp = await client.post("/documents/upload", body)
         if resp.status_code in (200, 201):
