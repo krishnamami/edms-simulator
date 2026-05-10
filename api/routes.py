@@ -596,36 +596,63 @@ async def scheduler_trigger(request: Request, body: _SchedulerTriggerBody):
     return {"job": body.job, "result": result}
 
 
-# Module-level catch-up state. Single per-process; multi-replica is
-# fine because /admin/reset + catch-up is an ops flow run on one
-# replica at a time. ALB sticky-routing isn't needed — clients poll
-# whichever replica answers and see "running" only on the one that
-# started the job.
-_catch_up_state: dict = {"status": "idle"}
+# Catch-up state lives in Redis (key: ``catchup:state``) so both ECS
+# replicas read/write the same view — without this, a POST hits
+# replica A, a GET hits replica B, and B reports ``idle`` while A is
+# happily draining. Lock is in-process (each replica only ever runs
+# at most one drain at a time); we additionally check Redis state on
+# entry to ``POST /scheduler/catch-up`` so two replicas can't both
+# start drains in parallel.
+_CATCHUP_REDIS_KEY = "catchup:state"
 _catch_up_lock = asyncio.Lock()
 
 
-async def _run_catch_up_bg(engine, max_builds: int) -> None:
-    """Background task — drain the connector forward, updating
-    ``_catch_up_state`` after each build so a poller can see progress.
-    Exceptions are swallowed into the state dict (never re-raised) so
-    the asyncio task doesn't log an uncaught traceback."""
+async def _read_catchup_state(redis) -> dict:
+    """Pull the JSON-encoded state from Redis; return ``{"status":
+    "idle"}`` if nothing has run yet."""
+    try:
+        raw = await redis._r.get(_CATCHUP_REDIS_KEY)
+    except Exception:
+        return {"status": "idle"}
+    if not raw:
+        return {"status": "idle"}
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {"status": "idle"}
+
+
+async def _write_catchup_state(redis, state: dict) -> None:
+    try:
+        await redis._r.set(_CATCHUP_REDIS_KEY, json.dumps(state, default=str))
+    except Exception:
+        pass
+
+
+async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
+    """Background task — drain the connector forward, persisting
+    progress to Redis after every build so any replica answering
+    ``GET /scheduler/catch-up/status`` sees the same numbers.
+    Exceptions are swallowed into the state dict so the asyncio task
+    doesn't log an uncaught traceback."""
     from datetime import date as _date, datetime as _dt, timezone as _tz
     sched = engine.config.get("schedule", {}) or {}
     build_cfg = next(iter(sched.get("builds", []) or [{}]), {}) or {}
     last_wm_date = None
-    started = _dt.fromisoformat(_catch_up_state["started_at"])
+    state = await _read_catchup_state(redis)
+    started = _dt.fromisoformat(state["started_at"])
     try:
-        while _catch_up_state["builds_completed"] < max_builds:
+        while state["builds_completed"] < max_builds:
             now = _dt.now(engine.tz)
             stats = await engine.run_build_job(build_cfg, now)
-            _catch_up_state["builds_completed"] += 1
+            state["builds_completed"] += 1
             new_docs = int(stats.get("documents_new") or 0)
-            _catch_up_state["documents_processed"] += new_docs
+            state["documents_processed"] += new_docs
             wm = stats.get("watermark_to") or stats.get("watermark_from")
-            _catch_up_state["current_watermark"] = wm
+            state["current_watermark"] = wm
             sim_date = wm.split("T")[0] if isinstance(wm, str) else None
-            # Day-boundary snapshot.
             if (sim_date and last_wm_date and sim_date != last_wm_date
                     and engine.snapshot_scheduler):
                 try:
@@ -633,36 +660,37 @@ async def _run_catch_up_bg(engine, max_builds: int) -> None:
                         snapshot_date=_date.fromisoformat(last_wm_date),
                         tenant_id=engine._tenant_id,
                     )
-                    _catch_up_state["snapshots_taken"] += 1
+                    state["snapshots_taken"] += 1
                 except Exception:
                     pass
             last_wm_date = sim_date or last_wm_date
-            _catch_up_state["elapsed_seconds"] = int(
+            state["elapsed_seconds"] = int(
                 (_dt.now(_tz.utc) - started).total_seconds()
             )
+            await _write_catchup_state(redis, state)
             if new_docs == 0:
-                # Final snapshot for the last day we processed.
                 if last_wm_date and engine.snapshot_scheduler:
                     try:
                         await engine.snapshot_scheduler.take_daily_snapshot(
                             snapshot_date=_date.fromisoformat(last_wm_date),
                             tenant_id=engine._tenant_id,
                         )
-                        _catch_up_state["snapshots_taken"] += 1
+                        state["snapshots_taken"] += 1
                     except Exception:
                         pass
                 break
-        _catch_up_state["status"] = "completed"
-        _catch_up_state["completed_at"] = _dt.now(_tz.utc).isoformat()
-        _catch_up_state["stopped_reason"] = (
+        state["status"] = "completed"
+        state["completed_at"] = _dt.now(_tz.utc).isoformat()
+        state["stopped_reason"] = (
             "max_builds_hit"
-            if _catch_up_state["builds_completed"] >= max_builds
+            if state["builds_completed"] >= max_builds
             else "no_new_docs"
         )
     except Exception as exc:
-        _catch_up_state["status"] = "error"
-        _catch_up_state["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
-        _catch_up_state["completed_at"] = _dt.now(_tz.utc).isoformat()
+        state["status"] = "error"
+        state["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+        state["completed_at"] = _dt.now(_tz.utc).isoformat()
+    await _write_catchup_state(redis, state)
 
 
 @router.post(
@@ -690,15 +718,14 @@ async def _run_catch_up_bg(engine, max_builds: int) -> None:
 )
 async def scheduler_catch_up(request: Request, max_builds: int = 500):
     engine = _require_engine(request)
+    redis  = request.app.state.redis_store
     from datetime import datetime as _dt, timezone as _tz
     async with _catch_up_lock:
-        if _catch_up_state.get("status") == "running":
-            return {"status": "already_running", **_catch_up_state}
-        job_id = (
-            f"catch-up-{int(_dt.now(_tz.utc).timestamp())}"
-        )
-        _catch_up_state.clear()
-        _catch_up_state.update({
+        existing = await _read_catchup_state(redis)
+        if existing.get("status") == "running":
+            return {"status": "already_running", **existing}
+        job_id = f"catch-up-{int(_dt.now(_tz.utc).timestamp())}"
+        new_state = {
             "status":              "running",
             "job_id":              job_id,
             "builds_completed":    0,
@@ -708,10 +735,11 @@ async def scheduler_catch_up(request: Request, max_builds: int = 500):
             "started_at":          _dt.now(_tz.utc).isoformat(),
             "elapsed_seconds":     0,
             "max_builds":          max_builds,
-        })
-        # Fire-and-forget — the task updates _catch_up_state as it
+        }
+        await _write_catchup_state(redis, new_state)
+        # Fire-and-forget — the task updates the Redis state as it
         # progresses; caller polls the GET endpoint.
-        asyncio.create_task(_run_catch_up_bg(engine, max_builds))
+        asyncio.create_task(_run_catch_up_bg(engine, redis, max_builds))
     return {"job_id": job_id, "status": "started", "max_builds": max_builds}
 
 
@@ -733,18 +761,21 @@ async def scheduler_catch_up(request: Request, max_builds: int = 500):
 )
 async def scheduler_catch_up_status(request: Request):
     from datetime import datetime as _dt, timezone as _tz
+    redis = request.app.state.redis_store
+    state = await _read_catchup_state(redis)
     # Refresh elapsed_seconds so a long-stalled job's ticker keeps
-    # moving even between background updates.
-    if (_catch_up_state.get("status") == "running"
-            and _catch_up_state.get("started_at")):
+    # moving even between background updates. Read-only — we don't
+    # write it back since the background task overwrites on each
+    # build anyway.
+    if state.get("status") == "running" and state.get("started_at"):
         try:
-            started = _dt.fromisoformat(_catch_up_state["started_at"])
-            _catch_up_state["elapsed_seconds"] = int(
+            started = _dt.fromisoformat(state["started_at"])
+            state["elapsed_seconds"] = int(
                 (_dt.now(_tz.utc) - started).total_seconds()
             )
         except Exception:
             pass
-    return _catch_up_state
+    return state
 
 
 @router.post(
