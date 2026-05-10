@@ -735,7 +735,11 @@ async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
             state["builds_completed"] += 1
             new_docs = int(stats.get("documents_new") or 0)
             new_apps = int(stats.get("applications_created") or 0)
+            pulled   = int(stats.get("documents_pulled") or 0)
             state["documents_processed"] += new_docs
+            state["documents_pulled"] = (
+                int(state.get("documents_pulled") or 0) + pulled
+            )
             state["applications_created"] = (
                 int(state.get("applications_created") or 0) + new_apps
             )
@@ -757,11 +761,13 @@ async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
                 (_dt.now(_tz.utc) - started).total_seconds()
             )
             await _write_catchup_state(redis, state)
-            # Continue while ANY work happened — a folder containing
-            # only ``loan_origination/`` events lands 0 documents but
-            # N applications. Bailing on docs alone would stall the
-            # catch-up one day in. Stop only when both are 0.
-            if new_docs == 0 and new_apps == 0:
+            # Stop only when the connector found ABSOLUTELY NOTHING
+            # in the next date folder. ``documents_new == 0`` alone
+            # means "this day was already indexed" (possible on a
+            # partial re-run) — keep going, the next folder might
+            # still have new content. Only ``documents_pulled == 0
+            # && applications_created == 0`` means truly idle.
+            if pulled == 0 and new_apps == 0:
                 if last_wm_date and engine.snapshot_scheduler:
                     try:
                         await engine.snapshot_scheduler.take_daily_snapshot(
