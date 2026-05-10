@@ -3,7 +3,7 @@
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "1024",
-  "memory": "2048",
+  "memory": "4096",
   "executionRoleArn": "arn:aws:iam::621646470377:role/ecsTaskExecutionRole",
   "taskRoleArn": "arn:aws:iam::621646470377:role/edms-simulator-task-role",
   "containerDefinitions": [
