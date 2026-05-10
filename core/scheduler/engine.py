@@ -26,7 +26,7 @@ import asyncio
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Optional
 
 import yaml
@@ -325,6 +325,88 @@ class ScheduleEngine:
             if j.get("name") == job_name:
                 return await self.run_snapshot_job(j, datetime.now(self.tz))
         return {"error": f"unknown job: {job_name}"}
+
+    async def run_catch_up(
+        self, max_builds: int = 200,
+    ) -> dict:
+        """Drain a backlog of un-pulled S3 docs synchronously.
+
+        Walks the connector forward in 500-doc chunks until a build
+        comes back with ``documents_new == 0`` (no more new data).
+        When the watermark crosses a calendar-day boundary, takes an
+        EOD snapshot for the prior day so the lineage view stays
+        accurate. Returns aggregate stats for the operator.
+
+        ``max_builds`` is a safety cap so a runaway loop can't lock
+        the API forever — at 500 docs/build × 200 builds = 100k docs
+        per call, well above the 9k-loan / ~270k-doc scale target.
+        """
+        sched = self.config.get("schedule", {}) or {}
+        build_cfg = next(iter(sched.get("builds", []) or [{}]), {}) or {}
+        builds = 0
+        total_docs_new = 0
+        snapshots_taken = 0
+        last_wm_date = None
+        while builds < max_builds:
+            now = datetime.now(self.tz)
+            stats = await self.run_build_job(build_cfg, now)
+            builds += 1
+            total_docs_new += int(stats.get("documents_new") or 0)
+            wm_to = stats.get("watermark_to") or stats.get("watermark_from")
+            sim_date = None
+            if wm_to:
+                try:
+                    sim_date = (
+                        wm_to.split("T")[0]
+                        if isinstance(wm_to, str)
+                        else wm_to.date().isoformat()
+                    )
+                except Exception:
+                    sim_date = None
+            # Snapshot when the simulation watermark crosses a day.
+            if (sim_date and last_wm_date
+                    and sim_date != last_wm_date
+                    and self.snapshot_scheduler):
+                try:
+                    n = await self.snapshot_scheduler.take_daily_snapshot(
+                        snapshot_date=date.fromisoformat(last_wm_date),
+                        tenant_id=self._tenant_id,
+                    )
+                    snapshots_taken += 1
+                    logger.info(
+                        f"catch_up_snapshot date={last_wm_date} entities={n}"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"catch_up_snapshot_failed date={last_wm_date} "
+                        f"error={str(exc)[:200]}"
+                    )
+            last_wm_date = sim_date or last_wm_date
+
+            new_docs = int(stats.get("documents_new") or 0)
+            logger.info(
+                f"catch_up_build build={builds} docs_new={new_docs} "
+                f"total_new={total_docs_new} sim_date={sim_date}"
+            )
+            if new_docs == 0:
+                # Final EOD snapshot for the last day we processed.
+                if last_wm_date and self.snapshot_scheduler:
+                    try:
+                        n = await self.snapshot_scheduler.take_daily_snapshot(
+                            snapshot_date=date.fromisoformat(last_wm_date),
+                            tenant_id=self._tenant_id,
+                        )
+                        snapshots_taken += 1
+                    except Exception:
+                        pass
+                break
+        return {
+            "builds":              builds,
+            "documents_processed": total_docs_new,
+            "snapshots_taken":     snapshots_taken,
+            "stopped_reason":      ("max_builds_hit" if builds >= max_builds
+                                     else "no_new_docs"),
+        }
 
     # ------------------------------------------------------------------
     # Loop

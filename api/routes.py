@@ -596,6 +596,30 @@ async def scheduler_trigger(request: Request, body: _SchedulerTriggerBody):
 
 
 @router.post(
+    "/scheduler/catch-up",
+    dependencies=[Depends(verify_api_key)],
+    summary="Drain the S3 backlog synchronously",
+    description=(
+        "Runs ``run_build`` back-to-back until ``documents_new == 0`` "
+        "(or ``max_builds`` is hit). Crosses-day-boundary EOD "
+        "snapshots are taken inline so the lineage view reflects the "
+        "full progression. Returns aggregate stats: total builds, "
+        "documents_processed, snapshots_taken, stop reason. Use this "
+        "after ``/admin/reset`` to bootstrap the live read-state from "
+        "the full simulation tree without waiting on cron ticks."
+    ),
+    responses={
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        503: {"description": "Schedule engine not configured."},
+    },
+)
+async def scheduler_catch_up(request: Request, max_builds: int = 200):
+    engine = _require_engine(request)
+    result = await engine.run_catch_up(max_builds=max_builds)
+    return result
+
+
+@router.post(
     "/scheduler/reload",
     dependencies=[Depends(verify_api_key)],
     summary="Re-read schedule.yaml without restarting the container",

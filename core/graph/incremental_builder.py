@@ -135,14 +135,19 @@ def _income_block(docs: list) -> dict:
     f1040_prior = _doc(docs, "TAX_RETURN_1040_PRIOR")
     divorce = _doc(docs, "DIVORCE_DECREE", "ALIMONY_ORDER")
     alimony_history = _doc(docs, "ALIMONY_RECEIPT_HISTORY")
+    commission = _doc(docs, "COMMISSION_HISTORY")
+    rsu_docs = _all_docs(docs, "RSU_STATEMENT")
 
     # ---- determine calculation_type ----------------------------------
     has_se = bool(sch_c or k1 or nec_docs or f1040_prior)
     has_fixed = bool(ssa or pen) and not w2_docs
+    has_commission = bool(commission)
     if has_se:
         calculation_type = "self_employed_2yr_avg"
     elif has_fixed:
         calculation_type = "fixed_income"
+    elif has_commission:
+        calculation_type = "base_plus_commission"
     else:
         calculation_type = "w2_salaried"
 
@@ -267,6 +272,38 @@ def _income_block(docs: list) -> dict:
             })
             src_doc_ids.append(pen.get("source_document_id"))
 
+    # ---- Commission / bonus history (2-yr average) ------------------
+    if commission:
+        try:
+            avg = float(_f(commission, "two_year_average") or 0)
+        except (TypeError, ValueError):
+            avg = 0
+        if avg:
+            sources.append({
+                "type":       "COMMISSION_BONUS",
+                "annual":     avg,
+                "monthly":    round(avg / 12, 2),
+                "trending":   _f(commission, "trending"),
+                "source_doc": commission.get("source_document_id"),
+            })
+            src_doc_ids.append(commission.get("source_document_id"))
+
+    # ---- RSU / equity comp ------------------------------------------
+    for rsu in rsu_docs:
+        try:
+            vested = float(_f(rsu, "vested_annual") or 0)
+        except (TypeError, ValueError):
+            vested = 0
+        if vested:
+            sources.append({
+                "type":       "RSU_VESTED",
+                "annual":     vested,
+                "monthly":    round(vested / 12, 2),
+                "vested_at":  _f(rsu, "vest_date"),
+                "source_doc": rsu.get("source_document_id"),
+            })
+            src_doc_ids.append(rsu.get("source_document_id"))
+
     # ---- Alimony — only with 3+ yrs remaining + receipt history -----
     if divorce:
         try:
@@ -352,20 +389,35 @@ def _income_block(docs: list) -> dict:
 
 def _employment_block(docs: list) -> dict:
     voe = _doc(docs, "VOE_TWN", "VOE_EQUIFAX", "VOE")
+    # Section B: optional employment-gap explanation letter
+    gap_letter = _doc(docs, "EMPLOYMENT_GAP_LETTER", "EMPLOYMENT_GAP_EXPLANATION")
+    gap_block = None
+    if gap_letter:
+        gap_block = {
+            "has_gap":              True,
+            "gap_reason":           _f(gap_letter, "reason"),
+            "gap_start":            _f(gap_letter, "gap_start"),
+            "gap_end":              _f(gap_letter, "gap_end"),
+            "explanation_received": True,
+            "source_doc":           gap_letter.get("source_document_id"),
+        }
     if not voe:
         # Fall back to the W-2's employer_name so we have at least
         # *something* to surface in /context — but mark unverified.
         w2 = _doc(docs, "W2_CURRENT", "W2_PRIOR")
         if w2:
-            return {
+            block = {
                 "employer":      _f(w2, "employer_name"),
                 "status":        None,
                 "verified":      False,
                 "source_doc":    None,
                 "verified_at":   None,
             }
-        return {"verified": False}
-    return {
+            if gap_block:
+                block["gap"] = gap_block
+            return block
+        return {"verified": False, **({"gap": gap_block} if gap_block else {})}
+    block = {
         "employer":          _f(voe, "employer_name"),
         "status":            _f(voe, "employment_status"),
         "hire_date":         _f(voe, "hire_date"),
@@ -376,6 +428,9 @@ def _employment_block(docs: list) -> dict:
         "verified":          True,
         "verified_at":       voe.get("received_at"),
     }
+    if gap_block:
+        block["gap"] = gap_block
+    return block
 
 
 def _credit_block(docs: list) -> dict:
@@ -562,14 +617,21 @@ def _property_block(all_docs: list) -> dict:
             "insurance_date":     (ti or {}).get("received_at"),
         }
 
+    flood_ins = _doc(all_docs, "FLOOD_INSURANCE", "NFIP_POLICY")
     insurance = {}
-    if hoi or flood or wind:
+    if hoi or flood or wind or flood_ins:
+        # Section B: flood zone A/AE/V/VE forces flood insurance.
+        flood_zone = _f(flood, "flood_zone") if flood else None
+        in_sfha = (flood_zone or "X") in ("A", "AE", "V", "VE")
         insurance = {
             "hoi_premium_annual":  _f(hoi, "annual_premium") if hoi else None,
             "hoi_carrier":         _f(hoi, "carrier") if hoi else None,
-            "flood_zone":          _f(flood, "flood_zone") if flood else None,
-            "flood_insurance_required": (
-                _f(flood, "requires_insurance") if flood else None
+            "flood_zone":          flood_zone,
+            "flood_insurance_required": in_sfha or (
+                bool(_f(flood, "requires_insurance")) if flood else False
+            ),
+            "flood_premium_annual": (
+                _f(flood_ins, "annual_premium") if flood_ins else None
             ),
             "wind_hail_premium":   _f(wind, "annual_premium") if wind else None,
             "source_doc":          (hoi or {}).get("source_document_id"),
@@ -1457,7 +1519,13 @@ class IncrementalGraphBuilder:
                 elif appraised_value:
                     ltv = round(loan_amount / appraised_value * 100, 2)
 
-        # ---- MI — required when LTV > 80, included in PITI (Gap 8) -
+        # ---- MI — required when LTV > 80, included in PITI (Gap 6) -
+        # Tiered rate per LTV band (mirrors agency tables):
+        #   80-90 LTV  → 0.5% / yr
+        #   90-95 LTV  → 0.8% / yr
+        #   95+ LTV    → 1.0% / yr
+        # If a real MI_CERTIFICATE exists with monthly_premium, that
+        # always wins over the estimate.
         mi_monthly = 0.0
         if ltv and ltv > 80:
             mi_doc = _doc(all_docs, "MI_CERTIFICATE", "MI_PREMIUM_QUOTE")
@@ -1467,9 +1535,11 @@ class IncrementalGraphBuilder:
                 except (TypeError, ValueError):
                     mi_monthly = 0.0
             if not mi_monthly and loan_amount:
-                # Spec-suggested fallback: 0.5% of loan amount annually
-                # for 85-95% LTV. Coarse but better than $0 for DTI.
-                mi_monthly = round(float(loan_amount) * 0.005 / 12, 2)
+                rate = (
+                    0.005 if ltv <= 90
+                    else (0.008 if ltv <= 95 else 0.01)
+                )
+                mi_monthly = round(float(loan_amount) * rate / 12, 2)
 
         # ---- CLTV — combined with subordinate liens (Gap 10) -------
         # For refis, the existing payoff is being replaced (not
@@ -1493,10 +1563,17 @@ class IncrementalGraphBuilder:
                 (loan_terms_block.get("current_mortgage") or {}).get("monthly_payment")
             )
 
-        # ---- PITI + DTI (now MI-aware) ------------------------------
+        # ---- PITI + DTI (MI- and flood-aware) -----------------------
         annual_tax = (property_block.get("tax") or {}).get("annual_tax")
         annual_hoi = (
             (property_block.get("insurance") or {}).get("hoi_premium_annual")
+        )
+        # Section B: flood premium added to PITI when in zone A/V/AE/VE.
+        annual_flood = (
+            (property_block.get("insurance") or {}).get("flood_premium_annual")
+        )
+        flood_monthly = (
+            float(annual_flood) / 12 if annual_flood else 0.0
         )
         piti_monthly = None
         if loan_amount and interest_rate and annual_tax and annual_hoi:
@@ -1510,7 +1587,7 @@ class IncrementalGraphBuilder:
                     pi = float(loan_amount) / max(n, 1)
                 piti_monthly = round(
                     pi + float(annual_tax) / 12 + float(annual_hoi) / 12
-                    + float(mi_monthly or 0), 2,
+                    + float(mi_monthly or 0) + flood_monthly, 2,
                 )
             except (TypeError, ValueError, ZeroDivisionError):
                 piti_monthly = None

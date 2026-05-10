@@ -23,34 +23,32 @@
 
 schedule:
   timezone: "US/Eastern"
-  poll_interval: 300        # 5 minutes between cron checks
+  poll_interval: 60         # 1 minute polling — cron tick is 15 min
 
   enabled: true             # master switch — false disables all scheduled runs
   snapshot_enabled: true    # false skips snapshots but keeps builds running
 
   builds:
-    - name: "morning_build"
-      cron: "0 9 * * *"     # 9:00 AM daily
-      description: "Morning pull — catches overnight doc arrivals"
-
-    - name: "afternoon_build"
-      cron: "0 14 * * *"    # 2:00 PM daily
-      description: "Afternoon pull — catches morning uploads"
-
-    - name: "evening_build"
-      cron: "0 17 * * *"    # 5:00 PM daily
-      description: "End of day pull — final catch before snapshot"
+    # Single continuous-ingest job — every 15 minutes pull whatever
+    # has arrived since the last watermark and process it. With
+    # max_docs_per_build=500 the cron-tick cost stays bounded; the
+    # /scheduler/catch-up endpoint exists to drain a backlog
+    # synchronously when ops needs to.
+    - name: "continuous_ingest"
+      cron: "*/15 * * * *"
+      description: "Every 15 min — process next batch from S3"
+      max_docs_per_batch: 500
 
   snapshots:
     - name: "eod_snapshot"
-      cron: "0 18 * * *"    # 6:00 PM daily (after the last build)
+      cron: "0 18 * * *"    # 6:00 PM daily (after final cron tick)
       description: "End of business day entity-state freeze"
 
   connector:
     type: "s3"                                   # s3 (local fs or s3://) — placeholder for future api/EDMS connector
     # ``${VAR:-default}`` is resolved by ScheduleEngine at load time:
     # local dev keeps the filesystem path; the ECS task definition
-    # injects ``S3_SIMULATION_SOURCE=s3://edms-simulator-loans/s3_simulation``
+    # injects ``S3_SIMULATION_SOURCE=s3://edms-simulator-loans/s3_simulation_v3``
     # so prod walks the real bucket.
     source: "${S3_SIMULATION_SOURCE:-local_storage/s3_simulation_v3}"
 
