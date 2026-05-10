@@ -1404,7 +1404,11 @@ def _build_timeline(profile: dict, los_id: str) -> list:
 
     if profile["scenario"] == "retired_fixed_income":
         e.append((5, 10, "ssa_gov",        "SSA_AWARD_LETTER", "primary", {}))
-        e.append((5, 11, "employer_manual","PENSION_LETTER",   "primary", {}))
+        # PENSION_LETTER moved from employer_manual (PDF-only, needs
+        # AI Vision) to edms_pull (JSON) so monthly_benefit reaches
+        # the income block deterministically — pension counts toward
+        # qualifying_monthly without depending on the Anthropic key.
+        e.append((5, 11, "edms_pull",      "PENSION_LETTER",   "primary", {}))
 
     if profile["scenario"] == "post_divorce_alimony":
         e.append((7, 10, "email_inbox",   "DIVORCE_DECREE", "primary",
