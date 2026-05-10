@@ -291,14 +291,40 @@ class S3EDMSConnector(BaseEDMSConnector):
         by_channel:      dict[str, int] = {}     # post-filter accept
         by_channel_seen: dict[str, int] = {}     # pre-filter raw yields
 
+        # v4.3 — bounded pull: take only the FIRST date folder strictly
+        # after ``wm.date()``. Each build processes one calendar day's
+        # worth of docs; the catch-up loop or cron tick advances the
+        # watermark to end-of-that-day, then the next call picks up
+        # the following day. Without this bound a fresh-from-epoch
+        # call against the 9k-loan corpus would list ~338k objects in
+        # one shot and ALB-timeout the build.
+        all_folders = list(self._iter_date_folders())
+        all_folders.sort(key=lambda x: x[0])
+        folder_count = len(all_folders)
+        next_folder: Optional[tuple] = None
+        for d, p in all_folders:
+            if d <= wm.date():
+                continue
+            if upper is not None and d > upper.date():
+                break
+            next_folder = (d, p)
+            break
+
         docs: list[dict] = []
-        for folder_date, folder_path in self._iter_date_folders():
-            folder_count += 1
-            if folder_date < wm.date():
-                continue
-            if upper is not None and folder_date > upper.date():
-                continue
-            in_window += 1
+        if next_folder is None:
+            logger.info(
+                f"connector_pull_no_more_folders folders_total={folder_count} "
+                f"watermark={wm.isoformat()} "
+                f"until={(upper.isoformat() if upper else 'None')}"
+            )
+        else:
+            folder_date, folder_path = next_folder
+            in_window = 1
+            logger.info(
+                f"connector_pull_target_folder date={folder_date.isoformat()} "
+                f"folder={folder_path} "
+                f"watermark={wm.isoformat()}"
+            )
 
             folder_files    = 0
             folder_accepted = 0

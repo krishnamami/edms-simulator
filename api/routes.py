@@ -589,11 +589,44 @@ async def scheduler_status(request: Request):
     },
 )
 async def scheduler_trigger(request: Request, body: _SchedulerTriggerBody):
+    """Fire one build/snapshot in the background; return immediately.
+
+    With the connector now bounded to a single date folder per build,
+    even a "small" trigger can move 2k docs through the indexer +
+    extractor + entity-state writer — well over the ALB's 60s cap.
+    The handler validates the job name synchronously (so 404 still
+    fires on typos), then spawns a background task and writes a
+    ``running`` entry to the same Redis ``catchup:state`` key the
+    catch-up loop uses, so ``GET /scheduler/catch-up/status`` reports
+    progress regardless of which replica the poll lands on."""
     engine = _require_engine(request)
-    result = await engine.trigger_job(body.job)
-    if isinstance(result, dict) and result.get("error", "").startswith("unknown job"):
-        raise HTTPException(status_code=404, detail=result["error"])
-    return {"job": body.job, "result": result}
+    redis  = request.app.state.redis_store
+
+    if not _job_exists(engine, body.job):
+        raise HTTPException(status_code=404, detail=f"unknown job: {body.job}")
+
+    async with _catch_up_lock:
+        existing = await _read_catchup_state(redis)
+        if existing.get("status") == "running":
+            return {"status": "already_running", **existing}
+        from datetime import datetime as _dt, timezone as _tz
+        job_id = f"trigger-{body.job}-{int(_dt.now(_tz.utc).timestamp())}"
+        new_state = {
+            "status": "running",
+            "job_id": job_id,
+            "job_name": body.job,
+            "builds_completed": 0,
+            "documents_processed": 0,
+            "snapshots_taken": 0,
+            "current_watermark": None,
+            "started_at": _dt.now(_tz.utc).isoformat(),
+            "elapsed_seconds": 0,
+            "max_builds": 1,
+        }
+        await _write_catchup_state(redis, new_state)
+        asyncio.create_task(_run_trigger_bg(engine, redis, body.job))
+
+    return {"job_id": job_id, "job": body.job, "status": "started"}
 
 
 # Catch-up state lives in Redis (key: ``catchup:state``) so both ECS
@@ -629,6 +662,58 @@ async def _write_catchup_state(redis, state: dict) -> None:
         await redis._r.set(_CATCHUP_REDIS_KEY, json.dumps(state, default=str))
     except Exception:
         pass
+
+
+def _job_exists(engine, job_name: str) -> bool:
+    """Cheap synchronous lookup against the loaded schedule.yaml so
+    ``POST /scheduler/trigger`` can 404 on a typo without spawning a
+    background task that would only set ``state['error']`` and never
+    surface as a real HTTP failure."""
+    sched = engine.config.get("schedule", {}) or {}
+    for j in sched.get("builds", []) or []:
+        if j.get("name") == job_name:
+            return True
+    for j in sched.get("snapshots", []) or []:
+        if j.get("name") == job_name:
+            return True
+    return False
+
+
+async def _run_trigger_bg(engine, redis, job_name: str) -> None:
+    """Background task fired by ``POST /scheduler/trigger``. Runs one
+    job (build or snapshot) and reports its result through the same
+    Redis ``catchup:state`` key the catch-up loop uses, so ``GET
+    /scheduler/catch-up/status`` is the single source of truth for
+    "is there a manual run in flight" — regardless of which replica
+    the GET lands on."""
+    from datetime import datetime as _dt, timezone as _tz
+    state = await _read_catchup_state(redis)
+    started = _dt.fromisoformat(state["started_at"])
+    try:
+        result = await engine.trigger_job(job_name)
+        if isinstance(result, dict):
+            state["builds_completed"]    = 1
+            state["documents_processed"] = int(result.get("documents_new") or 0)
+            wm = result.get("watermark_to") or result.get("watermark_from")
+            state["current_watermark"]   = wm
+            state["last_result"]         = {
+                k: v for k, v in result.items()
+                if k in {"documents_new", "watermark_from", "watermark_to",
+                         "snapshot_date", "snapshot_taken"}
+            }
+        state["status"]         = "completed"
+        state["completed_at"]   = _dt.now(_tz.utc).isoformat()
+        state["elapsed_seconds"] = int(
+            (_dt.now(_tz.utc) - started).total_seconds()
+        )
+    except Exception as exc:
+        state["status"]         = "error"
+        state["error"]          = f"{type(exc).__name__}: {str(exc)[:300]}"
+        state["completed_at"]   = _dt.now(_tz.utc).isoformat()
+        state["elapsed_seconds"] = int(
+            (_dt.now(_tz.utc) - started).total_seconds()
+        )
+    await _write_catchup_state(redis, state)
 
 
 async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
