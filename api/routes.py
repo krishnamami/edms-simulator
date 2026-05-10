@@ -716,59 +716,84 @@ async def _run_trigger_bg(engine, redis, job_name: str) -> None:
     await _write_catchup_state(redis, state)
 
 
+_CATCHUP_ZOMBIE_THRESHOLD_S = 60          # heartbeat older than this → zombie
+_CATCHUP_MAX_BUILD_ERRORS   = 3           # consecutive failures before giving up
+
+
 async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
     """Background task — drain the connector forward, persisting
     progress to Redis after every build so any replica answering
     ``GET /scheduler/catch-up/status`` sees the same numbers.
-    Exceptions are swallowed into the state dict so the asyncio task
-    doesn't log an uncaught traceback."""
+
+    Two layers of fault tolerance:
+
+    1. **Heartbeat.** ``last_heartbeat`` is updated *before* and
+       *after* every build call. The POST handler treats a status
+       of ``running`` with a heartbeat older than
+       ``_CATCHUP_ZOMBIE_THRESHOLD_S`` as a dead task and lets a
+       new POST take over (also accepts ``?force=true`` to bypass
+       the freshness check).
+
+    2. **Per-build try/except.** A single bad date folder shouldn't
+       kill the whole drain. ``error_count`` accumulates; we keep
+       going until it hits ``_CATCHUP_MAX_BUILD_ERRORS``, at which
+       point we stop with ``stopped_reason='too_many_errors'`` so
+       the operator sees the failure instead of an infinite loop.
+
+    Exceptions outside the inner try (i.e., the loop wiring itself)
+    flip the state to ``error`` so the task's asyncio future
+    doesn't surface an uncaught traceback."""
     from datetime import date as _date, datetime as _dt, timezone as _tz
     sched = engine.config.get("schedule", {}) or {}
     build_cfg = next(iter(sched.get("builds", []) or [{}]), {}) or {}
     last_wm_date = None
     state = await _read_catchup_state(redis)
+    my_job_id = state.get("job_id")
     started = _dt.fromisoformat(state["started_at"])
     try:
         while state["builds_completed"] < max_builds:
-            now = _dt.now(engine.tz)
-            stats = await engine.run_build_job(build_cfg, now)
-            state["builds_completed"] += 1
-            new_docs = int(stats.get("documents_new") or 0)
-            new_apps = int(stats.get("applications_created") or 0)
-            pulled   = int(stats.get("documents_pulled") or 0)
-            state["documents_processed"] += new_docs
-            state["documents_pulled"] = (
-                int(state.get("documents_pulled") or 0) + pulled
-            )
-            state["applications_created"] = (
-                int(state.get("applications_created") or 0) + new_apps
-            )
-            wm = stats.get("watermark_to") or stats.get("watermark_from")
-            state["current_watermark"] = wm
-            sim_date = wm.split("T")[0] if isinstance(wm, str) else None
-            if (sim_date and last_wm_date and sim_date != last_wm_date
-                    and engine.snapshot_scheduler):
-                try:
-                    await engine.snapshot_scheduler.take_daily_snapshot(
-                        snapshot_date=_date.fromisoformat(last_wm_date),
-                        tenant_id=engine._tenant_id,
-                    )
-                    state["snapshots_taken"] += 1
-                except Exception:
-                    pass
-            last_wm_date = sim_date or last_wm_date
-            state["elapsed_seconds"] = int(
-                (_dt.now(_tz.utc) - started).total_seconds()
-            )
+            # Defense in depth: if a force-restart spawned a second
+            # _run_catch_up_bg, the loser sees its job_id no longer
+            # owns the Redis slot and exits silently rather than
+            # stomping the new run's progress counters.
+            cur = await _read_catchup_state(redis)
+            if cur.get("job_id") != my_job_id:
+                logger.info(
+                    f"catchup_self_terminate my_job={my_job_id} "
+                    f"current_job={cur.get('job_id')}"
+                )
+                return
+
+            state["last_heartbeat"] = _dt.now(_tz.utc).isoformat()
             await _write_catchup_state(redis, state)
-            # Stop only when the connector found ABSOLUTELY NOTHING
-            # in the next date folder. ``documents_new == 0`` alone
-            # means "this day was already indexed" (possible on a
-            # partial re-run) — keep going, the next folder might
-            # still have new content. Only ``documents_pulled == 0
-            # && applications_created == 0`` means truly idle.
-            if pulled == 0 and new_apps == 0:
-                if last_wm_date and engine.snapshot_scheduler:
+
+            try:
+                now = _dt.now(engine.tz)
+                stats = await engine.run_build_job(build_cfg, now)
+
+                # ``run_build_job`` swallows builder exceptions and
+                # returns ``{"error": ...}`` instead of raising —
+                # surface that here so the error-counter logic kicks
+                # in the same way it would for a true raise.
+                if isinstance(stats, dict) and stats.get("error"):
+                    raise RuntimeError(stats["error"])
+
+                state["builds_completed"] += 1
+                new_docs = int(stats.get("documents_new") or 0)
+                new_apps = int(stats.get("applications_created") or 0)
+                pulled   = int(stats.get("documents_pulled") or 0)
+                state["documents_processed"] += new_docs
+                state["documents_pulled"] = (
+                    int(state.get("documents_pulled") or 0) + pulled
+                )
+                state["applications_created"] = (
+                    int(state.get("applications_created") or 0) + new_apps
+                )
+                wm = stats.get("watermark_to") or stats.get("watermark_from")
+                state["current_watermark"] = wm
+                sim_date = wm.split("T")[0] if isinstance(wm, str) else None
+                if (sim_date and last_wm_date and sim_date != last_wm_date
+                        and engine.snapshot_scheduler):
                     try:
                         await engine.snapshot_scheduler.take_daily_snapshot(
                             snapshot_date=_date.fromisoformat(last_wm_date),
@@ -777,18 +802,65 @@ async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
                         state["snapshots_taken"] += 1
                     except Exception:
                         pass
-                break
-        state["status"] = "completed"
+                last_wm_date = sim_date or last_wm_date
+                state["elapsed_seconds"] = int(
+                    (_dt.now(_tz.utc) - started).total_seconds()
+                )
+                state["last_heartbeat"] = _dt.now(_tz.utc).isoformat()
+                await _write_catchup_state(redis, state)
+
+                # Stop only when the connector found ABSOLUTELY
+                # NOTHING in the next date folder. ``documents_new
+                # == 0`` alone means "this day was already indexed"
+                # (possible on a partial re-run) — keep going.
+                # Only ``documents_pulled == 0 && applications_created
+                # == 0`` means truly idle.
+                if pulled == 0 and new_apps == 0:
+                    if last_wm_date and engine.snapshot_scheduler:
+                        try:
+                            await engine.snapshot_scheduler.take_daily_snapshot(
+                                snapshot_date=_date.fromisoformat(last_wm_date),
+                                tenant_id=engine._tenant_id,
+                            )
+                            state["snapshots_taken"] += 1
+                        except Exception:
+                            pass
+                    break
+            except Exception as build_err:
+                # One bad folder shouldn't kill the drain — log,
+                # bump the counter, and try the next build.
+                state["error_count"] = int(state.get("error_count") or 0) + 1
+                state["last_error"]  = (
+                    f"{type(build_err).__name__}: {str(build_err)[:300]}"
+                )
+                state["last_heartbeat"] = _dt.now(_tz.utc).isoformat()
+                await _write_catchup_state(redis, state)
+                logger.error(
+                    f"catchup_build_error build={state['builds_completed']} "
+                    f"errors={state['error_count']} "
+                    f"err={state['last_error']}"
+                )
+                if state["error_count"] >= _CATCHUP_MAX_BUILD_ERRORS:
+                    state["stopped_reason"] = "too_many_errors"
+                    break
+                continue
+
+        if "stopped_reason" not in state:
+            state["stopped_reason"] = (
+                "max_builds_hit"
+                if state["builds_completed"] >= max_builds
+                else "no_new_work"
+            )
+        state["status"]       = "completed"
         state["completed_at"] = _dt.now(_tz.utc).isoformat()
-        state["stopped_reason"] = (
-            "max_builds_hit"
-            if state["builds_completed"] >= max_builds
-            else "no_new_work"
+    except Exception as fatal_err:
+        state["status"]       = "error"
+        state["last_error"]   = (
+            f"{type(fatal_err).__name__}: {str(fatal_err)[:500]}"
         )
-    except Exception as exc:
-        state["status"] = "error"
-        state["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
         state["completed_at"] = _dt.now(_tz.utc).isoformat()
+        logger.error(f"catchup_fatal err={state['last_error']}")
+    state["last_heartbeat"] = _dt.now(_tz.utc).isoformat()
     await _write_catchup_state(redis, state)
 
 
@@ -815,31 +887,94 @@ async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
         503: {"description": "Schedule engine not configured."},
     },
 )
-async def scheduler_catch_up(request: Request, max_builds: int = 500):
+async def scheduler_catch_up(
+    request:    Request,
+    max_builds: int  = 500,
+    force:      bool = False,
+):
+    """Spawn a background drain. Three guard rails on top of plain
+    "if running, refuse":
+
+    * ``?force=true`` — operator escape hatch. Always reset state
+      and start a new drain, regardless of what the prior run
+      reported. Use after a code rollout or when you know the prior
+      task is gone.
+    * Stale-heartbeat auto-reset — if status is ``running`` but the
+      last heartbeat is older than ``_CATCHUP_ZOMBIE_THRESHOLD_S``,
+      the prior task is treated as dead (asyncio task crashed
+      silently, ECS task got recycled, etc.) and we start fresh.
+    * ``max_builds`` may be passed as either ``?max_builds=N`` or
+      a JSON body ``{"max_builds": N}`` — body wins when both are
+      present, mirroring how operators tend to script POSTs."""
     engine = _require_engine(request)
     redis  = request.app.state.redis_store
     from datetime import datetime as _dt, timezone as _tz
+
+    # Optional body wins over query param. Read defensively so a
+    # POST without Content-Type still works.
+    try:
+        body = await request.json()
+        if isinstance(body, dict) and body.get("max_builds"):
+            max_builds = int(body["max_builds"])
+    except Exception:
+        pass
+
     async with _catch_up_lock:
         existing = await _read_catchup_state(redis)
         if existing.get("status") == "running":
-            return {"status": "already_running", **existing}
+            is_zombie = False
+            zombie_reason = None
+            last_hb = existing.get("last_heartbeat")
+            if not last_hb:
+                is_zombie     = True
+                zombie_reason = "no_heartbeat"
+            else:
+                try:
+                    hb_dt = _dt.fromisoformat(
+                        last_hb.replace("Z", "+00:00")
+                    )
+                    age_s = (_dt.now(_tz.utc) - hb_dt).total_seconds()
+                    if age_s > _CATCHUP_ZOMBIE_THRESHOLD_S:
+                        is_zombie     = True
+                        zombie_reason = f"stale_heartbeat_age_s={int(age_s)}"
+                except Exception:
+                    is_zombie     = True
+                    zombie_reason = "unparseable_heartbeat"
+            if not (force or is_zombie):
+                return {"status": "already_running", **existing}
+            logger.warning(
+                f"catchup_force_reset force={force} "
+                f"is_zombie={is_zombie} reason={zombie_reason} "
+                f"prior_job={existing.get('job_id')}"
+            )
+
         job_id = f"catch-up-{int(_dt.now(_tz.utc).timestamp())}"
         new_state = {
-            "status":              "running",
-            "job_id":              job_id,
-            "builds_completed":    0,
-            "documents_processed": 0,
-            "snapshots_taken":     0,
-            "current_watermark":   None,
-            "started_at":          _dt.now(_tz.utc).isoformat(),
-            "elapsed_seconds":     0,
-            "max_builds":          max_builds,
+            "status":               "running",
+            "job_id":               job_id,
+            "builds_completed":     0,
+            "documents_processed":  0,
+            "documents_pulled":     0,
+            "applications_created": 0,
+            "snapshots_taken":      0,
+            "current_watermark":    None,
+            "started_at":           _dt.now(_tz.utc).isoformat(),
+            "last_heartbeat":       _dt.now(_tz.utc).isoformat(),
+            "elapsed_seconds":      0,
+            "max_builds":           max_builds,
+            "error_count":          0,
+            "last_error":           None,
         }
         await _write_catchup_state(redis, new_state)
         # Fire-and-forget — the task updates the Redis state as it
         # progresses; caller polls the GET endpoint.
         asyncio.create_task(_run_catch_up_bg(engine, redis, max_builds))
-    return {"job_id": job_id, "status": "started", "max_builds": max_builds}
+    return {
+        "job_id":     job_id,
+        "status":     "started",
+        "max_builds": max_builds,
+        "forced":     bool(force),
+    }
 
 
 @router.get(
@@ -874,6 +1009,17 @@ async def scheduler_catch_up_status(request: Request):
             )
         except Exception:
             pass
+    # Heartbeat age is what flags a zombie — surface it on the GET
+    # so operators don't have to do the subtraction themselves.
+    last_hb = state.get("last_heartbeat")
+    if last_hb:
+        try:
+            hb_dt = _dt.fromisoformat(last_hb.replace("Z", "+00:00"))
+            state["heartbeat_age_s"] = int(
+                (_dt.now(_tz.utc) - hb_dt).total_seconds()
+            )
+        except Exception:
+            state["heartbeat_age_s"] = None
     return state
 
 
