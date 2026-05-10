@@ -384,11 +384,16 @@ class ScheduleEngine:
             last_wm_date = sim_date or last_wm_date
 
             new_docs = int(stats.get("documents_new") or 0)
+            new_apps = int(stats.get("applications_created") or 0)
             logger.info(
                 f"catch_up_build build={builds} docs_new={new_docs} "
-                f"total_new={total_docs_new} sim_date={sim_date}"
+                f"apps_new={new_apps} total_new={total_docs_new} sim_date={sim_date}"
             )
-            if new_docs == 0:
+            # Continue while ANY work happened — a folder containing
+            # only ``loan_origination/`` events lands 0 documents but N
+            # applications, and bailing on docs_new alone would stall
+            # the loop one day in. Stop only when both are 0.
+            if new_docs == 0 and new_apps == 0:
                 # Final EOD snapshot for the last day we processed.
                 if last_wm_date and self.snapshot_scheduler:
                     try:

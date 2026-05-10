@@ -734,7 +734,11 @@ async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
             stats = await engine.run_build_job(build_cfg, now)
             state["builds_completed"] += 1
             new_docs = int(stats.get("documents_new") or 0)
+            new_apps = int(stats.get("applications_created") or 0)
             state["documents_processed"] += new_docs
+            state["applications_created"] = (
+                int(state.get("applications_created") or 0) + new_apps
+            )
             wm = stats.get("watermark_to") or stats.get("watermark_from")
             state["current_watermark"] = wm
             sim_date = wm.split("T")[0] if isinstance(wm, str) else None
@@ -753,7 +757,11 @@ async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
                 (_dt.now(_tz.utc) - started).total_seconds()
             )
             await _write_catchup_state(redis, state)
-            if new_docs == 0:
+            # Continue while ANY work happened — a folder containing
+            # only ``loan_origination/`` events lands 0 documents but
+            # N applications. Bailing on docs alone would stall the
+            # catch-up one day in. Stop only when both are 0.
+            if new_docs == 0 and new_apps == 0:
                 if last_wm_date and engine.snapshot_scheduler:
                     try:
                         await engine.snapshot_scheduler.take_daily_snapshot(
@@ -769,7 +777,7 @@ async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
         state["stopped_reason"] = (
             "max_builds_hit"
             if state["builds_completed"] >= max_builds
-            else "no_new_docs"
+            else "no_new_work"
         )
     except Exception as exc:
         state["status"] = "error"
