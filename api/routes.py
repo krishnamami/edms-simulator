@@ -3,6 +3,7 @@
 Auth: X-API-Key validated against the edms/api/keys secret.
 Cache pattern: Redis -> Postgres.
 """
+import asyncio
 import base64
 import json
 import os
@@ -595,28 +596,155 @@ async def scheduler_trigger(request: Request, body: _SchedulerTriggerBody):
     return {"job": body.job, "result": result}
 
 
+# Module-level catch-up state. Single per-process; multi-replica is
+# fine because /admin/reset + catch-up is an ops flow run on one
+# replica at a time. ALB sticky-routing isn't needed — clients poll
+# whichever replica answers and see "running" only on the one that
+# started the job.
+_catch_up_state: dict = {"status": "idle"}
+_catch_up_lock = asyncio.Lock()
+
+
+async def _run_catch_up_bg(engine, max_builds: int) -> None:
+    """Background task — drain the connector forward, updating
+    ``_catch_up_state`` after each build so a poller can see progress.
+    Exceptions are swallowed into the state dict (never re-raised) so
+    the asyncio task doesn't log an uncaught traceback."""
+    from datetime import date as _date, datetime as _dt, timezone as _tz
+    sched = engine.config.get("schedule", {}) or {}
+    build_cfg = next(iter(sched.get("builds", []) or [{}]), {}) or {}
+    last_wm_date = None
+    started = _dt.fromisoformat(_catch_up_state["started_at"])
+    try:
+        while _catch_up_state["builds_completed"] < max_builds:
+            now = _dt.now(engine.tz)
+            stats = await engine.run_build_job(build_cfg, now)
+            _catch_up_state["builds_completed"] += 1
+            new_docs = int(stats.get("documents_new") or 0)
+            _catch_up_state["documents_processed"] += new_docs
+            wm = stats.get("watermark_to") or stats.get("watermark_from")
+            _catch_up_state["current_watermark"] = wm
+            sim_date = wm.split("T")[0] if isinstance(wm, str) else None
+            # Day-boundary snapshot.
+            if (sim_date and last_wm_date and sim_date != last_wm_date
+                    and engine.snapshot_scheduler):
+                try:
+                    await engine.snapshot_scheduler.take_daily_snapshot(
+                        snapshot_date=_date.fromisoformat(last_wm_date),
+                        tenant_id=engine._tenant_id,
+                    )
+                    _catch_up_state["snapshots_taken"] += 1
+                except Exception:
+                    pass
+            last_wm_date = sim_date or last_wm_date
+            _catch_up_state["elapsed_seconds"] = int(
+                (_dt.now(_tz.utc) - started).total_seconds()
+            )
+            if new_docs == 0:
+                # Final snapshot for the last day we processed.
+                if last_wm_date and engine.snapshot_scheduler:
+                    try:
+                        await engine.snapshot_scheduler.take_daily_snapshot(
+                            snapshot_date=_date.fromisoformat(last_wm_date),
+                            tenant_id=engine._tenant_id,
+                        )
+                        _catch_up_state["snapshots_taken"] += 1
+                    except Exception:
+                        pass
+                break
+        _catch_up_state["status"] = "completed"
+        _catch_up_state["completed_at"] = _dt.now(_tz.utc).isoformat()
+        _catch_up_state["stopped_reason"] = (
+            "max_builds_hit"
+            if _catch_up_state["builds_completed"] >= max_builds
+            else "no_new_docs"
+        )
+    except Exception as exc:
+        _catch_up_state["status"] = "error"
+        _catch_up_state["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+        _catch_up_state["completed_at"] = _dt.now(_tz.utc).isoformat()
+
+
 @router.post(
     "/scheduler/catch-up",
     dependencies=[Depends(verify_api_key)],
-    summary="Drain the S3 backlog synchronously",
+    summary="Drain the S3 backlog asynchronously",
     description=(
-        "Runs ``run_build`` back-to-back until ``documents_new == 0`` "
-        "(or ``max_builds`` is hit). Crosses-day-boundary EOD "
-        "snapshots are taken inline so the lineage view reflects the "
-        "full progression. Returns aggregate stats: total builds, "
-        "documents_processed, snapshots_taken, stop reason. Use this "
-        "after ``/admin/reset`` to bootstrap the live read-state from "
-        "the full simulation tree without waiting on cron ticks."
+        "Spawns a background asyncio task that runs ``run_build`` "
+        "back-to-back until ``documents_new == 0`` (or ``max_builds`` "
+        "is hit). Returns immediately with a ``job_id`` + "
+        "``status='started'`` so the ALB doesn't time out on long "
+        "drains (60s default). Poll ``GET /scheduler/catch-up/status`` "
+        "for progress (builds_completed / documents_processed / "
+        "current_watermark / elapsed_seconds) until status flips to "
+        "``completed`` or ``error``.\n\n"
+        "Idempotent on concurrent calls — a second POST while a "
+        "drain is running returns ``already_running`` + the live "
+        "state instead of starting a second task."
     ),
     responses={
+        200: {"description": "Background task accepted (or already running)."},
         401: {"description": "Missing or invalid `X-API-Key`."},
         503: {"description": "Schedule engine not configured."},
     },
 )
-async def scheduler_catch_up(request: Request, max_builds: int = 200):
+async def scheduler_catch_up(request: Request, max_builds: int = 500):
     engine = _require_engine(request)
-    result = await engine.run_catch_up(max_builds=max_builds)
-    return result
+    from datetime import datetime as _dt, timezone as _tz
+    async with _catch_up_lock:
+        if _catch_up_state.get("status") == "running":
+            return {"status": "already_running", **_catch_up_state}
+        job_id = (
+            f"catch-up-{int(_dt.now(_tz.utc).timestamp())}"
+        )
+        _catch_up_state.clear()
+        _catch_up_state.update({
+            "status":              "running",
+            "job_id":              job_id,
+            "builds_completed":    0,
+            "documents_processed": 0,
+            "snapshots_taken":     0,
+            "current_watermark":   None,
+            "started_at":          _dt.now(_tz.utc).isoformat(),
+            "elapsed_seconds":     0,
+            "max_builds":          max_builds,
+        })
+        # Fire-and-forget — the task updates _catch_up_state as it
+        # progresses; caller polls the GET endpoint.
+        asyncio.create_task(_run_catch_up_bg(engine, max_builds))
+    return {"job_id": job_id, "status": "started", "max_builds": max_builds}
+
+
+@router.get(
+    "/scheduler/catch-up/status",
+    dependencies=[Depends(verify_api_key)],
+    summary="Poll the running catch-up task",
+    description=(
+        "Returns the live state of the most recent ``/scheduler/"
+        "catch-up`` run (or ``{'status': 'idle'}`` if no drain has "
+        "ever started in this process). Updated by the background "
+        "task after every build, so a 30-second poll cadence "
+        "reflects progress within one tick."
+    ),
+    responses={
+        200: {"description": "Current state of the catch-up task."},
+        401: {"description": "Missing or invalid `X-API-Key`."},
+    },
+)
+async def scheduler_catch_up_status(request: Request):
+    from datetime import datetime as _dt, timezone as _tz
+    # Refresh elapsed_seconds so a long-stalled job's ticker keeps
+    # moving even between background updates.
+    if (_catch_up_state.get("status") == "running"
+            and _catch_up_state.get("started_at")):
+        try:
+            started = _dt.fromisoformat(_catch_up_state["started_at"])
+            _catch_up_state["elapsed_seconds"] = int(
+                (_dt.now(_tz.utc) - started).total_seconds()
+            )
+        except Exception:
+            pass
+    return _catch_up_state
 
 
 @router.post(
