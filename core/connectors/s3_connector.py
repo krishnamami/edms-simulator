@@ -62,6 +62,17 @@ logger = logging.getLogger(__name__)
 SOURCE_NAME = "s3_edms_connector"
 _WATERMARK_EPOCH = "1970-01-01T00:00:00+00:00"
 
+# v4.4 — Cap per-build doc count. A date folder in the scale corpus
+# can carry 2000+ documents; reading them all into memory + threading
+# them through the indexer + extractor in a single build OOM'd the
+# Fargate task on 2 GiB. With this cap the watermark stays *within*
+# a calendar day if the day is not yet drained, so the next build
+# picks up from the cursor. End-of-day advancement is signalled via
+# an in-band ``_eod_marker`` doc the builder consumes silently — see
+# ``IncrementalGraphBuilder.run_build``'s marker branch.
+_PULL_CAP_PER_BUILD = 200
+_EOD_MARKER_KEY = "_eod_marker"
+
 # Channel dispatch — keep these as constants so a v2 backwards-compat
 # extension only requires one edit.
 _INDIVIDUAL_JSON_CHANNELS = {
@@ -291,19 +302,21 @@ class S3EDMSConnector(BaseEDMSConnector):
         by_channel:      dict[str, int] = {}     # post-filter accept
         by_channel_seen: dict[str, int] = {}     # pre-filter raw yields
 
-        # v4.3 — bounded pull: take only the FIRST date folder strictly
-        # after ``wm.date()``. Each build processes one calendar day's
-        # worth of docs; the catch-up loop or cron tick advances the
-        # watermark to end-of-that-day, then the next call picks up
-        # the following day. Without this bound a fresh-from-epoch
-        # call against the 9k-loan corpus would list ~338k objects in
-        # one shot and ALB-timeout the build.
+        # v4.4 — bounded pull: take only the FIRST date folder whose
+        # ``folder_date >= wm.date()``. Note the ``>=`` (was ``>`` in
+        # v4.3): with the per-build cap below, a single day's drain
+        # can span N builds, and the watermark stays inside that day
+        # until it's exhausted — so we MUST be willing to re-pick the
+        # same date folder. Cross-day advancement is handled by the
+        # ``_eod_marker`` synthetic doc appended below when a folder
+        # is fully drained (otherwise the picker would loop on the
+        # same exhausted date forever).
         all_folders = list(self._iter_date_folders())
         all_folders.sort(key=lambda x: x[0])
         folder_count = len(all_folders)
         next_folder: Optional[tuple] = None
         for d, p in all_folders:
-            if d <= wm.date():
+            if d < wm.date():
                 continue
             if upper is not None and d > upper.date():
                 break
@@ -381,18 +394,66 @@ class S3EDMSConnector(BaseEDMSConnector):
             )
 
         docs.sort(key=lambda d: (d.get("received_at"), d.get("document_id")))
+
+        # v4.4 — cap per-build doc count + EOD marker. Two cases:
+        #
+        #  (a) ``len(docs) > _PULL_CAP_PER_BUILD`` — folder has more
+        #      than the cap. Return the first N; wm naturally lands
+        #      at the Nth doc's received_at; next build re-picks the
+        #      same folder (the ``>=`` picker above allows this).
+        #
+        #  (b) ``len(docs) <= _PULL_CAP_PER_BUILD`` — folder fully
+        #      drained. If there's still a folder ahead within the
+        #      window, append an in-band marker doc that carries a
+        #      ``received_at`` of start-of-next-day. The builder's
+        #      persist loop skips the marker but uses its received_at
+        #      to advance the watermark, so the next build picks the
+        #      next folder. Without the marker we'd loop forever on
+        #      this exhausted day (the per-doc filter would drop
+        #      everything and the picker would re-pick the same date).
+        #
+        # No marker is appended when the folder is the last one in
+        # the window — let the caller see ``len(docs) == 0`` next
+        # build and stop the drain naturally.
+        capped = False
+        if next_folder is not None and len(docs) > _PULL_CAP_PER_BUILD:
+            docs = docs[:_PULL_CAP_PER_BUILD]
+            capped = True
+        elif next_folder is not None:
+            folder_date, _ = next_folder
+            has_next_folder_in_window = any(
+                d > folder_date
+                and (upper is None or d <= upper.date())
+                for d, _p in all_folders
+            )
+            if has_next_folder_in_window:
+                from datetime import timedelta as _td
+                next_day = folder_date + _td(days=1)
+                marker_iso = datetime(
+                    next_day.year, next_day.month, next_day.day,
+                    0, 0, 0, tzinfo=timezone.utc,
+                ).isoformat()
+                docs.append({
+                    _EOD_MARKER_KEY: True,
+                    "received_at":   marker_iso,
+                    "folder_date":   folder_date.isoformat(),
+                })
+
         # Inline funnel + by_channel stats so the production stdlib
         # formatter surfaces them in CloudWatch — ``extra={}`` is dropped
         # by the default formatter and won't show up there.
         chan_acc  = ",".join(f"{k}={v}" for k, v in sorted(by_channel.items())) or "-"
         chan_seen = ",".join(f"{k}={v}" for k, v in sorted(by_channel_seen.items())) or "-"
+        accepted_real = sum(1 for d in docs if not d.get(_EOD_MARKER_KEY))
+        marker_count  = len(docs) - accepted_real
         logger.info(
             "connector_pull_complete "
             f"folders_total={folder_count} folders_in_win={in_window} "
             f"files_total={total_files} read_failed={read_failed} "
             f"no_received_at={no_received_at} "
             f"filtered_pre_wm={filtered_pre} filtered_post={filtered_post} "
-            f"accepted={len(docs)} "
+            f"accepted={accepted_real} eod_markers={marker_count} "
+            f"capped={capped} cap={_PULL_CAP_PER_BUILD} "
             f"by_channel_seen={chan_seen} "
             f"by_channel_accepted={chan_acc} "
             f"bucket={getattr(self, '_bucket', None)} "

@@ -1092,6 +1092,8 @@ class IncrementalGraphBuilder:
             )
         except Exception as exc:
             stats["duration_ms"] = int((time.perf_counter() - t0) * 1000)
+            stats["watermark_from"] = wm_from
+            stats["watermark_to"]   = wm_from
             await self._record_run(
                 build_date, build_number, wm_from, wm_from,
                 stats, started_at, status="failed",
@@ -1101,9 +1103,19 @@ class IncrementalGraphBuilder:
                          extra={"error": str(exc)[:200]})
             return stats
 
+        # v4.4 — the connector may inject in-band ``_eod_marker`` docs
+        # to signal "this folder is drained; advance wm past it". They
+        # carry no document_id / applicant_id and aren't real evidence,
+        # so split them out before the persist loop sees them. Their
+        # ``received_at`` (= start of next day) still threads through
+        # wm_to advancement below so cross-day movement keeps working.
+        eod_markers = [d for d in new_docs if d.get("_eod_marker")]
+        new_docs    = [d for d in new_docs if not d.get("_eod_marker")]
         stats["documents_pulled"] = len(new_docs)
-        if not new_docs:
+        if not new_docs and not eod_markers:
             stats["duration_ms"] = int((time.perf_counter() - t0) * 1000)
+            stats["watermark_from"] = wm_from
+            stats["watermark_to"]   = wm_from
             await self._record_run(
                 build_date, build_number, wm_from, wm_from,
                 stats, started_at, tenant_id=tenant_id,
@@ -1260,6 +1272,15 @@ class IncrementalGraphBuilder:
             if application_id:
                 affected_apps.setdefault(application_id, doc.get("los_id") or "")
 
+        # v4.4 — fold connector's ``_eod_marker`` received_at into
+        # wm_to so a marker-only pull still advances the watermark
+        # past the drained date folder. Without this the catch-up
+        # loop would picker-loop on the same exhausted day forever.
+        for marker in eod_markers:
+            received = marker.get("received_at")
+            if received and received > (wm_to or ""):
+                wm_to = received
+
         # ── Step 4: reconcile (scoped per-doc) ─────────────────────
         # Edges still come out of the existing reconciler — we just
         # stamp ``application_id`` on each row so a workbench query
@@ -1374,6 +1395,13 @@ class IncrementalGraphBuilder:
             except Exception as exc:
                 logger.warning("watermark_save_failed",
                                extra={"error": str(exc)[:200]})
+
+        # Surface watermark bookends on the stats so the catch-up loop
+        # can distinguish "build did real work" from "build advanced
+        # wm via an _eod_marker only" — the latter still has to count
+        # as forward progress even though ``documents_pulled == 0``.
+        stats["watermark_from"] = wm_from
+        stats["watermark_to"]   = wm_to
 
         # ── Step 6: record the run ───────────────────────────────────
         stats["duration_ms"] = int((time.perf_counter() - t0) * 1000)

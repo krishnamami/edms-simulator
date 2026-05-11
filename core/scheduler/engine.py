@@ -386,20 +386,21 @@ class ScheduleEngine:
             new_docs = int(stats.get("documents_new") or 0)
             new_apps = int(stats.get("applications_created") or 0)
             pulled   = int(stats.get("documents_pulled") or 0)
+            wm_from  = stats.get("watermark_from")
+            wm_to    = stats.get("watermark_to") or wm_from
+            wm_advanced = bool(wm_to and wm_from and wm_to != wm_from)
             logger.info(
                 f"catch_up_build build={builds} docs_pulled={pulled} "
                 f"docs_new={new_docs} apps_new={new_apps} "
+                f"wm_advanced={wm_advanced} "
                 f"total_new={total_docs_new} sim_date={sim_date}"
             )
             # Stop only when the connector found ABSOLUTELY NOTHING in
-            # the next date folder — i.e., we've reached the end of
-            # the corpus. ``documents_new == 0`` alone means "this
-            # day's docs were all dedup-skipped because they're
-            # already in PG", which can happen when re-running catch-
-            # up over partially-indexed dates; the next folder might
-            # still have brand-new content. Only ``documents_pulled
-            # == 0 && applications_created == 0`` means truly idle.
-            if pulled == 0 and new_apps == 0:
+            # the next date folder AND the watermark didn't advance.
+            # An ``_eod_marker``-only pull from the connector signals
+            # "this folder is drained, push past it" — pulled=0, but
+            # wm advances. Treat as forward progress.
+            if pulled == 0 and new_apps == 0 and not wm_advanced:
                 # Final EOD snapshot for the last day we processed.
                 if last_wm_date and self.snapshot_scheduler:
                     try:

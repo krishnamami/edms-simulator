@@ -782,6 +782,9 @@ async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
                 new_docs = int(stats.get("documents_new") or 0)
                 new_apps = int(stats.get("applications_created") or 0)
                 pulled   = int(stats.get("documents_pulled") or 0)
+                wm_from  = stats.get("watermark_from")
+                wm_to    = stats.get("watermark_to") or wm_from
+                wm_advanced = bool(wm_to and wm_from and wm_to != wm_from)
                 state["documents_processed"] += new_docs
                 state["documents_pulled"] = (
                     int(state.get("documents_pulled") or 0) + pulled
@@ -789,7 +792,7 @@ async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
                 state["applications_created"] = (
                     int(state.get("applications_created") or 0) + new_apps
                 )
-                wm = stats.get("watermark_to") or stats.get("watermark_from")
+                wm = wm_to or wm_from
                 state["current_watermark"] = wm
                 sim_date = wm.split("T")[0] if isinstance(wm, str) else None
                 if (sim_date and last_wm_date and sim_date != last_wm_date
@@ -810,12 +813,15 @@ async def _run_catch_up_bg(engine, redis, max_builds: int) -> None:
                 await _write_catchup_state(redis, state)
 
                 # Stop only when the connector found ABSOLUTELY
-                # NOTHING in the next date folder. ``documents_new
-                # == 0`` alone means "this day was already indexed"
-                # (possible on a partial re-run) — keep going.
-                # Only ``documents_pulled == 0 && applications_created
-                # == 0`` means truly idle.
-                if pulled == 0 and new_apps == 0:
+                # NOTHING in the next date folder AND the watermark
+                # didn't advance. ``documents_new == 0`` alone means
+                # "this day was already indexed" (partial re-run);
+                # ``pulled == 0 && apps == 0 && wm_advanced`` means
+                # the connector emitted an EOD marker to push past a
+                # drained date folder — keep going, the next folder
+                # may still have new content. Only when all three
+                # signals say "idle" is the corpus truly drained.
+                if pulled == 0 and new_apps == 0 and not wm_advanced:
                     if last_wm_date and engine.snapshot_scheduler:
                         try:
                             await engine.snapshot_scheduler.take_daily_snapshot(

@@ -203,6 +203,106 @@ def test_watermark_filter_excludes_pre_window_docs(v2_root: Path):
     assert all(r > "2026-01-01T12:00:00Z" for r in received), received
 
 
+def test_v4_pull_cap_returns_first_n_and_no_eod_marker(tmp_path: Path):
+    """v4.4 — when a folder carries more docs than the per-build cap,
+    the connector returns the first N (sorted by received_at) and
+    does NOT append an EOD marker — the watermark advances mid-day so
+    the next build re-picks the same folder."""
+    from core.connectors.s3_connector import _PULL_CAP_PER_BUILD
+    root = tmp_path / "s3_simulation_v4"
+    day  = root / "2026-01-01"
+    # 250 docs is comfortably > the 200 cap.
+    for i in range(_PULL_CAP_PER_BUILD + 50):
+        _write(day / "edms_pull" / f"EDMS-{i:04d}.json", {
+            "document_id":      f"EDMS-{i:04d}",
+            "document_type":    "W2_CURRENT",
+            "category":         "income",
+            "los_id":           "LOAN-101",
+            "borrower_role":    "primary",
+            "received_at":      f"2026-01-01T{(i // 60) % 24:02d}:{i % 60:02d}:00Z",
+            "extracted_fields": {},
+        })
+    c = S3EDMSConnector(str(root), _StubPG())
+    docs = asyncio.run(c.pull_documents_since("1970-01-01T00:00:00Z"))
+    assert len(docs) == _PULL_CAP_PER_BUILD, (
+        f"expected exactly {_PULL_CAP_PER_BUILD} docs after the cap, "
+        f"got {len(docs)}"
+    )
+    assert not any(d.get("_eod_marker") for d in docs), (
+        "EOD marker must not appear when the cap was hit — wm should "
+        "stay mid-day so the next build re-picks the same folder"
+    )
+    # Sorted ascending by received_at — the LATEST returned doc is the
+    # 200th (mid-day, not end-of-day).
+    received = [d["received_at"] for d in docs]
+    assert received == sorted(received), "docs must be sorted"
+
+
+def test_v4_eod_marker_appended_when_folder_drained_with_more_folders(tmp_path: Path):
+    """v4.4 — when a folder has <= cap docs AND there's a later folder
+    in window, the connector appends an in-band ``_eod_marker`` with
+    ``received_at`` = start of next day so the builder advances the
+    watermark past the drained folder. Without the marker the picker
+    would re-loop on the same exhausted day forever."""
+    root = tmp_path / "s3_simulation_v4_eod"
+    # Two date folders; pull from epoch picks day-1 and should mark
+    # it as drained so the next build moves to day-2.
+    _write(root / "2026-01-01" / "edms_pull" / "DOC-001.json", {
+        "document_id":      "DOC-001",
+        "document_type":    "W2_CURRENT",
+        "category":         "income",
+        "los_id":           "LOAN-101",
+        "borrower_role":    "primary",
+        "received_at":      "2026-01-01T09:15:00Z",
+        "extracted_fields": {},
+    })
+    _write(root / "2026-01-02" / "edms_pull" / "DOC-002.json", {
+        "document_id":      "DOC-002",
+        "document_type":    "W2_CURRENT",
+        "category":         "income",
+        "los_id":           "LOAN-101",
+        "borrower_role":    "primary",
+        "received_at":      "2026-01-02T09:15:00Z",
+        "extracted_fields": {},
+    })
+    c = S3EDMSConnector(str(root), _StubPG())
+    docs = asyncio.run(c.pull_documents_since("1970-01-01T00:00:00Z"))
+    real_docs = [d for d in docs if not d.get("_eod_marker")]
+    markers   = [d for d in docs if d.get("_eod_marker")]
+    assert len(real_docs) == 1, (
+        f"expected exactly one real doc (day-1), got {len(real_docs)}"
+    )
+    assert real_docs[0]["document_id"] == "DOC-001"
+    assert len(markers) == 1, (
+        f"expected one EOD marker when folder drained with more folders ahead, "
+        f"got {len(markers)}"
+    )
+    assert markers[0]["received_at"].startswith("2026-01-02T00:00:00"), (
+        f"marker received_at must be start of next day; got {markers[0]['received_at']}"
+    )
+
+
+def test_v4_eod_marker_NOT_appended_on_last_folder(tmp_path: Path):
+    """v4.4 — when the drained folder is the last one in window, do
+    NOT append a marker. Let the catch-up loop see the empty pull on
+    the next build and stop naturally."""
+    root = tmp_path / "s3_simulation_v4_last"
+    _write(root / "2026-01-01" / "edms_pull" / "DOC-001.json", {
+        "document_id":      "DOC-001",
+        "document_type":    "W2_CURRENT",
+        "category":         "income",
+        "los_id":           "LOAN-101",
+        "borrower_role":    "primary",
+        "received_at":      "2026-01-01T09:15:00Z",
+        "extracted_fields": {},
+    })
+    c = S3EDMSConnector(str(root), _StubPG())
+    docs = asyncio.run(c.pull_documents_since("1970-01-01T00:00:00Z"))
+    assert not any(d.get("_eod_marker") for d in docs), (
+        "no marker should be appended when there are no folders ahead"
+    )
+
+
 def test_sibling_pdf_files_are_ignored_by_dispatch(v2_root: Path):
     """``edms_pull/`` and ``los_encompass/`` may carry sibling raw
     ``.pdf`` evidence files alongside the JSON record (added by
