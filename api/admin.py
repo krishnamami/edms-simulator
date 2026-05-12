@@ -383,7 +383,7 @@ async def _run_rebuild_bg(pg, redis, tenant_id: str, force: bool) -> None:
         )
         state = await read_backfill_state(tenant_id=tenant_id)
         state["status"]       = "failed"
-        state["completed_at"] = _dt.now(_tz.utc).isoformat()
+        state["completed_at"] = _dt.now(_tz.utc)
         state.setdefault("errors", []).append({
             "application_id": None,
             "error":          f"{type(exc).__name__}: {str(exc)[:400]}",

@@ -96,10 +96,28 @@ async def read_backfill_state(tenant_id: str = "default") -> dict:
     return out
 
 
+def _as_dt(v):
+    """asyncpg refuses ISO strings for TIMESTAMPTZ columns — it wants a
+    real ``datetime`` instance. Accept either form so callers can read
+    the state, mutate fields, and write back without re-parsing."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, str):
+        try:
+            return datetime.fromisoformat(v.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
 async def write_backfill_state(state: dict, tenant_id: str = "default") -> None:
     """UPSERT the singleton row. Always overwrites — caller is
     responsible for merging deltas (typically: read → modify → write
-    in the orchestrator loop)."""
+    in the orchestrator loop). Coerces the two TIMESTAMPTZ fields to
+    real ``datetime`` instances; asyncpg's binary protocol rejects ISO
+    strings on those columns."""
     errs = state.get("errors") or []
     await db.execute(
         f"""
@@ -125,8 +143,8 @@ async def write_backfill_state(state: dict, tenant_id: str = "default") -> None:
         int(state.get("total_count") or 0),
         state.get("status") or "running",
         json.dumps(errs, default=str),
-        state.get("started_at"),
-        state.get("completed_at"),
+        _as_dt(state.get("started_at")),
+        _as_dt(state.get("completed_at")),
     )
 
 
@@ -659,7 +677,7 @@ async def run_backfill(
             "total_count":                   await count_applications(tenant_id),
             "status":                        "running",
             "errors":                        [],
-            "started_at":                    datetime.now(timezone.utc).isoformat(),
+            "started_at":                    datetime.now(timezone.utc),
             "completed_at":                  None,
         }
     else:
@@ -698,7 +716,7 @@ async def run_backfill(
             if len([e for e in state["errors"]
                     if e.get("application_id") == application_id]) >= max_errors:
                 state["status"]       = "failed"
-                state["completed_at"] = datetime.now(timezone.utc).isoformat()
+                state["completed_at"] = datetime.now(timezone.utc)
                 await write_backfill_state(state, tenant_id=tenant_id)
                 return state
 
@@ -712,7 +730,7 @@ async def run_backfill(
             )
 
     state["status"]       = "completed"
-    state["completed_at"] = datetime.now(timezone.utc).isoformat()
+    state["completed_at"] = datetime.now(timezone.utc)
     await write_backfill_state(state, tenant_id=tenant_id)
     logger.info(
         f"golden_record_backfill_complete "
