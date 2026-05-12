@@ -793,6 +793,26 @@ CREATE INDEX IF NOT EXISTS idx_doc_source_channel
     WHERE source_channel IS NOT NULL;
 
 -- =====================================================================
+-- v4.5 — golden_record_backfill_state. Singleton row (per tenant)
+-- tracking restartable progress of POST /admin/rebuild-golden-records.
+-- ``last_completed_application_id`` is the cursor: on restart the
+-- orchestrator does ``WHERE application_id > $last_completed`` and
+-- resumes. Errors accumulate in a JSONB array so the operator can see
+-- which applications crashed without scrolling CloudWatch.
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS golden_record_backfill_state (
+    tenant_id                      VARCHAR(50)  PRIMARY KEY DEFAULT 'default',
+    last_completed_application_id  VARCHAR(200),
+    completed_count                INT          NOT NULL DEFAULT 0,
+    total_count                    INT          NOT NULL DEFAULT 0,
+    status                         VARCHAR(20)  NOT NULL DEFAULT 'not_started',
+    errors                         JSONB        NOT NULL DEFAULT '[]'::jsonb,
+    started_at                     TIMESTAMPTZ,
+    updated_at                     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    completed_at                   TIMESTAMPTZ
+);
+
+-- =====================================================================
 -- v4 additions — applications tracks stated (from URLA) vs verified
 -- (from documents) values side by side, so /application/{id}/context
 -- can surface "stated $125k income, verified $123k via W-2" without

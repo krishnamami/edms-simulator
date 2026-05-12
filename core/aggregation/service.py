@@ -482,21 +482,33 @@ class AggregationService:
 
             # ── entity_states write-through ──────────────────────────
             #
-            # After every layer is assembled + cached, fan out into
-            # entity_states for the four lending entities (borrower /
-            # co_borrower / property / loan_terms). Wrapped in a global
-            # try/except so a malformed state on one entity never blocks
-            # the upload path; per-entity failures are bucketed inside
-            # ``upsert_all_entities`` and logged.
+            # Compose the v4 single-row-per-application ``entity_states``
+            # record (borrower + co_borrowers + property + loan_terms
+            # JSONB plus indexed columns for mid_score / qualifying /
+            # loan_amount / dti / piti / ltv) from the profiles we just
+            # saved and UPSERT it. Wrapped in a global try/except so a
+            # malformed state never blocks the upload path; the
+            # source-of-truth profile rows are already in PG above.
+            #
+            # ``_compose_and_upsert_entity_state`` doesn't re-run the
+            # assemblers — we just ran them above and the result is in
+            # ``profile`` / ``primary_credit`` / ``co_credit``. The
+            # heavier ``rebuild_one`` (which re-runs them) is used by
+            # the ``/admin/rebuild-golden-records`` backfill path.
             try:
-                from core.aggregation.entity_state_builder import upsert_all_entities
-                await upsert_all_entities(
-                    pg=self.postgres_store,
-                    redis=self.redis_store,
-                    application_id=application_id,
-                    applicant_id=applicant_id,
-                    co_applicant_id=co_applicant_id,
-                    tenant_id=current_tenant_id(),
+                from core.aggregation.golden_record_builder import (
+                    _compose_and_upsert_entity_state,
+                )
+                app_row = await self.postgres_store.get_application(
+                    application_id, tenant_id=current_tenant_id(),
+                )
+                los_id = (app_row or {}).get("los_id") or ""
+                await _compose_and_upsert_entity_state(
+                    self.postgres_store, self.redis_store,
+                    application_id, applicant_id, co_applicant_id,
+                    los_id, loan_data, primary_credit, co_credit, profile,
+                    primary_docs, co_docs,
+                    current_tenant_id(),
                 )
             except Exception as exc:
                 logger.warning(

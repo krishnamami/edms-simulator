@@ -349,3 +349,161 @@ async def admin_reset(request: Request):
         "failed":            failed,
         "redis_flushed":     redis_flushed,
     }
+
+
+# =====================================================================
+# Golden-record backfill — POST /admin/rebuild-golden-records (202'd to
+# background) + GET /admin/rebuild-golden-records/status. See
+# core/aggregation/golden_record_builder.py for the per-application
+# orchestrator that backs both endpoints.
+# =====================================================================
+import asyncio as _asyncio
+from datetime import datetime as _dt, timezone as _tz
+
+# In-process guard so a second POST on the same replica can't spawn a
+# duplicate background task. Cross-replica safety comes from the PG-
+# backed watermark + idempotent UPSERTs — two replicas racing produces
+# correct (if wasteful) writes.
+_REBUILD_LOCK = _asyncio.Lock()
+
+
+async def _run_rebuild_bg(pg, redis, tenant_id: str, force: bool) -> None:
+    """Background task launched by POST. Swallows top-level exceptions
+    into the watermark row so the asyncio future doesn't surface an
+    uncaught traceback in CloudWatch."""
+    from core.aggregation.golden_record_builder import (
+        run_backfill, read_backfill_state, write_backfill_state,
+    )
+    try:
+        await run_backfill(pg, redis, tenant_id=tenant_id, force=force)
+    except Exception as exc:
+        logger.error(
+            f"rebuild_golden_records_bg_failed tenant={tenant_id} "
+            f"error_type={type(exc).__name__} error={str(exc)[:300]}"
+        )
+        state = await read_backfill_state(tenant_id=tenant_id)
+        state["status"]       = "failed"
+        state["completed_at"] = _dt.now(_tz.utc).isoformat()
+        state.setdefault("errors", []).append({
+            "application_id": None,
+            "error":          f"{type(exc).__name__}: {str(exc)[:400]}",
+            "at":             _dt.now(_tz.utc).isoformat(),
+        })
+        await write_backfill_state(state, tenant_id=tenant_id)
+
+
+@router.post(
+    "/rebuild-golden-records",
+    summary="Rebuild income / credit / xref / entity_states from already-indexed docs",
+    description=(
+        "Backfill orchestrator. Reads every application in the tenant "
+        "ORDER BY application_id ASC, re-runs the income + credit "
+        "assemblers against the docs currently in ``document_index``, "
+        "writes ``income_profiles`` / ``credit_profiles`` / "
+        "``applicant_identity_xref`` / ``entity_states`` for each, and "
+        "logs an ``entity_state_events`` row.\n\n"
+        "**Restartable.** Progress is committed per application to "
+        "``golden_record_backfill_state``. On crash, the next POST "
+        "resumes after the last committed ``application_id`` — passing "
+        "``?force=true`` resets the watermark and re-UPSERTs every row "
+        "from scratch.\n\n"
+        "Returns immediately with HTTP 202; poll "
+        "``GET /admin/rebuild-golden-records/status`` for progress."
+    ),
+    status_code=202,
+    dependencies=[Depends(require_admin)],
+    responses={
+        202: {"description": "Background task accepted."},
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        403: {"description": "`admin` scope required."},
+        409: {"description": "A backfill is already running."},
+    },
+)
+async def rebuild_golden_records(request: Request, force: bool = False):
+    pg    = request.app.state.postgres_store
+    redis = request.app.state.redis_store
+    tenant_id = getattr(request.state, "tenant_id", "default") or "default"
+
+    from core.aggregation.golden_record_builder import (
+        read_backfill_state, count_applications,
+    )
+
+    async with _REBUILD_LOCK:
+        existing = await read_backfill_state(tenant_id=tenant_id)
+        if existing.get("status") == "running" and not force:
+            return {
+                "status":         "already_running",
+                "completed":      existing.get("completed_count") or 0,
+                "total":          existing.get("total_count") or 0,
+                "last_completed": existing.get("last_completed_application_id"),
+                "started_at":     (existing.get("started_at").isoformat()
+                                   if hasattr(existing.get("started_at"), "isoformat")
+                                   else existing.get("started_at")),
+            }
+        total = await count_applications(tenant_id)
+        _asyncio.create_task(_run_rebuild_bg(pg, redis, tenant_id, force))
+        logger.info(
+            f"rebuild_golden_records_started tenant={tenant_id} "
+            f"force={force} total_applications={total}"
+        )
+        return {
+            "status":    "started",
+            "force":     bool(force),
+            "total":     total,
+            "tenant_id": tenant_id,
+            "message":   "Poll GET /admin/rebuild-golden-records/status for progress.",
+        }
+
+
+@router.get(
+    "/rebuild-golden-records/status",
+    summary="Poll the running golden-record backfill",
+    description=(
+        "Returns the current state of the most recent backfill (or "
+        "``{'status': 'not_started'}`` if one has never run for this "
+        "tenant). Updated by the background task after every "
+        "application, so a 5-second poll cadence reflects progress "
+        "within a few apps."
+    ),
+    dependencies=[Depends(require_admin)],
+    responses={
+        200: {"description": "Current backfill state."},
+        401: {"description": "Missing or invalid `X-API-Key`."},
+        403: {"description": "`admin` scope required."},
+    },
+)
+async def rebuild_golden_records_status(request: Request):
+    tenant_id = getattr(request.state, "tenant_id", "default") or "default"
+    from core.aggregation.golden_record_builder import read_backfill_state
+    s = await read_backfill_state(tenant_id=tenant_id)
+
+    def _iso(v):
+        return v.isoformat() if hasattr(v, "isoformat") else v
+
+    started   = s.get("started_at")
+    completed = s.get("completed_at")
+    elapsed   = None
+    if started:
+        try:
+            sd = started if isinstance(started, _dt) else _dt.fromisoformat(
+                str(started).replace("Z", "+00:00")
+            )
+            end = completed if isinstance(completed, _dt) else (
+                _dt.fromisoformat(str(completed).replace("Z", "+00:00"))
+                if completed else _dt.now(_tz.utc)
+            )
+            elapsed = int((end - sd).total_seconds())
+        except Exception:
+            elapsed = None
+
+    return {
+        "status":            s.get("status") or "not_started",
+        "completed":         int(s.get("completed_count") or 0),
+        "total":             int(s.get("total_count") or 0),
+        "last_completed":    s.get("last_completed_application_id"),
+        "errors":            s.get("errors") or [],
+        "started_at":        _iso(started),
+        "completed_at":      _iso(completed),
+        "elapsed_seconds":   elapsed,
+        "tenant_id":         tenant_id,
+    }
