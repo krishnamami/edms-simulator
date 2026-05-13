@@ -608,19 +608,17 @@ ON CONFLICT (api_key) DO NOTHING;
 -- queries (``WHERE mid_credit_score >= 700 AND completeness_pct >=
 -- 80 AND NOT clear_to_close``) sub-millisecond.
 --
--- entity_states is fully derived from document_index + applicants +
--- applications. We therefore DROP+CREATE on every container boot —
--- next build re-assembles from source. The historical
--- entity_snapshots table is also dropped here (lineage rebuilds at
--- the next EOD tick); set ``DISABLE_V4_ENTITY_RESET=true`` if you
--- need the old data preserved across a deploy.
+-- IMPORTANT: this section must stay idempotent. ``apply_schema()``
+-- runs the whole file on every ECS task boot, so any destructive DDL
+-- here wipes production on every rolling deploy. To wipe + rebuild
+-- entity_states, run ``scripts/reset_v3_data.sql`` manually — that is
+-- the supported reset path. The golden-record backfill orchestrator
+-- (``POST /admin/rebuild-golden-records``) is the supported way to
+-- re-derive rows from document_index + applicants + applications
+-- after a wipe.
 -- =====================================================================
 
-DROP TABLE IF EXISTS entity_state_events;
-DROP TABLE IF EXISTS entity_snapshots;
-DROP TABLE IF EXISTS entity_states;
-
-CREATE TABLE entity_states (
+CREATE TABLE IF NOT EXISTS entity_states (
     application_id            VARCHAR(100) PRIMARY KEY,
     tenant_id                 VARCHAR(50) NOT NULL DEFAULT 'default',
     los_id                    VARCHAR(100),
@@ -698,7 +696,7 @@ CREATE INDEX IF NOT EXISTS idx_es_clear        ON entity_states(clear_to_close);
 
 -- One row per (snapshot_date, application_id) — EOD copy of
 -- entity_states. Powers /entity/{id}/timeline + lineage replay.
-CREATE TABLE entity_snapshots (
+CREATE TABLE IF NOT EXISTS entity_snapshots (
     id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     snapshot_date             DATE NOT NULL,
     application_id            VARCHAR(100) NOT NULL,
@@ -735,7 +733,7 @@ CREATE INDEX IF NOT EXISTS idx_snap_tenant ON entity_snapshots(tenant_id, snapsh
 -- new doc-driven field updates, condition cleared, etc.). The builder
 -- writes these alongside the upsert so /entity/{id}/events surfaces a
 -- granular history without diff-scanning snapshots.
-CREATE TABLE entity_state_events (
+CREATE TABLE IF NOT EXISTS entity_state_events (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     application_id  VARCHAR(100) NOT NULL,
     tenant_id       VARCHAR(50) NOT NULL DEFAULT 'default',
