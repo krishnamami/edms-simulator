@@ -93,7 +93,12 @@ EXPECTED_VIEWS = [
 
 
 def _read_schema() -> str:
-    return SCHEMA_FILE.read_text(encoding="utf-8")
+    """Read schema.sql and strip ``--`` line comments the same way
+    ``core.storage.migrations.apply_schema`` does. Without this, free-
+    text inside comments (e.g. "may be a scalar OR an array FROM ...")
+    would trip our regex-based splitters."""
+    raw = SCHEMA_FILE.read_text(encoding="utf-8")
+    return re.sub(r"--[^\n]*", "", raw)
 
 
 def _extract_view_body(schema_sql: str, view_name: str) -> str:
@@ -112,15 +117,34 @@ def _extract_view_body(schema_sql: str, view_name: str) -> str:
 _FROM_RE = re.compile(r"\bFROM\b", re.IGNORECASE)
 
 
+def _find_top_level_from(body: str) -> int:
+    """Return the byte offset of the TOP-LEVEL ``FROM`` (depth-0, not
+    inside a subquery). Returns ``-1`` if none found. Views with a
+    CASE that uses ``jsonb_array_elements(...)`` carry a subquery
+    FROM at depth > 0 — those must be skipped."""
+    depth = 0
+    for m in _FROM_RE.finditer(body):
+        # Count parens up to (but not including) this match.
+        depth = body.count("(", 0, m.start()) - body.count(")", 0, m.start())
+        if depth == 0:
+            # First depth-0 FROM. The view's outer FROM is always the
+            # first one at depth 0 because the SELECT's projection
+            # comes BEFORE the outer FROM. (Any earlier "FROM" in the
+            # body has to live inside a depth-> 0 subquery.)
+            return m.start()
+    return -1
+
+
 def _split_select_and_from(body: str) -> tuple[str, str]:
     """Split a view body into ``(select_projection, from_clause)``
-    using a regex match for ``FROM`` so a newline-preceded keyword
-    (which is the style in our schema) is still found."""
-    m = _FROM_RE.search(body)
-    if not m:
+    based on the TOP-LEVEL FROM. Subquery FROMs inside CASE
+    expressions live at depth > 0 and are ignored — see
+    ``_find_top_level_from``."""
+    idx = _find_top_level_from(body)
+    if idx < 0:
         return "", ""
-    projection = body[:m.start()]
-    rest       = body[m.end():].strip()
+    projection = body[:idx]
+    rest       = body[idx + len("FROM"):].strip()
     # Drop the leading "SELECT" so the caller sees only projection cols.
     projection = re.sub(r"^\s*SELECT\s+", "", projection,
                         flags=re.IGNORECASE)
@@ -225,3 +249,46 @@ def test_views_use_create_or_replace_for_idempotent_redeploy(schema_sql):
         assert header.search(schema_sql), (
             f"{view_name} must be declared with CREATE OR REPLACE VIEW"
         )
+
+
+# ===========================================================================
+# Regression guards — JSONB casts that landed array/object values in
+# production must stay protected. These tests fail loudly if anyone
+# unwinds the ``jsonb_typeof`` safety net while refactoring.
+# ===========================================================================
+
+
+_TYPEOF_GUARDED_VIEWS = [
+    # (view_name, JSONB path that may be array/object/scalar)
+    ("vw_credit_assessment_context",       "borrower->'credit'->'monthly_obligations'"),
+    ("vw_dti_calculation_context",         "borrower->'credit'->'monthly_obligations'"),
+    ("vw_employment_reconciliation_context",
+                                            "borrower->'employment'->'income_amount'"),
+]
+
+
+@pytest.mark.parametrize(
+    "view_name,path", _TYPEOF_GUARDED_VIEWS,
+    ids=[f"{v}:{p}" for v, p in _TYPEOF_GUARDED_VIEWS],
+)
+def test_jsonb_typeof_guard_present_on_risky_cast(schema_sql, view_name, path):
+    """``::float`` against a JSONB array text representation raises in
+    Postgres at query time. Decision OS hit this with
+    ``borrower.credit.monthly_obligations`` (a list of obligation
+    rows when the credit assembler runs against a real CREDIT_REPORT
+    doc) and again with ``borrower.employment.income_amount`` (raw
+    extracted_fields passthrough — anything from a numeric string to
+    a chaos-test "one hundred thousand"). Every cast against one of
+    those paths must be wrapped in ``jsonb_typeof`` so the bad shapes
+    fall through to NULL or 0 instead of erroring the whole query."""
+    body = _extract_view_body(schema_sql, view_name)
+    assert body, f"{view_name} missing from schema.sql"
+    # ``jsonb_typeof(<path>)`` must appear at least once in the same
+    # view body where ``<path>::float`` would otherwise live.
+    expected = f"jsonb_typeof({path})"
+    assert expected in body, (
+        f"{view_name}: missing safety guard `{expected}` — a future "
+        "refactor that removed the jsonb_typeof CASE would re-introduce "
+        "the production query failure on real-doc monthly_obligations "
+        "or chaos-case income_amount."
+    )

@@ -931,7 +931,18 @@ SELECT
     (borrower->'credit'->>'derogatory_marks')::int                  AS derogatory_marks,
     (borrower->'credit'->>'open_tradelines')::int                   AS open_tradelines,
     (borrower->'credit'->>'credit_utilization')::float              AS credit_utilization,
-    (borrower->'credit'->>'monthly_obligations')::float             AS monthly_obligations,
+    -- monthly_obligations may be a scalar (total_monthly_obligations
+    -- mirror) OR a JSONB array of obligation rows from the credit
+    -- assembler's ``_normalize_obligations`` output. The CASE branches
+    -- on jsonb_typeof so a ``::float`` cast never sees an array text.
+    CASE
+        WHEN jsonb_typeof(borrower->'credit'->'monthly_obligations') = 'number'
+            THEN (borrower->'credit'->>'monthly_obligations')::float
+        WHEN jsonb_typeof(borrower->'credit'->'monthly_obligations') = 'array'
+            THEN (SELECT COALESCE(SUM((elem->>'monthly_payment')::float), 0)
+                    FROM jsonb_array_elements(borrower->'credit'->'monthly_obligations') elem)
+        ELSE 0
+    END                                                             AS monthly_obligations,
     status,
     completeness_pct
 FROM entity_states;
@@ -983,7 +994,19 @@ SELECT
     borrower->'employment'->>'period_start'                         AS period_start,
     borrower->'employment'->>'period_end'                           AS period_end,
     borrower->'employment'->>'employment_status'                    AS employment_status,
-    (borrower->'employment'->>'income_amount')::float               AS gross_amount,
+    -- income_amount passes through document_index.extracted_fields
+    -- unchanged, so the value can be anything the doc carried:
+    -- a number, a numeric string ("95000"), a non-numeric string
+    -- ("one hundred thousand" — see chaos-test hardening), or an
+    -- object/array. Only cast when the JSONB is a scalar AND the
+    -- text matches a numeric literal; otherwise NULL so the persona
+    -- treats the value as unknown rather than crashing the query.
+    CASE
+        WHEN jsonb_typeof(borrower->'employment'->'income_amount') IN ('number', 'string')
+             AND (borrower->'employment'->>'income_amount') ~ '^-?[0-9]+(\.[0-9]+)?$'
+            THEN (borrower->'employment'->>'income_amount')::float
+        ELSE NULL
+    END                                                             AS gross_amount,
     borrower->'income'->>'stated_employer'                          AS stated_employer,
     (borrower->'income'->>'stated_income_annual')::float            AS stated_income,
     status
@@ -1017,7 +1040,16 @@ SELECT
     tenant_id,
     dti_back                                                        AS dti,
     dti_front,
-    (borrower->'credit'->>'monthly_obligations')::float             AS existing_debt_obligations,
+    -- See note on monthly_obligations in vw_credit_assessment_context —
+    -- same upstream JSONB may be a scalar or an array of obligation rows.
+    CASE
+        WHEN jsonb_typeof(borrower->'credit'->'monthly_obligations') = 'number'
+            THEN (borrower->'credit'->>'monthly_obligations')::float
+        WHEN jsonb_typeof(borrower->'credit'->'monthly_obligations') = 'array'
+            THEN (SELECT COALESCE(SUM((elem->>'monthly_payment')::float), 0)
+                    FROM jsonb_array_elements(borrower->'credit'->'monthly_obligations') elem)
+        ELSE 0
+    END                                                             AS existing_debt_obligations,
     piti_monthly                                                    AS proposed_payment,
     qualifying_monthly,
     combined_monthly_income,
