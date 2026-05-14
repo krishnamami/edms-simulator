@@ -892,6 +892,95 @@ CREATE INDEX IF NOT EXISTS idx_outbox_webhook
     ON webhook_outbox(webhook_id, status, created_at DESC);
 
 -- =====================================================================
+-- Decision OS — decision output tracking + analytics.
+--
+-- ``decision_outputs`` is the source-of-truth row Decision OS writes
+-- back to EDMS for every persona decision (ALLOW / BLOCK / ESCALATE
+-- / RECOMMEND). One row per (application_id, decision_id, version);
+-- a re-decision after a context update increments ``version`` and
+-- back-points the prior row via ``superseded_by``.
+--
+-- ``decision_timeline`` is the append-only state-transition log —
+-- ``from_state → to_state`` with the trigger that fired it and the
+-- elapsed-time deltas the management dashboard reads to surface
+-- bottlenecks (which step a loan is stuck on, how long it's been
+-- waiting, what it's waiting on).
+--
+-- Both tables sit in EDMS so Decision OS doesn't need its own DB
+-- and the same tenant_id scoping that gates entity_states extends
+-- here automatically.
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS decision_outputs (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    application_id          VARCHAR(64) NOT NULL,
+    decision_id             VARCHAR(64) NOT NULL,
+    wave                    INT         NOT NULL,
+    outcome                 VARCHAR(20) NOT NULL,
+    mode                    VARCHAR(20) NOT NULL,
+    risk_level              VARCHAR(10),
+    boundary_matched        VARCHAR(30),
+    boundary_rule           TEXT,
+    context_snapshot        JSONB,
+    reasoning               JSONB,
+    confidence              FLOAT,
+    upstream_decisions      JSONB,
+    human_action            VARCHAR(20),
+    human_override_reason   TEXT,
+    human_reviewer          VARCHAR(100),
+    decided_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    acted_at                TIMESTAMPTZ,
+    sla_seconds             INT,
+    actual_seconds          FLOAT,
+    version                 INT         NOT NULL DEFAULT 1,
+    superseded_by           UUID REFERENCES decision_outputs(id),
+    tenant_id               VARCHAR(64) NOT NULL DEFAULT 'default',
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Uniqueness on (app, decision, version, tenant) — re-decisions bump
+-- version, never overwrite. The partial pending-human index keeps the
+-- ops dashboard query (``WHERE human_action IS NULL AND mode =
+-- 'human_approval'``) micro-fast as the table grows.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_outputs_unique
+    ON decision_outputs(application_id, decision_id, version, tenant_id);
+CREATE INDEX IF NOT EXISTS idx_decision_outputs_app
+    ON decision_outputs(application_id);
+CREATE INDEX IF NOT EXISTS idx_decision_outputs_decision
+    ON decision_outputs(decision_id, outcome);
+CREATE INDEX IF NOT EXISTS idx_decision_outputs_decided
+    ON decision_outputs(decided_at);
+CREATE INDEX IF NOT EXISTS idx_decision_outputs_tenant
+    ON decision_outputs(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_decision_outputs_pending_human
+    ON decision_outputs(decision_id, outcome)
+    WHERE human_action IS NULL AND mode = 'human_approval';
+
+CREATE TABLE IF NOT EXISTS decision_timeline (
+    id                            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    application_id                VARCHAR(64) NOT NULL,
+    decision_id                   VARCHAR(64) NOT NULL,
+    wave                          INT         NOT NULL,
+    from_state                    VARCHAR(30) NOT NULL,
+    to_state                      VARCHAR(30) NOT NULL,
+    trigger                       VARCHAR(30) NOT NULL,
+    transition_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    time_in_prev_state_seconds    FLOAT,
+    cumulative_elapsed_seconds    FLOAT,
+    wave_elapsed_seconds          FLOAT,
+    waiting_on                    JSONB,
+    pipeline_position             VARCHAR(20),
+    tenant_id                     VARCHAR(64) NOT NULL DEFAULT 'default'
+);
+
+CREATE INDEX IF NOT EXISTS idx_decision_timeline_app
+    ON decision_timeline(application_id, transition_at);
+CREATE INDEX IF NOT EXISTS idx_decision_timeline_decision
+    ON decision_timeline(decision_id, transition_at);
+CREATE INDEX IF NOT EXISTS idx_decision_timeline_tenant
+    ON decision_timeline(tenant_id);
+
+-- =====================================================================
 -- Decision OS persona context views (read-only).
 --
 -- Decision OS evaluates 13 boundary-rule personas (Wave 1-5) against
@@ -1169,3 +1258,42 @@ SELECT
     (loan_terms->>'days_until_rate_lock_expiry')::int               AS days_until_rate_lock_expiry,
     status
 FROM entity_states;
+
+-- =====================================================================
+-- Decision OS management-dashboard view.
+--
+-- ``vw_pipeline_status`` rolls every application's latest-version
+-- decision_outputs rows up into a single status row: how many of the
+-- 12 personas have completed, what wave we're in, whether any decision
+-- blocked, how many are escalated, how many are sitting in a human-
+-- approval queue, plus pipeline-elapsed timing. Decision OS hits this
+-- once per dashboard load — the inner subquery picks the latest
+-- version per (app, decision) so superseded re-decisions don't get
+-- double-counted.
+-- =====================================================================
+CREATE OR REPLACE VIEW vw_pipeline_status AS
+SELECT
+    do1.application_id,
+    do1.tenant_id,
+    COUNT(DISTINCT do1.decision_id)                                  AS decisions_complete,
+    12                                                               AS decisions_total,
+    ROUND(COUNT(DISTINCT do1.decision_id)::numeric / 12 * 100)       AS pipeline_pct,
+    MAX(do1.wave)                                                    AS current_wave,
+    BOOL_OR(do1.outcome = 'block')                                   AS has_block,
+    COUNT(*) FILTER (WHERE do1.outcome = 'escalate')                 AS escalate_count,
+    COUNT(*) FILTER (
+        WHERE do1.outcome = 'recommend'
+          AND do1.human_action IS NULL
+          AND do1.mode = 'human_approval'
+    )                                                                AS pending_human_review,
+    MIN(do1.decided_at)                                              AS pipeline_started,
+    MAX(do1.decided_at)                                              AS last_decision_at,
+    EXTRACT(EPOCH FROM MAX(do1.decided_at) - MIN(do1.decided_at))    AS pipeline_elapsed_seconds
+FROM decision_outputs do1
+WHERE do1.version = (
+    SELECT MAX(version) FROM decision_outputs do2
+     WHERE do2.application_id = do1.application_id
+       AND do2.decision_id    = do1.decision_id
+       AND do2.tenant_id      = do1.tenant_id
+)
+GROUP BY do1.application_id, do1.tenant_id;
