@@ -275,21 +275,84 @@ def _llpa_grid(score, ltv_pct) -> float:
     return 2.5
 
 
-def _classify_investor(loan_type: str, loan_amount, aus_approved: bool) -> str:
-    """Group 8 — investor_eligible: which agency / portfolio the loan
+def _classify_investor(loan_type: str, loan_amount, aus_approved: bool = False) -> str:
+    """Group 9 — investor_eligible: which agency / portfolio the loan
     can be sold to. Threshold $766,550 is the 2024 conforming-loan
-    limit; anything above goes jumbo."""
+    limit; anything above goes jumbo. The ``aus_approved`` arg is
+    accepted for back-compat but is no longer required for fannie
+    eligibility per the v2 spec — secondary-market eligibility is a
+    pricing-grid concern, not a green-light gate."""
     try:
         la = float(loan_amount or 0)
     except (TypeError, ValueError):
         la = 0.0
-    if loan_type == "conforming" and la <= 766_550 and aus_approved:
+    if loan_type == "conforming" and la <= 766_550:
         return "fannie"
     if loan_type in ("fha", "va"):
         return "ginnie"
     if la > 766_550:
         return "jumbo_portfolio"
     return "non_qm"
+
+
+def _iso_date(value) -> Optional[str]:
+    """Coerce a datetime / date / ISO-string into a ``YYYY-MM-DD``
+    string. Returns ``None`` on anything unparseable so callers can
+    leave the column null cleanly."""
+    if value is None:
+        return None
+    try:
+        from datetime import date, datetime as _dt
+        if isinstance(value, _dt):
+            return value.date().isoformat()
+        if isinstance(value, date):
+            return value.isoformat()
+        if isinstance(value, str):
+            return _dt.fromisoformat(value.replace("Z", "+00:00")).date().isoformat()
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def _evaluate_cd_timing(cd_received_at, closing_date):
+    """Group 8 — TRID 3-day rule. Returns ``(compliant, violation)``:
+      - ``(True, False)`` if no closing_date is set (can't violate
+        timing on a loan that hasn't picked a close date yet) OR if
+        the CD arrived ≥ 3 days before the closing_date.
+      - ``(False, True)`` if a closing_date is set and the CD either
+        is missing or landed less than 3 days before it.
+    """
+    from datetime import date, datetime as _dt, timedelta
+    try:
+        if not closing_date:
+            return True, False
+        if isinstance(closing_date, str):
+            close_d = date.fromisoformat(closing_date[:10])
+        elif isinstance(closing_date, _dt):
+            close_d = closing_date.date()
+        elif isinstance(closing_date, date):
+            close_d = closing_date
+        else:
+            return True, False
+    except (ValueError, TypeError):
+        return True, False
+    if not cd_received_at:
+        return False, True
+    try:
+        if isinstance(cd_received_at, str):
+            cd_d = _dt.fromisoformat(
+                cd_received_at.replace("Z", "+00:00")
+            ).date()
+        elif isinstance(cd_received_at, _dt):
+            cd_d = cd_received_at.date()
+        elif isinstance(cd_received_at, date):
+            cd_d = cd_received_at
+        else:
+            return False, True
+    except (ValueError, TypeError):
+        return False, True
+    compliant = (close_d - cd_d) >= timedelta(days=3)
+    return compliant, (not compliant)
 
 
 def _days_until(value) -> Optional[int]:
@@ -481,6 +544,10 @@ async def _compose_and_upsert_entity_state(
         "conditions_cleared":  False,
         "clear_to_close":      False,
     }
+    # ``completeness_pct`` is keyed off the original 12 verification
+    # flags only — Group 3 + Group 8 fields below are persona signals,
+    # not loan-readiness flags, so adding them to ``verifications``
+    # must not dilute the readiness score.
     completeness_pct = sum(1 for v in verifications.values() if v) / len(_VERIFICATIONS) * 100.0
     status           = _classify_status(completeness_pct)
 
@@ -546,7 +613,7 @@ async def _compose_and_upsert_entity_state(
     except Exception:
         pass
 
-    # ── Group 5: property enrichment ─────────────────────────────────
+    # ── Group 6: property enrichment ─────────────────────────────────
     # down_payment only for purchases; refis don't carry purchase_price
     # and the field is null. lien_status reflects how far through title
     # work the file is, independent of the boolean ``title_clear`` flag.
@@ -575,21 +642,43 @@ async def _compose_and_upsert_entity_state(
             "down_payment":       down_payment,
             "appraisal_disputed": False,
             "lien_status":        lien_status,
+            # Group 6: persona gates derived from the readiness flags so
+            # ltv_assessment / closing_readiness can short-circuit without
+            # re-evaluating the underlying doc set.
+            "title_defect":       not bool(verifications.get("title_clear")),
+            "lien_dispute":       False,
+            "insurance_gap":      not bool(verifications.get("insurance_bound")),
         })
 
-    # ── Group 6: loan enrichment ─────────────────────────────────────
-    loan_type = _classify_loan_type(rate_lock.get("loan_program"))
+    # ── Group 7 part 1: loan_type + lock expiry ──────────────────────
+    loan_type              = _classify_loan_type(rate_lock.get("loan_program"))
     days_until_lock_expiry = _days_until(rate_lock.get("lock_expiry"))
+    locked_rate            = _f(rate_lock.get("locked_rate"))
 
-    # ── Group 7: closer fields ───────────────────────────────────────
-    cd_issued = "CLOSING_DISCLOSURE" in doc_types
+    # ── Closer-style doc lookups (cd_issued + cd_sent_at) ────────────
+    cd_doc: Optional[dict] = None
+    for d in primary_docs + co_docs:
+        if d.get("document_type") == "CLOSING_DISCLOSURE":
+            cd_doc = d
+            break
+    cd_issued                   = cd_doc is not None
     final_title_policy_received = bool(title_block.get("title_insurance_received"))
+    cd_received_at              = cd_doc.get("received_at") if cd_doc else None
+    cd_sent_at                  = _iso_date(cd_received_at)
 
-    # ── Group 8: secondary-market eligibility + LLPA ─────────────────
-    llpa_adjustment   = _llpa_grid(mid_score, ltv)
-    investor_eligible = _classify_investor(
-        loan_type, loan_amount, bool(verifications.get("aus_approved")),
+    # ── Group 8: CD timing compliance ────────────────────────────────
+    # The TRID 3-day rule — CD must reach the borrower at least three
+    # business days before consummation. We approximate "business days"
+    # with calendar days here since the synthetic corpus doesn't
+    # distinguish them.
+    closing_date_raw    = (purchase_agree or {}).get("closing_date")
+    cd_timing_compliant, cd_timing_violation = _evaluate_cd_timing(
+        cd_received_at, closing_date_raw,
     )
+
+    # ── Group 8 part 2: secondary-market eligibility + LLPA ──────────
+    llpa_adjustment   = _llpa_grid(mid_score, ltv)
+    investor_eligible = _classify_investor(loan_type, loan_amount)
 
     if loan_terms_state:
         loan_terms_state.update({
@@ -598,12 +687,35 @@ async def _compose_and_upsert_entity_state(
             "days_until_rate_lock_expiry":   days_until_lock_expiry,
             "proposed_payment":              piti_total,
             "cd_issued":                     cd_issued,
+            "cd_sent_at":                    cd_sent_at,
             "wire_instructions_received":    False,
             "final_title_policy_received":   final_title_policy_received,
             "investor_eligible":             investor_eligible,
             "llpa_adjustment":               llpa_adjustment,
             "servicing_released":            True,
+            # Group 7 pricing gates — product_eligibility + rate_pricing.
+            "rate_within_normal_band":       (locked_rate is not None and locked_rate < 12.0),
+            "no_manual_adjustments":         llpa_adjustment < 2.0,
+            "rate_exceeds_usury":            (locked_rate is not None and locked_rate > 24.0),
         })
+
+    # ── Groups 3 + 8: extend the verifications dict with persona-only
+    # signals. These are NOT counted toward ``completeness_pct`` (see
+    # comment above) — they're decision inputs, not readiness flags.
+    verifications.update({
+        # Group 3 — compliance_check persona.
+        "hmda_complete":                "URLA_1003" in doc_types,
+        "no_fair_lending_flags":        True,
+        "state_rules_passed":           True,
+        "fair_lending_violation":       False,
+        "missing_required_disclosures": False,
+        "regulatory_ambiguity":         False,
+        "mixed_jurisdiction":           False,
+        "minor_data_gap":               completeness_pct < 90.0,
+        # Group 8 — closing_readiness persona.
+        "cd_timing_compliant":          cd_timing_compliant,
+        "cd_timing_violation":          cd_timing_violation,
+    })
 
     # ── Group 9: management timing ───────────────────────────────────
     loan_age_days = _days_since(app_created_at)

@@ -171,13 +171,32 @@ async def build_borrower_state(
     doc_types = sorted({d.get("document_type") for d in docs if d.get("document_type")})
 
     # Income block carries both the assembled-profile summary AND the
-    # 9 enrichment fields (verified_/stated_, employment_type,
+    # enrichment fields (verified_/stated_, employment_type,
     # multiple_income_sources, income_confidence_score, stability,
-    # trending, gap_in_employment) that the income_assessment persona
-    # in Decision OS reads.
+    # trending, gap_in_employment, payroll_verified,
+    # income_discrepancy_pct) the income_verification persona reads.
     income_block = _income_summary(income)
-    income_block.update(_derive_income_enrichment(
+    income_enrichment = _derive_income_enrichment(
         docs, income, applicant_id, employment.get("income_amount"),
+    )
+    income_block.update(income_enrichment)
+
+    # Employment block carries the per-doc summary PLUS the 8
+    # employment_reconciliation persona fields. Reads
+    # document_relationships for the employer_name edge confidence;
+    # tolerates a missing edges table (returns 0.5 default).
+    try:
+        relationships = await pg.get_relationships_for_applicant(
+            applicant_id, tenant_id=tenant_id,
+        )
+    except Exception:
+        relationships = []
+    employment_block = dict(employment)
+    employment_block.update(_derive_employment_reconciliation(
+        docs,
+        relationships,
+        income_enrichment.get("stated_income_annual"),
+        income_enrichment.get("verified_income_annual"),
     ))
 
     # Identity block carries the existing Redis summary plus the 5
@@ -189,7 +208,7 @@ async def build_borrower_state(
         "applicant_id":   applicant_id,
         "application_id": application_id,
         "income":         income_block,
-        "employment":     employment,
+        "employment":     employment_block,
         "credit":         _credit_summary(credit, applicant_id=applicant_id),
         "assets":         assets,
         "identity":       identity_block,
@@ -313,6 +332,23 @@ def _derive_income_enrichment(
         except (TypeError, ValueError, ZeroDivisionError):
             pass
 
+    # income_discrepancy_pct — drives the income_verification persona's
+    # block_if. Only meaningful when both stated + verified are known;
+    # 0.0 (i.e. "no daylight detected") is the safe default.
+    discrepancy_pct = 0.0
+    try:
+        if (stated_annual is not None and verified_annual is not None
+                and float(verified_annual) > 0):
+            discrepancy_pct = abs(float(stated_annual) - float(verified_annual)) \
+                              / float(verified_annual)
+    except (TypeError, ValueError, ZeroDivisionError):
+        discrepancy_pct = 0.0
+
+    # payroll_verified — distinct from employment_verified (which gates
+    # on VOE_TWN only); persona reads this OR a current paystub as the
+    # signal that someone's actively cutting them a check.
+    payroll_verified = ("PAYSTUB_CURRENT" in type_set) or ("VOE_TWN" in type_set)
+
     return {
         "verified_income_annual":  verified_annual,
         "stated_income_annual":    stated_annual,
@@ -326,6 +362,139 @@ def _derive_income_enrichment(
         # in the synthetic corpus; default False so the persona has the
         # key but knows the signal isn't computed.
         "gap_in_employment":       False,
+        # Group 5 — income_verification persona gates.
+        "payroll_verified":        payroll_verified,
+        "income_discrepancy_pct":  round(discrepancy_pct, 4),
+    }
+
+
+def _derive_employment_reconciliation(
+    docs: list,
+    relationships: list,
+    stated_annual,
+    verified_annual,
+) -> dict:
+    """Group 4 — employment_reconciliation persona inputs. Eight fields
+    that summarize how cleanly the borrower's stated employer + income
+    matches what the source docs (W2, VOE, paystub) confirm.
+
+    Reads the existing document_relationships graph for the
+    ``employer_name`` field-level edges so we don't second-guess the
+    reconciler's confidence scoring; falls back to a 0.5 default when
+    no edge exists yet (typical for backfills of older applications
+    whose graph rebuild hasn't run)."""
+    by_type: dict[str, list[dict]] = {}
+    for d in docs:
+        dt = d.get("document_type")
+        if dt:
+            by_type.setdefault(dt, []).append(d)
+
+    w2_current = _latest(by_type.get("W2_CURRENT") or [])
+    w2_prior   = _latest(by_type.get("W2_PRIOR") or [])
+    voe        = _latest(by_type.get("VOE_TWN") or by_type.get("VOE") or [])
+    paystub    = _latest(by_type.get("PAYSTUB_CURRENT") or [])
+
+    def _emp(doc) -> str:
+        if not doc:
+            return ""
+        return (_doc_fields(doc).get("employer_name") or "").strip().lower()
+
+    cur_emp  = _emp(w2_current)
+    voe_emp  = _emp(voe)
+    pay_emp  = _emp(paystub)
+    pri_emp  = _emp(w2_prior)
+
+    # ── reconciliation_status ────────────────────────────────────────
+    if not w2_current:
+        reconciliation_status = "missing"
+    elif (voe or paystub):
+        # "conflict" — at least one corroborating doc disagrees with W2.
+        disagrees = ((voe_emp and cur_emp and voe_emp != cur_emp)
+                     or (pay_emp and cur_emp and pay_emp != cur_emp))
+        if disagrees:
+            reconciliation_status = "conflict"
+        elif (voe_emp and cur_emp and voe_emp == cur_emp) \
+                or (pay_emp and cur_emp and pay_emp == cur_emp):
+            reconciliation_status = "auto_verified"
+        else:
+            reconciliation_status = "partial"
+    else:
+        reconciliation_status = "partial"
+
+    # ── continuity_coverage_pct + max_gap_days ──────────────────────
+    if w2_current and w2_prior:
+        continuity = 1.0 if (cur_emp and pri_emp and cur_emp == pri_emp) else 1.0
+        # Both rules collapse to 1.0 in the "both W2s present" branch;
+        # the *gap* is what distinguishes stable vs job-change.
+        max_gap = 0 if (cur_emp and pri_emp and cur_emp == pri_emp) else 30
+    elif w2_current:
+        continuity = 0.5
+        max_gap    = 365
+    else:
+        continuity = 0.0
+        max_gap    = 365
+
+    # ── employer_name_match_confidence ───────────────────────────────
+    # Read the highest-confidence employer_name edge for this applicant
+    # — confirms / corroborates are high signal; contradicts means low
+    # match. Default 0.5 when no edge exists (graph hasn't run, or
+    # there's nothing to compare against yet).
+    employer_name_match_confidence = 0.5
+    best = 0.0
+    saw  = False
+    for rel in (relationships or []):
+        if rel.get("field_name") != "employer_name":
+            continue
+        saw  = True
+        rtype = rel.get("relationship_type")
+        if hasattr(rtype, "value"):
+            rtype = rtype.value
+        conf = rel.get("confidence")
+        try:
+            conf = float(conf) if conf is not None else 0.0
+        except (TypeError, ValueError):
+            conf = 0.0
+        # Contradicts edges flip the confidence — a high "we're sure
+        # these disagree" reads as a LOW match.
+        if rtype == "contradicts":
+            conf = 1.0 - conf
+        if conf > best:
+            best = conf
+    if saw:
+        employer_name_match_confidence = round(best, 3)
+
+    # ── stated_vs_verified_drift_pct ─────────────────────────────────
+    drift = 0.0
+    try:
+        if (stated_annual is not None and verified_annual is not None
+                and float(verified_annual) > 0):
+            drift = abs(float(stated_annual) - float(verified_annual)) \
+                    / float(verified_annual)
+    except (TypeError, ValueError, ZeroDivisionError):
+        drift = 0.0
+
+    # ── period_start / period_end from W2 tax_year ───────────────────
+    period_start: Optional[str] = None
+    period_end:   Optional[str] = None
+    if w2_current:
+        tax_year = _doc_fields(w2_current).get("tax_year")
+        try:
+            yyyy = int(tax_year) if tax_year is not None else None
+        except (TypeError, ValueError):
+            yyyy = None
+        if yyyy is not None:
+            period_start = f"{yyyy:04d}-01-01"
+            period_end   = f"{yyyy:04d}-12-31"
+
+    return {
+        "reconciliation_status":          reconciliation_status,
+        "continuity_coverage_pct":        round(continuity, 2),
+        "max_gap_days":                   max_gap,
+        "employer_name_match_confidence": employer_name_match_confidence,
+        "stated_vs_verified_drift_pct":   round(drift, 4),
+        "employer_on_watchlist":          False,
+        "period_start":                   period_start,
+        "period_end":                     period_end,
     }
 
 
