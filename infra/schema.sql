@@ -891,3 +891,249 @@ CREATE INDEX IF NOT EXISTS idx_outbox_tenant
 CREATE INDEX IF NOT EXISTS idx_outbox_webhook
     ON webhook_outbox(webhook_id, status, created_at DESC);
 
+-- =====================================================================
+-- Decision OS persona context views (read-only).
+--
+-- Decision OS evaluates 13 boundary-rule personas (Wave 1-5) against
+-- entity_states JSONB. Rather than make every persona walk the same
+-- JSONB paths and casts at query time, we flatten the fields each
+-- persona reads into a dedicated view. Decision OS issues plain
+-- ``SELECT ... FROM vw_<persona>_context WHERE application_id = $1``
+-- and gets a stable typed row back — no JSONB knowledge required.
+--
+-- Why CREATE OR REPLACE VIEW:
+--   ``core.storage.migrations.apply_schema`` runs this file on every
+--   ECS task boot. ``CREATE OR REPLACE`` is idempotent on identical
+--   column shapes — re-runs are free. If a future change adds or
+--   removes columns, drop the affected view first (Postgres rejects
+--   shape changes via REPLACE).
+--
+-- All views read entity_states only — no joins, no extra tables. The
+-- JSONB path expressions return NULL when a key is missing, which is
+-- the correct null-as-unknown signal for downstream persona logic.
+-- =====================================================================
+
+-- View 1 — credit_assessment (Wave 1, auto_execute, medium risk)
+CREATE OR REPLACE VIEW vw_credit_assessment_context AS
+SELECT
+    application_id,
+    tenant_id,
+    borrower->>'applicant_id'                                       AS applicant_id,
+    (borrower->'credit'->>'mid_score')::int                         AS credit_score,
+    borrower->'credit'->>'credit_band'                              AS credit_band,
+    (borrower->'credit'->>'equifax_score')::int                     AS equifax_score,
+    (borrower->'credit'->>'experian_score')::int                    AS experian_score,
+    (borrower->'credit'->>'transunion_score')::int                  AS transunion_score,
+    (borrower->'credit'->>'active_bankruptcy')::boolean             AS active_bankruptcy,
+    (borrower->'credit'->>'foreclosure_last_36_months')::boolean    AS foreclosure_last_36_months,
+    (borrower->'credit'->>'thin_file')::boolean                     AS thin_file,
+    (borrower->'credit'->>'no_derogatory_last_24_months')::boolean  AS no_derogatory_last_24_months,
+    (borrower->'credit'->>'derogatory_marks')::int                  AS derogatory_marks,
+    (borrower->'credit'->>'open_tradelines')::int                   AS open_tradelines,
+    (borrower->'credit'->>'credit_utilization')::float              AS credit_utilization,
+    (borrower->'credit'->>'monthly_obligations')::float             AS monthly_obligations,
+    status,
+    completeness_pct
+FROM entity_states;
+
+-- View 2 — fraud_screening (Wave 1, auto_execute, high risk)
+CREATE OR REPLACE VIEW vw_fraud_screening_context AS
+SELECT
+    application_id,
+    tenant_id,
+    borrower->>'applicant_id'                                       AS applicant_id,
+    (borrower->'identity'->>'fraud_score')::float                   AS fraud_score,
+    (borrower->'identity'->>'identity_match_confidence')::float     AS identity_match_confidence,
+    (borrower->'identity'->>'document_authenticity_score')::float   AS document_authenticity_score,
+    (borrower->'identity'->>'watchlist_match')::boolean             AS watchlist_match,
+    (borrower->'identity'->>'synthetic_identity_flag')::boolean     AS synthetic_identity_flag,
+    status
+FROM entity_states;
+
+-- View 3 — compliance_check (Wave 1, human_approval, high risk)
+CREATE OR REPLACE VIEW vw_compliance_check_context AS
+SELECT
+    application_id,
+    tenant_id,
+    (verifications->>'hmda_complete')::boolean                      AS all_hmda_fields_complete,
+    (verifications->>'no_fair_lending_flags')::boolean              AS no_fair_lending_flags,
+    (verifications->>'state_rules_passed')::boolean                 AS state_rules_passed,
+    (verifications->>'fair_lending_violation')::boolean             AS fair_lending_violation,
+    (verifications->>'missing_required_disclosures')::boolean       AS missing_required_disclosures,
+    (verifications->>'regulatory_ambiguity')::boolean               AS regulatory_ambiguity,
+    (verifications->>'mixed_jurisdiction')::boolean                 AS mixed_jurisdiction,
+    (verifications->>'minor_data_gap')::boolean                     AS minor_data_gap,
+    completeness_pct,
+    status
+FROM entity_states;
+
+-- View 4 — employment_reconciliation (Wave 1, recommend, medium risk)
+CREATE OR REPLACE VIEW vw_employment_reconciliation_context AS
+SELECT
+    application_id,
+    tenant_id,
+    borrower->>'applicant_id'                                       AS applicant_id,
+    borrower->'employment'->>'reconciliation_status'                AS reconciliation_status,
+    (borrower->'employment'->>'continuity_coverage_pct')::float     AS continuity_coverage_pct,
+    (borrower->'employment'->>'max_gap_days')::int                  AS max_gap_days,
+    (borrower->'employment'->>'employer_name_match_confidence')::float AS employer_name_match_confidence,
+    (borrower->'employment'->>'stated_vs_verified_drift_pct')::float   AS stated_vs_verified_drift_pct,
+    (borrower->'employment'->>'employer_on_watchlist')::boolean     AS employer_on_watchlist,
+    borrower->'employment'->>'employer_name'                        AS employer_name,
+    borrower->'employment'->>'period_start'                         AS period_start,
+    borrower->'employment'->>'period_end'                           AS period_end,
+    borrower->'employment'->>'employment_status'                    AS employment_status,
+    (borrower->'employment'->>'income_amount')::float               AS gross_amount,
+    borrower->'income'->>'stated_employer'                          AS stated_employer,
+    (borrower->'income'->>'stated_income_annual')::float            AS stated_income,
+    status
+FROM entity_states;
+
+-- View 5 — income_verification (Wave 2, human_approval, medium risk)
+CREATE OR REPLACE VIEW vw_income_verification_context AS
+SELECT
+    application_id,
+    tenant_id,
+    borrower->>'applicant_id'                                       AS applicant_id,
+    (borrower->'income'->>'income_confidence_score')::float         AS income_confidence_score,
+    borrower->'income'->>'employment_type'                          AS employment_type,
+    (borrower->'income'->>'payroll_verified')::boolean              AS payroll_verified,
+    borrower->'employment'->>'reconciliation_status'                AS reconciliation_status,
+    (borrower->'income'->>'income_discrepancy_pct')::float          AS income_discrepancy_pct,
+    (borrower->'income'->>'stated_income_annual')::float            AS stated_income,
+    (borrower->'income'->>'verified_income_annual')::float          AS verified_income,
+    (borrower->'income'->>'multiple_income_sources')::boolean       AS multiple_income_sources,
+    borrower->'income'->>'income_stability'                         AS income_stability,
+    borrower->'income'->>'income_trending'                          AS income_trending,
+    (borrower->'income'->>'overall_confidence')::float              AS overall_confidence,
+    status
+FROM entity_states;
+
+-- View 6 — dti_calculation (Wave 2). Indexed columns are pulled
+-- directly; JSONB only for income_confidence + monthly_obligations.
+CREATE OR REPLACE VIEW vw_dti_calculation_context AS
+SELECT
+    application_id,
+    tenant_id,
+    dti_back                                                        AS dti,
+    dti_front,
+    (borrower->'credit'->>'monthly_obligations')::float             AS existing_debt_obligations,
+    piti_monthly                                                    AS proposed_payment,
+    qualifying_monthly,
+    combined_monthly_income,
+    (borrower->'income'->>'overall_confidence')::float              AS income_confidence,
+    loan_amount,
+    interest_rate,
+    status
+FROM entity_states;
+
+-- View 7 — ltv_assessment (Wave 2). title_status is NULL today; left
+-- in the projection so Decision OS doesn't have to special-case once
+-- the title block grows that field.
+CREATE OR REPLACE VIEW vw_ltv_assessment_context AS
+SELECT
+    application_id,
+    tenant_id,
+    ltv,
+    appraised_value,
+    purchase_price,
+    loan_amount,
+    (property->>'down_payment')::float                              AS down_payment,
+    (property->>'appraisal_disputed')::boolean                      AS appraisal_disputed,
+    property->'title'->>'title_status'                              AS title_status,
+    (property->>'lien_dispute')::boolean                            AS lien_dispute,
+    borrower->'credit'->>'credit_band'                              AS credit_band,
+    status
+FROM entity_states;
+
+-- View 8 — product_eligibility (Wave 3)
+CREATE OR REPLACE VIEW vw_product_eligibility_context AS
+SELECT
+    application_id,
+    tenant_id,
+    dti_back                                                        AS dti_ratio,
+    ltv                                                             AS ltv_ratio,
+    borrower->'credit'->>'credit_band'                              AS credit_band,
+    mid_credit_score                                                AS credit_score,
+    loan_terms->>'loan_type'                                        AS loan_type,
+    loan_amount,
+    loan_terms->'urla'->>'loan_purpose'                             AS loan_purpose,
+    status
+FROM entity_states;
+
+-- View 9 — rate_pricing (Wave 3)
+CREATE OR REPLACE VIEW vw_rate_pricing_context AS
+SELECT
+    application_id,
+    tenant_id,
+    mid_credit_score                                                AS credit_score,
+    dti_back                                                        AS dti_ratio,
+    ltv                                                             AS ltv_ratio,
+    interest_rate,
+    loan_terms->>'loan_type'                                        AS loan_type,
+    (loan_terms->>'rate_within_normal_band')::boolean               AS rate_within_normal_band,
+    (loan_terms->>'no_manual_adjustments')::boolean                 AS no_manual_adjustments_required,
+    (loan_terms->>'rate_exceeds_usury')::boolean                    AS rate_exceeds_usury_limit,
+    (loan_terms->>'concurrent_rate_lock_conflict')::boolean         AS concurrent_rate_lock_conflict,
+    (loan_terms->>'llpa_adjustment')::float                         AS llpa_adjustment,
+    loan_terms->'rate_lock'->>'loan_program'                        AS loan_program,
+    status
+FROM entity_states;
+
+-- View 10 — underwriting_decision (Wave 4). Reads EVERYTHING — every
+-- JSONB block + every indexed column. Persona makes a final
+-- ALLOW/BLOCK/ESCALATE call by re-evaluating the file.
+CREATE OR REPLACE VIEW vw_underwriting_decision_context AS
+SELECT
+    application_id,
+    tenant_id,
+    borrower,
+    co_borrowers,
+    property,
+    loan_terms,
+    verifications,
+    mid_credit_score,
+    ltv,
+    dti_back,
+    dti_front,
+    piti_monthly,
+    qualifying_monthly,
+    combined_monthly_income,
+    total_liquid_assets,
+    loan_amount,
+    interest_rate,
+    appraised_value,
+    purchase_price,
+    completeness_pct,
+    status
+FROM entity_states;
+
+-- View 11 — approval_routing (Wave 5). Thin slice — routing decides
+-- which queue / approver the application lands in, so it just needs
+-- the high-level status + completeness.
+CREATE OR REPLACE VIEW vw_approval_routing_context AS
+SELECT
+    application_id,
+    tenant_id,
+    borrower->>'applicant_id'                                       AS applicant_id,
+    status,
+    completeness_pct
+FROM entity_states;
+
+-- View 12 — closing_readiness (Wave 5, human_approval, high risk)
+CREATE OR REPLACE VIEW vw_closing_readiness_context AS
+SELECT
+    application_id,
+    tenant_id,
+    (verifications->>'conditions_cleared')::boolean                 AS all_conditions_cleared,
+    (verifications->>'cd_timing_compliant')::boolean                AS cd_timing_compliant,
+    (verifications->>'title_clear')::boolean                        AS title_clear,
+    (verifications->>'cd_timing_violation')::boolean                AS cd_timing_violation,
+    (property->>'title_defect')::boolean                            AS title_defect,
+    (property->>'lien_dispute')::boolean                            AS lien_dispute,
+    (property->>'insurance_gap')::boolean                           AS insurance_gap,
+    (verifications->>'insurance_bound')::boolean                    AS insurance_binder,
+    loan_terms->>'cd_sent_at'                                       AS closing_disclosure_sent_at,
+    (loan_terms->>'days_until_rate_lock_expiry')::int               AS days_until_rate_lock_expiry,
+    status
+FROM entity_states;
