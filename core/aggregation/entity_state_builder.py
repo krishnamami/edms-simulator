@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -158,7 +159,7 @@ async def build_borrower_state(
         "application_id": application_id,
         "income":         _income_summary(income),
         "employment":     employment,
-        "credit":         _credit_summary(credit),
+        "credit":         _credit_summary(credit, applicant_id=applicant_id),
         "assets":         assets,
         "identity":       identity,
         "doc_types":      doc_types,
@@ -182,18 +183,71 @@ def _income_summary(income: Optional[dict]) -> dict:
     }
 
 
-def _credit_summary(credit: Optional[dict]) -> dict:
+def _derive_credit_assessment_fields(
+    applicant_id: str, mid_score: int, credit_band: str,
+) -> dict:
+    """Derive the 7 fields the credit_assessment persona in Decision OS
+    needs to gate ALLOW / ESCALATE / BLOCK. Our CREDIT_REPORT docs are
+    synthetic and don't carry these explicitly, so we derive from the
+    underwriting buckets that ``mid_score`` already places the
+    applicant in. Seeded on ``applicant_id`` so a backfill that
+    re-composes the same applicant surfaces the same utilization /
+    tradeline counts — Decision OS snapshots stay stable across
+    re-runs."""
+    rng = random.Random(applicant_id or "")
+    if mid_score < 620:
+        derog        = 4
+        tradelines   = rng.randint(1, 3)
+        utilization  = round(rng.uniform(0.60, 0.95), 2)
+        no_derog_24mo = False
+    elif mid_score < 680:
+        derog        = 2
+        tradelines   = rng.randint(3, 8)
+        utilization  = round(rng.uniform(0.40, 0.70), 2)
+        no_derog_24mo = rng.random() < 0.70
+    elif mid_score < 740:
+        derog        = 1
+        tradelines   = rng.randint(6, 15)
+        utilization  = round(rng.uniform(0.20, 0.50), 2)
+        no_derog_24mo = True
+    else:
+        derog        = 0
+        tradelines   = rng.randint(6, 15)
+        utilization  = round(rng.uniform(0.05, 0.30), 2)
+        no_derog_24mo = True
+    return {
+        "active_bankruptcy":            False,
+        "foreclosure_last_36_months":   False,
+        "thin_file":                    mid_score < 620 and credit_band == "subprime",
+        "no_derogatory_last_24_months": no_derog_24mo,
+        "derogatory_marks":             derog,
+        "open_tradelines":              tradelines,
+        "credit_utilization":           utilization,
+    }
+
+
+def _credit_summary(credit: Optional[dict], applicant_id: str = "") -> dict:
     if not credit:
         return {}
     obligations = credit.get("monthly_obligations") or credit.get("total_monthly_obligations")
-    return {
-        "mid_score":          credit.get("mid_score"),
-        "credit_band":        credit.get("credit_band"),
+    mid_score   = credit.get("mid_score")
+    credit_band = credit.get("credit_band") or "near-prime"
+    out = {
+        "mid_score":          mid_score,
+        "credit_band":        credit_band,
         "monthly_obligations": obligations,
         "experian_score":     credit.get("experian_score"),
         "equifax_score":      credit.get("equifax_score"),
         "transunion_score":   credit.get("transunion_score"),
     }
+    if mid_score is not None:
+        try:
+            out.update(_derive_credit_assessment_fields(
+                applicant_id, int(mid_score), credit_band,
+            ))
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 # ---------------------------------------------------------------------------
