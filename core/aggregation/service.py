@@ -509,6 +509,7 @@ class AggregationService:
                     los_id, loan_data, primary_credit, co_credit, profile,
                     primary_docs, co_docs,
                     current_tenant_id(),
+                    app_created_at=(app_row or {}).get("created_at"),
                 )
             except Exception as exc:
                 logger.warning(

@@ -27,6 +27,21 @@ import logging
 import random
 from typing import Any, Optional
 
+
+# ---------------------------------------------------------------------------
+# Doc-type families used by the income / identity enrichment derivations.
+# Keep these synced with the canonical names in
+# ``core/income/assembler.py`` + the indexer's extractor dispatch.
+# ---------------------------------------------------------------------------
+
+_W2_TYPES            = ("W2_CURRENT", "W2_PRIOR")
+_PAYSTUB_TYPES       = ("PAYSTUB_CURRENT", "PAYSTUB_PRIOR")
+_SELF_EMPLOYED_TYPES = ("1099_NEC", "FORM_1099_NEC", "FORM_1099_MISC",
+                        "SCHEDULE_C", "SCHEDULE_E")
+_RETIRED_TYPES       = ("SSA_AWARD_LETTER", "PENSION_LETTER")
+_OFAC_TYPES          = ("OFAC_CHECK", "OFAC_REPORT")
+_DL_TYPES            = ("DRIVERS_LICENSE", "IDENTITY_DL")
+
 logger = logging.getLogger(__name__)
 
 
@@ -154,14 +169,30 @@ async def build_borrower_state(
 
     docs = await pg.get_documents_for_applicant(applicant_id, tenant_id=tenant_id)
     doc_types = sorted({d.get("document_type") for d in docs if d.get("document_type")})
+
+    # Income block carries both the assembled-profile summary AND the
+    # 9 enrichment fields (verified_/stated_, employment_type,
+    # multiple_income_sources, income_confidence_score, stability,
+    # trending, gap_in_employment) that the income_assessment persona
+    # in Decision OS reads.
+    income_block = _income_summary(income)
+    income_block.update(_derive_income_enrichment(
+        docs, income, applicant_id, employment.get("income_amount"),
+    ))
+
+    # Identity block carries the existing Redis summary plus the 5
+    # FraudProfile fields the fraud persona reads.
+    identity_block = dict(identity or {})
+    identity_block.update(_derive_identity_enrichment(docs, applicant_id))
+
     return {
         "applicant_id":   applicant_id,
         "application_id": application_id,
-        "income":         _income_summary(income),
+        "income":         income_block,
         "employment":     employment,
         "credit":         _credit_summary(credit, applicant_id=applicant_id),
         "assets":         assets,
-        "identity":       identity,
+        "identity":       identity_block,
         "doc_types":      doc_types,
     }
 
@@ -180,6 +211,151 @@ def _income_summary(income: Optional[dict]) -> dict:
             for s in (primary.get("sources") or [])
             if (s or {}).get("source_type")
         }),
+    }
+
+
+def _classify_employment_type(doc_types: set[str]) -> str:
+    """Group 2 — employment_type buckets the borrower into one of four
+    income channels by the doc types they've filed. Distinct from
+    ``employment.employment_status`` which tracks active/terminated."""
+    if any(t in doc_types for t in _W2_TYPES) \
+            or any(t in doc_types for t in _PAYSTUB_TYPES):
+        return "salaried"
+    if any(t in doc_types for t in _SELF_EMPLOYED_TYPES):
+        return "self_employed"
+    if any(t in doc_types for t in _RETIRED_TYPES):
+        return "retired"
+    return "other"
+
+
+def _derive_income_enrichment(
+    docs: list,
+    income: Optional[dict],
+    applicant_id: str,
+    employment_income_amount: Optional[float],
+) -> dict:
+    """Groups 2 + 3 — surface the 9 income / employment fields the
+    Decision OS income_assessment persona reads. All derived from
+    ``document_index`` rows we already have (W2_CURRENT, W2_PRIOR,
+    URLA_1003, etc.); no extra PG hits."""
+    docs_by_type: dict[str, list[dict]] = {}
+    type_set: set[str] = set()
+    for d in docs:
+        dt = d.get("document_type")
+        if dt:
+            docs_by_type.setdefault(dt, []).append(d)
+            type_set.add(dt)
+
+    # ── Group 2 ──────────────────────────────────────────────────────
+    w2_current = _latest(docs_by_type.get("W2_CURRENT") or [])
+    verified_annual: Optional[float] = None
+    if w2_current:
+        ef = _doc_fields(w2_current)
+        verified_annual = ef.get("box1_wages") or ef.get("wages_salaries")
+    if verified_annual is None and employment_income_amount is not None:
+        verified_annual = employment_income_amount
+
+    urla            = _latest(docs_by_type.get("URLA_1003") or [])
+    stated_annual:   Optional[float] = None
+    stated_employer: Optional[str]   = None
+    if urla:
+        ef = _doc_fields(urla)
+        monthly = ef.get("monthly_income_stated")
+        if monthly is not None:
+            try:
+                stated_annual = float(monthly) * 12.0
+            except (TypeError, ValueError):
+                stated_annual = None
+        stated_employer = (ef.get("employer_name")
+                           or ef.get("stated_employer")
+                           or ef.get("borrower_employer"))
+
+    # multiple_income_sources — different income CHANNELS, not just
+    # different doc types within one channel (W2_CURRENT + W2_PRIOR is
+    # still a single salaried channel).
+    channels: set[str] = set()
+    if any(t in type_set for t in _W2_TYPES):            channels.add("w2")
+    if any(t in type_set for t in _PAYSTUB_TYPES):       channels.add("paystub")
+    if any(t in type_set for t in _SELF_EMPLOYED_TYPES): channels.add("self_employed")
+    if any(t in type_set for t in _RETIRED_TYPES):       channels.add("retired")
+    multiple_sources = len(channels) > 1
+
+    confidence: float = 0.85
+    if income:
+        primary = income.get("primary_borrower") or {}
+        oc = primary.get("overall_confidence")
+        if oc is not None:
+            try:
+                confidence = float(oc)
+            except (TypeError, ValueError):
+                pass
+
+    # ── Group 3: income stability + trending ─────────────────────────
+    w2_prior = _latest(docs_by_type.get("W2_PRIOR") or [])
+    stability = "insufficient_history"
+    trending  = "unknown"
+    if w2_current and w2_prior:
+        cur_f = _doc_fields(w2_current)
+        pri_f = _doc_fields(w2_prior)
+        cur_emp = (cur_f.get("employer_name") or "").strip().lower()
+        pri_emp = (pri_f.get("employer_name") or "").strip().lower()
+        stability = ("stable" if cur_emp and pri_emp and cur_emp == pri_emp
+                     else "new_employment")
+
+        cur_wages = cur_f.get("box1_wages") or cur_f.get("wages_salaries")
+        pri_wages = pri_f.get("box1_wages") or pri_f.get("wages_salaries")
+        try:
+            if cur_wages is not None and pri_wages is not None and float(pri_wages):
+                delta = (float(cur_wages) - float(pri_wages)) / float(pri_wages)
+                if   delta >  0.03: trending = "increasing"
+                elif delta < -0.03: trending = "decreasing"
+                else:               trending = "flat"
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+    return {
+        "verified_income_annual":  verified_annual,
+        "stated_income_annual":    stated_annual,
+        "stated_employer":         stated_employer,
+        "employment_type":         _classify_employment_type(type_set),
+        "multiple_income_sources": multiple_sources,
+        "income_confidence_score": round(confidence, 2),
+        "income_stability":        stability,
+        "income_trending":         trending,
+        # gap_in_employment would need start/end dates we don't capture
+        # in the synthetic corpus; default False so the persona has the
+        # key but knows the signal isn't computed.
+        "gap_in_employment":       False,
+    }
+
+
+def _derive_identity_enrichment(docs: list, applicant_id: str) -> dict:
+    """Group 4 — FraudProfile fields. Decision OS's fraud persona reads
+    these to gate ALLOW / ESCALATE. Synthetic data → derived from doc
+    presence + a seeded ±0.03 wiggle on ``fraud_score`` so re-running
+    the same applicant doesn't churn the value."""
+    types    = {d.get("document_type") for d in docs if d.get("document_type")}
+    has_ofac = any(t in types for t in _OFAC_TYPES)
+    has_ssn  = "SSN_VALIDATION" in types
+    has_dl   = any(t in types for t in _DL_TYPES)
+    id_count = sum([has_ofac, has_ssn, has_dl])
+
+    if   id_count == 3: base = 0.05
+    elif id_count >= 1: base = 0.30
+    else:               base = 0.80
+    rng         = random.Random(applicant_id or "")
+    fraud_score = round(max(0.0, min(1.0, base + rng.uniform(-0.03, 0.03))), 3)
+
+    if   has_ssn and has_dl: match_conf = 0.98
+    elif has_ssn or has_dl:  match_conf = 0.70
+    else:                    match_conf = 0.0
+
+    return {
+        "fraud_score":                 fraud_score,
+        "identity_match_confidence":   match_conf,
+        "document_authenticity_score": 0.95,
+        "watchlist_match":             False,
+        "synthetic_identity_flag":     False,
     }
 
 
@@ -218,7 +394,7 @@ def _derive_credit_assessment_fields(
     return {
         "active_bankruptcy":            False,
         "foreclosure_last_36_months":   False,
-        "thin_file":                    mid_score < 620 and credit_band == "subprime",
+        "thin_file":                    mid_score < 620,
         "no_derogatory_last_24_months": no_derog_24mo,
         "derogatory_marks":             derog,
         "open_tradelines":              tradelines,

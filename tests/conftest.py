@@ -290,6 +290,12 @@ class FakePostgresStore:
             "rate_locked":                   bool(s.get("rate_locked")),
             "conditions_cleared":            bool(s.get("conditions_cleared")),
             "clear_to_close":                bool(s.get("clear_to_close")),
+            "days_in_current_status":        (int(s["days_in_current_status"])
+                                              if s.get("days_in_current_status") is not None
+                                              else None),
+            "loan_age_days":                 (int(s["loan_age_days"])
+                                              if s.get("loan_age_days") is not None
+                                              else None),
             "last_updated":                  datetime.now(timezone.utc),
         }
 

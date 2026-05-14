@@ -240,6 +240,99 @@ def _piti(loan_amount, interest_rate_pct, term_months, annual_tax, annual_hoi, m
     return pi + tax + hoi + mi
 
 
+def _classify_loan_type(loan_program) -> str:
+    """Group 6 — bucket the rate_lock loan_program into one of the
+    enum values Decision OS reads from ``loan_terms.loan_type``."""
+    p = (loan_program or "")
+    p = p.strip().lower() if isinstance(p, str) else ""
+    if not p:            return "other"
+    if "conv" in p:      return "conforming"
+    if "fha"  in p:      return "fha"
+    if "va"   in p:      return "va"
+    if "jumbo" in p:     return "jumbo"
+    if "heloc" in p:     return "heloc"
+    if "usda" in p:      return "usda"
+    return "other"
+
+
+def _llpa_grid(score, ltv_pct) -> float:
+    """Group 8 — Loan-Level Price Adjustment grid (Fannie-ish; rough
+    proxy for our synthetic corpus). Returns the percentage-points add
+    secondary-market pricing applies on top of par."""
+    if score is None:
+        return 0.0
+    try:
+        s = int(score)
+    except (TypeError, ValueError):
+        return 0.0
+    l = float(ltv_pct or 0)
+    if s >= 740:
+        return 0.0 if l <= 80 else 0.25
+    if s >= 700:
+        return 0.25 if l <= 80 else 0.75
+    if s >= 680: return 1.0
+    if s >= 660: return 1.5
+    return 2.5
+
+
+def _classify_investor(loan_type: str, loan_amount, aus_approved: bool) -> str:
+    """Group 8 — investor_eligible: which agency / portfolio the loan
+    can be sold to. Threshold $766,550 is the 2024 conforming-loan
+    limit; anything above goes jumbo."""
+    try:
+        la = float(loan_amount or 0)
+    except (TypeError, ValueError):
+        la = 0.0
+    if loan_type == "conforming" and la <= 766_550 and aus_approved:
+        return "fannie"
+    if loan_type in ("fha", "va"):
+        return "ginnie"
+    if la > 766_550:
+        return "jumbo_portfolio"
+    return "non_qm"
+
+
+def _days_until(value) -> Optional[int]:
+    """Group 6 — days_until_rate_lock_expiry. Negative numbers are
+    informative (lock has already expired); the caller decides whether
+    to ESCALATE on negative or just on close-to-zero."""
+    if value is None:
+        return None
+    from datetime import date, datetime as _dt
+    try:
+        if isinstance(value, str):
+            d = date.fromisoformat(value[:10])
+        elif isinstance(value, _dt):
+            d = value.date()
+        elif isinstance(value, date):
+            d = value
+        else:
+            return None
+        return (d - date.today()).days
+    except (ValueError, TypeError):
+        return None
+
+
+def _days_since(value) -> Optional[int]:
+    """Group 9 — days from ``value`` to now (UTC). Returns ``None`` when
+    the input is missing or unparseable so the caller can leave the
+    column null."""
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str):
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        elif isinstance(value, datetime):
+            dt = value
+        else:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0, (datetime.now(timezone.utc) - dt).days)
+    except (ValueError, TypeError):
+        return None
+
+
 def _mi_pct_by_ltv(ltv) -> float:
     """Mortgage-insurance rate by LTV band (Conv/FHA-ish):
       >95%   → 1.10%
@@ -308,6 +401,8 @@ async def _compose_and_upsert_entity_state(
     primary_docs:   list,
     co_docs:        list,
     tenant_id:      str,
+    *,
+    app_created_at = None,
 ) -> dict:
     """Compose the ``entity_states`` row from the just-assembled
     profiles and the existing docs, then UPSERT it. Returns a small
@@ -451,6 +546,75 @@ async def _compose_and_upsert_entity_state(
     except Exception:
         pass
 
+    # ── Group 5: property enrichment ─────────────────────────────────
+    # down_payment only for purchases; refis don't carry purchase_price
+    # and the field is null. lien_status reflects how far through title
+    # work the file is, independent of the boolean ``title_clear`` flag.
+    loan_purpose = ((urla.get("loan_purpose") or "") if urla else "").lower()
+    is_refi = "refi" in loan_purpose
+    down_payment: Optional[float] = None
+    if not is_refi and purchase_price and loan_amount:
+        try:
+            down_payment = max(0.0, float(purchase_price) - float(loan_amount))
+        except (TypeError, ValueError):
+            down_payment = None
+
+    title_block = (property_state or {}).get("title") or {}
+    any_title_received = any(
+        v for k, v in title_block.items() if k.endswith("_received") and v
+    )
+    if verifications.get("title_clear"):
+        lien_status = "clear"
+    elif any_title_received:
+        lien_status = "pending"
+    else:
+        lien_status = "unknown"
+
+    if property_state:
+        property_state.update({
+            "down_payment":       down_payment,
+            "appraisal_disputed": False,
+            "lien_status":        lien_status,
+        })
+
+    # ── Group 6: loan enrichment ─────────────────────────────────────
+    loan_type = _classify_loan_type(rate_lock.get("loan_program"))
+    days_until_lock_expiry = _days_until(rate_lock.get("lock_expiry"))
+
+    # ── Group 7: closer fields ───────────────────────────────────────
+    cd_issued = "CLOSING_DISCLOSURE" in doc_types
+    final_title_policy_received = bool(title_block.get("title_insurance_received"))
+
+    # ── Group 8: secondary-market eligibility + LLPA ─────────────────
+    llpa_adjustment   = _llpa_grid(mid_score, ltv)
+    investor_eligible = _classify_investor(
+        loan_type, loan_amount, bool(verifications.get("aus_approved")),
+    )
+
+    if loan_terms_state:
+        loan_terms_state.update({
+            "loan_type":                     loan_type,
+            "concurrent_rate_lock_conflict": False,
+            "days_until_rate_lock_expiry":   days_until_lock_expiry,
+            "proposed_payment":              piti_total,
+            "cd_issued":                     cd_issued,
+            "wire_instructions_received":    False,
+            "final_title_policy_received":   final_title_policy_received,
+            "investor_eligible":             investor_eligible,
+            "llpa_adjustment":               llpa_adjustment,
+            "servicing_released":            True,
+        })
+
+    # ── Group 9: management timing ───────────────────────────────────
+    loan_age_days = _days_since(app_created_at)
+    days_in_current_status = 0
+    try:
+        prior_es = await pg.get_entity_state(application_id, tenant_id=tenant_id)
+    except Exception:
+        prior_es = None
+    if prior_es and prior_es.get("status") == status:
+        days_in_current_status = _days_since(prior_es.get("last_updated")) or 0
+
     # ── Compose ``state_data`` mapping to entity_states columns ──────
     state_data = {
         "los_id":                         los_id,
@@ -486,6 +650,9 @@ async def _compose_and_upsert_entity_state(
         "last_decision_by":               None,
         "last_decision_at":               None,
         "decision_trail":                 [],
+        # Group 9 — top-level management timing columns.
+        "days_in_current_status":         days_in_current_status,
+        "loan_age_days":                  loan_age_days,
         # Top-level boolean columns mirror the JSONB verifications block —
         # ``upsert_entity_state`` reads both, and the indexed columns are
         # what reports/dashboards filter on.
@@ -612,6 +779,7 @@ async def rebuild_one(
         pg, redis, application_id, applicant_id, co_applicant_id,
         los_id, loan_data, primary_credit, co_credit, profile,
         primary_docs, co_docs, tenant_id,
+        app_created_at=app.get("created_at"),
     )
 
     try:

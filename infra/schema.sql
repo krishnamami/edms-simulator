@@ -846,6 +846,16 @@ ALTER TABLE entity_states
     ADD COLUMN IF NOT EXISTS cltv                      FLOAT,
     ADD COLUMN IF NOT EXISTS existing_mortgage_payment FLOAT;
 
+-- v4.6 — Group 9 (Management) timing columns. ``days_in_current_status``
+-- is "how long has status been at its current value" (carried forward
+-- across re-builds when status doesn't change). ``loan_age_days`` is
+-- "how long since the application was created" — pure ``NOW() -
+-- applications.created_at``. Both are recomputed on every entity_states
+-- upsert by the golden-record builder.
+ALTER TABLE entity_states
+    ADD COLUMN IF NOT EXISTS days_in_current_status INT,
+    ADD COLUMN IF NOT EXISTS loan_age_days          INT;
+
 -- =====================================================================
 -- Webhook outbox — async delivery decouples upload latency from
 -- subscriber availability. Every assembly fan-out writes a row here;

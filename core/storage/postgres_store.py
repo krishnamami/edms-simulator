@@ -2409,6 +2409,7 @@ class PostgresStore:
                 assets_verified, identity_complete, appraisal_complete,
                 title_clear, insurance_bound, aus_approved,
                 rate_locked, conditions_cleared, clear_to_close,
+                days_in_current_status, loan_age_days,
                 last_updated, created_at
             ) VALUES (
                 $1, $2, $3, $4::jsonb,
@@ -2420,6 +2421,7 @@ class PostgresStore:
                 $32, $33, $34, $35::jsonb,
                 $36, $37, $38, $39, $40, $41, $42, $43, $44,
                 $45, $46, $47,
+                $48, $49,
                 NOW(), NOW()
             )
             ON CONFLICT (application_id) DO UPDATE SET
@@ -2473,6 +2475,8 @@ class PostgresStore:
                 rate_locked                     = EXCLUDED.rate_locked,
                 conditions_cleared              = EXCLUDED.conditions_cleared,
                 clear_to_close                  = EXCLUDED.clear_to_close,
+                days_in_current_status          = EXCLUDED.days_in_current_status,
+                loan_age_days                   = EXCLUDED.loan_age_days,
                 last_updated                    = NOW()
             """,
             application_id, tenant_id,
@@ -2521,6 +2525,10 @@ class PostgresStore:
             bool(s.get("rate_locked")),
             bool(s.get("conditions_cleared")),
             bool(s.get("clear_to_close")),
+            (int(s["days_in_current_status"])
+             if s.get("days_in_current_status") is not None else None),
+            (int(s["loan_age_days"])
+             if s.get("loan_age_days") is not None else None),
         )
 
     async def get_entity_state(

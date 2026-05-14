@@ -73,7 +73,7 @@ def test_subprime_bucket_yields_two_derog_high_utilization():
 
 
 def test_deep_subprime_bucket_yields_four_derog_thin_file_true():
-    # mid_score < 620 AND credit_band == 'subprime' → thin_file True.
+    # mid_score < 620 → thin_file True regardless of credit_band.
     out = _derive_credit_assessment_fields("APL-00004-P", 580, "subprime")
     assert out["derogatory_marks"] == 4
     assert out["no_derogatory_last_24_months"] is False
@@ -116,11 +116,13 @@ def test_derivation_varies_across_applicant_ids():
     assert len(samples) > 1
 
 
-def test_thin_file_only_true_for_deep_subprime_band():
-    """Spec: ``thin_file`` is true only when mid_score < 620 AND
-    credit_band == 'subprime'. Everything else is False."""
+def test_thin_file_keyed_to_mid_score_below_620():
+    """Spec v2 — ``thin_file`` is True any time mid_score < 620,
+    regardless of credit_band. Anything 620+ is False."""
     assert _derive_credit_assessment_fields("a", 580, "subprime")["thin_file"] is True
-    assert _derive_credit_assessment_fields("a", 580, "prime")["thin_file"] is False
+    assert _derive_credit_assessment_fields("a", 580, "prime")["thin_file"] is True
+    assert _derive_credit_assessment_fields("a", 619, "near-prime")["thin_file"] is True
+    assert _derive_credit_assessment_fields("a", 620, "subprime")["thin_file"] is False
     assert _derive_credit_assessment_fields("a", 700, "subprime")["thin_file"] is False
     assert _derive_credit_assessment_fields("a", 800, "prime")["thin_file"] is False
 
